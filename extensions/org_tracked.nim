@@ -39,6 +39,33 @@ proc pandoc(args: seq[string]): tuple[code: int; output: string] =
 
 # ---- CriticMarkup <-> pandoc span conversion -------------------------------
 
+proc orgCiteToPandoc(s: string): string =
+  ## Convert Org citation syntax to pandoc markdown citations, so a citation
+  ## inside a CriticMarkup span (which bypasses the org->md stage via `stash`)
+  ## still resolves.  Its `[cite:@key]` would otherwise reach `md -> docx` in
+  ## Org syntax, which pandoc's *markdown* reader does not recognise -- it ships
+  ## as literal text that citeproc never resolves.  `[cite:@key]` / `[cite:@a;@b]`
+  ## -> `[@key]` / `[@a;@b]` (parenthetical); `[cite/t:@key]` -> `@key`
+  ## (narrative single key).  Mirrors org-tracked-docx's `otd--orgcite->pandoc`.
+  result = newStringOfCap(s.len)
+  var i = 0
+  while i < s.len:
+    if s[i] == '[' and i + 5 < s.len and s[i+1] == 'c' and s[i+2] == 'i' and
+       s[i+3] == 't' and s[i+4] == 'e' and (s[i+5] == ':' or s[i+5] == '/'):
+      let closeB = s.find(']', i+5)
+      let colon  = s.find(':', i+5)
+      if closeB > i and colon > i and colon < closeB:
+        let style = s[i+5 ..< colon]                 # "" or "/t" or "/text" ...
+        let body  = s[colon+1 ..< closeB].strip()
+        if (style == "/t" or style == "/text") and body.startsWith("@") and
+           ';' notin body and ' ' notin body:
+          result.add body                            # narrative: @key
+        else:
+          result.add "[" & body & "]"                # parenthetical: [@key] / [@a;@b]
+        i = closeB + 1
+        continue
+    result.add s[i]; inc i
+
 proc criticToSpans(md: string): string =
   ## CriticMarkup tokens -> pandoc markdown spans (for md -> docx). Uses the same
   ## split scanner style as wkbcore.applyCriticMarkup.
@@ -62,16 +89,16 @@ proc criticToSpans(md: string): string =
         if e >= 0:
           let inner = md[i+3 ..< e-2]
           case x
-          of '+': result.add "[" & inner & "]{.insertion" & ins & "}"
-          of '-': result.add "[" & inner & "]{.deletion" & ins & "}"
-          of '=': result.add inner                        # highlight: keep the text
+          of '+': result.add "[" & orgCiteToPandoc(inner) & "]{.insertion" & ins & "}"
+          of '-': result.add "[" & orgCiteToPandoc(inner) & "]{.deletion" & ins & "}"
+          of '=': result.add orgCiteToPandoc(inner)                        # highlight: keep the text
           of '~':
             let arrow = inner.find("~>")
             if arrow >= 0:
-              result.add "[" & inner[0 ..< arrow] & "]{.deletion" & ins & "}"
-              result.add "[" & inner[arrow+2 .. ^1] & "]{.insertion" & ins & "}"
+              result.add "[" & orgCiteToPandoc(inner[0 ..< arrow]) & "]{.deletion" & ins & "}"
+              result.add "[" & orgCiteToPandoc(inner[arrow+2 .. ^1]) & "]{.insertion" & ins & "}"
             else:
-              result.add "[" & inner & "]{.insertion" & ins & "}"
+              result.add "[" & orgCiteToPandoc(inner) & "]{.insertion" & ins & "}"
           else: discard
           i = e + 1; continue
       elif x == '>' and y == '>':                         # {>>[A] note<<}
@@ -87,7 +114,7 @@ proc criticToSpans(md: string): string =
             let rb = note.find(']')
             cauth = note[1 ..< rb]
             note = note[rb+1 .. ^1].strip()
-          result.add "[" & note & "]{.comment-start id=\"" & $cid & "\" author=\"" &
+          result.add "[" & orgCiteToPandoc(note) & "]{.comment-start id=\"" & $cid & "\" author=\"" &
                      cauth & "\" date=\"" & d & "\"}[]{.comment-end id=\"" & $cid & "\"}"
           inc cid
           i = e + 1; continue
