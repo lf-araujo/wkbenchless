@@ -20,6 +20,7 @@ var
   gBib* = ""          ## bibliography path; else #+bibliography: header, else sibling .bib
   gCsl* = ""          ## CSL citation-style file (optional)
   gRefDoc* = ""       ## Word reference-doc / template (optional)
+  gEmbedSource* = true ## embed the canonical .org inside the exported docx (round-trip)
 
 proc trackAuthor(): string =
   if gAuthor.len > 0: return gAuthor
@@ -195,6 +196,110 @@ proc unstash(s: string; tokens: seq[string]): string =
   for idx, tok in tokens:
     result = result.replace("zZoTdZz" & $idx & "zZ", tok)
 
+# ---- embedded canonical org source (round-trip recovery) -------------------
+# Port of org-tracked-docx's customXml embed/extract: the .org that generated
+# the docx is stored inside it, so re-import can recover cite keys, cross-refs,
+# and #+header syntax that citeproc / pandoc-crossref render away.
+
+const
+  cxItemName  = "item-otd-source.xml"
+  cxItemProps = "itemProps-otd-source.xml"
+  cxNamespace = "urn:org-tracked-docx:source"
+
+proc cdataEscape(s: string): string =
+  "<![CDATA[" & s.replace("]]>", "]]]]><![CDATA[>") & "]]>"
+
+proc cdataUnescape(s: string): string =
+  s.replace("]]]]><![CDATA[>", "]]>")
+
+proc embedOrgSource*(docx, orgContent: string): bool =
+  ## Embed ORGCONTENT inside DOCX as a customXml part, registered in
+  ## [Content_Types].xml and word/_rels/document.xml.rels so Word and
+  ## LibreOffice preserve it across saves and tracked edits. Port of
+  ## otd--embed-org-source. Returns true on success.
+  let unzipExe = findExe("unzip")
+  let zipExe   = findExe("zip")
+  if unzipExe.len == 0 or zipExe.len == 0: return false
+  let docxAbs = absolutePath(docx)
+  if not fileExists(docxAbs): return false
+  let tmp = getTempDir() / ("otd-embed-" & $getCurrentProcessId() & "-" & $int(epochTime()))
+  removeDir(tmp); createDir(tmp)
+  defer: removeDir(tmp)
+  if execCmdEx(quoteShell(unzipExe) & " -q " & quoteShell(docxAbs) &
+               " -d " & quoteShell(tmp)).exitCode != 0: return false
+  let cxDir = tmp / "customXml"
+  createDir(cxDir); createDir(cxDir / "_rels")
+  writeFile(cxDir / cxItemName,
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
+    "<orgTrackedSource xmlns=\"" & cxNamespace & "\">" &
+    cdataEscape(orgContent) & "</orgTrackedSource>\n")
+  writeFile(cxDir / cxItemProps,
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
+    "<ds:datastoreItem ds:itemID=\"{ORG-TRACKED-DOCX-SOURCE}\"" &
+    " xmlns:ds=\"http://schemas.openxmlformats.org/officeDocument/2006/customXml\">" &
+    "<ds:schemaRefs><ds:schemaRef ds:uri=\"" & cxNamespace & "\"/></ds:schemaRefs>" &
+    "</ds:datastoreItem>\n")
+  writeFile(cxDir / "_rels" / (cxItemName & ".rels"),
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
+    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" &
+    "<Relationship Id=\"rId1\"" &
+    " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps\"" &
+    " Target=\"" & cxItemProps & "\"/></Relationships>\n")
+  let ct = tmp / "[Content_Types].xml"
+  if fileExists(ct):
+    let ins = "<Override PartName=\"/customXml/" & cxItemName &
+              "\" ContentType=\"application/xml\"/>" &
+              "<Override PartName=\"/customXml/" & cxItemProps &
+              "\" ContentType=\"application/vnd.openxmlformats-officedocument.customXmlProperties+xml\"/>"
+    writeFile(ct, readFile(ct).replace("</Types>", ins & "</Types>"))
+  let rels = tmp / "word" / "_rels" / "document.xml.rels"
+  if fileExists(rels):
+    let r = readFile(rels)
+    var maxId = 0
+    var i = 0
+    while true:
+      let p = r.find("Id=\"rId", i)
+      if p < 0: break
+      var j = p + 7
+      var num = ""
+      while j < r.len and r[j] in {'0'..'9'}: num.add r[j]; inc j
+      if num.len > 0: maxId = max(maxId, parseInt(num))
+      i = j + 1
+    let ins = "<Relationship Id=\"rId" & $(maxId + 1) & "\"" &
+              " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\"" &
+              " Target=\"../customXml/" & cxItemName & "\"/>"
+    writeFile(rels, r.replace("</Relationships>", ins & "</Relationships>"))
+  removeFile(docxAbs)
+  execCmdEx(quoteShell(zipExe) & " -q -r " & quoteShell(docxAbs) & " .",
+            workingDir = tmp).exitCode == 0
+
+proc extractOrgSource*(docx: string): string =
+  ## Recover the embedded canonical org from DOCX, or "" if absent. Identifies
+  ## the part by its <orgTrackedSource> element (LibreOffice renames the item on
+  ## save). Port of otd--extract-org-source-customxml; normalizes CRLF/CR to LF.
+  let unzipExe = findExe("unzip")
+  if unzipExe.len == 0 or not fileExists(docx): return ""
+  let (listing, lc) = execCmdEx(quoteShell(unzipExe) & " -Z1 " & quoteShell(docx))
+  if lc != 0: return ""
+  for raw in listing.splitLines():
+    let entry = raw.strip()
+    if entry.startsWith("customXml/") and entry.endsWith(".xml") and entry.count('/') == 1:
+      let (content, cc) = execCmdEx(quoteShell(unzipExe) & " -p " &
+                                    quoteShell(docx) & " " & quoteShell(entry))
+      if cc != 0: continue
+      let mi = content.find("<orgTrackedSource")
+      if mi < 0: continue
+      let cdStart = content.find("<![CDATA[", mi)
+      if cdStart < 0: continue
+      let payStart = cdStart + "<![CDATA[".len
+      let closeTag = content.find("</orgTrackedSource>", payStart)
+      if closeTag < 0: continue
+      var e = closeTag
+      while e > payStart and content[e-1] in {' ', '\t', '\n', '\r'}: dec e
+      if e >= payStart + 3 and content[e-3 ..< e] == "]]>":
+        return cdataUnescape(content[payStart ..< e-3]).replace("\r\n", "\n").replace("\r", "\n")
+  ""
+
 # ---- commands --------------------------------------------------------------
 
 proc docxOf(app: App): string =
@@ -341,7 +446,10 @@ proc otdExport(app: var App) =
   dargs.add md; dargs.add "-o"; dargs.add docx
   (code, outp) = pandoc(dargs)
   if code != 0: (app.msg = "pandoc md->docx failed: " & outp.strip(); return)
+  # Embed the canonical org so re-import can recover cite keys / cross-refs / headers.
+  let embedded = gEmbedSource and embedOrgSource(docx, app.ed.fullText())
   app.msg = "otd: exported -> " & extractFilename(docx) &
+            (if embedded: "  [+org]" else: "") &
             (if bib.len > 0: "  [refs: " & extractFilename(bib) & "]" else: "")
 
 proc extend*(app: var App) =
