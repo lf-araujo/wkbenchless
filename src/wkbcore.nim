@@ -26,12 +26,15 @@ type
     bigFont*: Font                        ## larger font for org headers/headings
     fontSize*: int                        ## desired editor font size (host applies)
     filePath*, msg*: string
+    activeDiskMtime*: times.Time          ## mtime of app.filePath at last load/save
+                                          ## (used by autoRevertActive)
     running*: bool
     srcEdit*: bool                        ## 4-quadrant (objects+help) vs plain
     pendingPrefix*: string
     buffers*: seq[BufferState]            ## all open buffers (snapshots)
     curBuf*: int                          ## index of the active buffer
     pendingKill*: bool                    ## a kill-buffer of a dirty buffer awaits confirm
+    pendingQuit*: bool                    ## a quit with unsaved buffer(s) awaits confirm
     paletteActive*: bool
     paletteMode*: PaletteMode
     paletteQuery*: string
@@ -408,6 +411,14 @@ proc extToLangId(ext: string): string =
   of ".js": "javascript"
   else: ""
 
+proc noteDiskMtime*(app: var App) =
+  ## Record the active file's on-disk mtime, so autoRevertActive only fires on a
+  ## *later* external change (not on our own load/save).
+  app.activeDiskMtime =
+    if app.filePath.len > 0 and fileExists(app.filePath):
+      getLastModificationTime(app.filePath)
+    else: times.Time()
+
 proc syncActive*(app: var App) =
   ## Write the live active editor back into its buffer slot.
   if app.curBuf >= 0 and app.curBuf < app.buffers.len:
@@ -420,12 +431,42 @@ proc activate(app: var App; idx: int) =
   app.filePath = b.filePath
   app.docLang = b.docLang
   app.curBuf = idx
+  app.noteDiskMtime()                     # baseline so we don't self-revert on switch
 
 proc switchToBuffer*(app: var App; idx: int) =
   if idx < 0 or idx >= app.buffers.len or idx == app.curBuf: return
   app.syncActive()
   app.activate(idx)
   app.msg = "buffer: " & bufName(app.buffers[idx])
+
+var gLastRevertCheck: float = 0.0        ## epochTime of last autoRevert poll
+
+proc autoRevertActive*(app: var App) =
+  ## Poll the active file's mtime; if it changed on disk since we last
+  ## loaded/saved it AND the buffer has no unsaved edits, reload it in place
+  ## (cursor preserved). Never clobbers unsaved edits — a modified buffer just
+  ## gets a one-shot status message. Throttled so it costs nothing per frame.
+  ## This is what keeps the buffer in sync when an external tool (an agent, a
+  ## formatter, git) rewrites the file underneath the editor.
+  if app.filePath.len == 0 or not fileExists(app.filePath): return
+  let now = epochTime()
+  if now - gLastRevertCheck < 0.7: return
+  gLastRevertCheck = now
+  let t = getLastModificationTime(app.filePath)
+  if t <= app.activeDiskMtime: return
+  if app.ed.changed:                     # unsaved edits — do not clobber
+    app.activeDiskMtime = t              # (and don't nag again for this change)
+    app.msg = extractFilename(app.filePath) &
+              " changed on disk (buffer modified — not reverted)"
+    return
+  let pos = app.ed.cursor
+  try: app.ed.loadFromFile(app.filePath)
+  except CatchableError:
+    app.msg = "auto-revert: cannot read " & extractFilename(app.filePath); return
+  app.ed.markSaved()
+  app.ed.gotoPos(min(pos, app.ed.len))
+  app.activeDiskMtime = t
+  app.msg = "reverted " & extractFilename(app.filePath) & " (disk changed)"
 
 proc recentFilesPath(): string = getCacheDir() / "wkbenchless" / "recent"
 
@@ -700,11 +741,24 @@ proc runLine*(app: var App) =
 proc saveCmd*(app: var App) =
   if app.filePath.len > 0:
     app.ed.saveToFile(app.filePath); app.ed.markSaved()
+    app.noteDiskMtime()                    # our own save must not trigger a revert
     app.msg = "saved"
     app.runHooks("after-save")
   else: app.msg = "no file (pass a path on the command line)"
 
-proc quitCmd*(app: var App) = app.running = false
+proc quitCmd*(app: var App) =
+  ## Guard unsaved work: warn (naming the dirty buffers) and require a second
+  ## quit to discard, mirroring `killBuffer`'s confirm pattern.
+  app.syncActive()
+  if not app.pendingQuit:
+    var dirty: seq[string]
+    for b in app.buffers:
+      if b.ed.changed: dirty.add bufName(b)
+    if dirty.len > 0:
+      app.pendingQuit = true
+      app.msg = "unsaved: " & dirty.join(", ") & " -- quit again to discard, or save first"
+      return
+  app.running = false
 
 proc zoomIn*(app: var App) =
   app.fontSize = min(48, app.fontSize + 1); app.msg = "font " & $app.fontSize
@@ -1017,12 +1071,18 @@ proc enableLatexPreview(app: var App): bool =
   let header = collectLatexHeader(app)
   try: createDir(getCacheDir() / "wkbenchless" / "ltximg") except CatchableError: discard
   var made, failed = 0
-  for i in 0 ..< app.ed.getLineCount():
+  var off = 0
+  while off < app.ed.len:
     var inner = ""
-    if parseMathLine(app.ed.getLineText(i), inner):
-      let outPng = ltxCachePath(app.ed.getLineText(i))
+    var blockEnd = -1
+    if latexDisplayMathAt(app.ed, off, inner, blockEnd):
+      let outPng = ltxCachePath(inner)
       if not fileExists(outPng):
         if renderLatexFragment(inner, header, outPng): inc made else: inc failed
+      off = blockEnd
+    else:
+      while off < app.ed.len and app.ed[off] != '\L': inc off
+      if off < app.ed.len: inc off
   app.msg = "latex preview on (" & $made & " rendered" &
             (if failed > 0: ", " & $failed & " failed" else: "") & ")"
   true
@@ -1345,14 +1405,6 @@ proc switchSession*(app: var App) =
   for k, name in keys:
     if name == cur: i = k
   selectTab(app, keys[(i + 1) mod keys.len])
-
-proc newTerminal*(app: var App) =
-  ## Start (or reuse) a bash shell session and switch the pane to it.
-  discard getSession(app, "bash", "term")
-  app.curLang = "bash"; app.curSession = "term"
-  app.focus = "session"
-  app.sess.appendOutput("-- bash terminal --\n")
-  app.msg = "terminal: bash/term"
 
 proc focusNext*(app: var App) =
   const order = ["editor", "session", "objects", "help"]
@@ -1876,7 +1928,6 @@ proc registerBuiltins*() =
   defcommand("src-edit-session", "Src-edit: tangle this session's blocks", srcEditSession)
   defcommand("focus-next", "Focus next pane", focusNext)
   defcommand("switch-session", "Switch to next session", switchSession)
-  defcommand("new-terminal", "New bash terminal session", newTerminal)
   defcommand("edit-config", "Edit config file", editConfig)
   defcommand("reload-config", "Reload config (recompile & restart)", reloadConfig)
   # The full keymap lives in wkbconfig.nim so every binding is visible and
