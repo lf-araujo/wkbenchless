@@ -1154,6 +1154,106 @@ proc criticRejectAll*(app: var App) =
   app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = false))
   app.ed.markChanged(); app.msg = "rejected all tracked changes"
 
+proc lineStartOffset(app: App): int =
+  ## Byte offset of the start of the current line in fullText.
+  for i in 0 ..< app.ed.currentLine: result += app.ed.getLineText(i).len + 1
+
+proc criticFindToken(text: string; fromOff: int): tuple[s, e: int] =
+  ## First CriticMarkup token whose end is > FROMOFF (so a token enclosing the
+  ## cursor is caught, else the next one after it); (-1,-1) if none. `e` is the
+  ## index just past the closing brace.
+  proc closeOf(o: int; c: char): int =
+    var q = o + 3
+    while q + 2 < text.len:
+      if text[q] == c and text[q+1] == c and text[q+2] == '}': return q + 3
+      inc q
+    -1
+  var i = 0
+  while i < text.len:
+    if text[i] == '{' and i + 4 < text.len:
+      let a = text[i+1]; let b = text[i+2]
+      var e = -1
+      if a == b and a in {'+', '-', '=', '~'}: e = closeOf(i, a)
+      elif a == '>' and b == '>': e = closeOf(i, '<')
+      if e > 0:
+        if e > fromOff: return (i, e)
+        i = e; continue
+    inc i
+  (-1, -1)
+
+proc criticResolveOne(app: var App; accept: bool) =
+  if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
+  let ft = app.ed.fullText()
+  let (s, e) = criticFindToken(ft, lineStartOffset(app))
+  if s < 0: app.msg = "no tracked change here"; return
+  let piece = ft[s ..< e]
+  if piece.startsWith("{>>"):
+    app.msg = "that is a comment (use Mark DONE / Clean DONE)"; return
+  app.ed.setText(ft[0 ..< s] & applyCriticMarkup(piece, accept) & ft[e ..< ft.len])
+  app.ed.markChanged()
+  app.msg = (if accept: "accepted change" else: "rejected change")
+
+proc criticAcceptOne*(app: var App) = criticResolveOne(app, true)
+proc criticRejectOne*(app: var App) = criticResolveOne(app, false)
+
+proc criticMarkDone*(app: var App) =
+  ## Mark the comment at/after the cursor `[DONE]` (org-tracked-docx convention).
+  if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
+  let ft = app.ed.fullText()
+  var off = lineStartOffset(app)
+  while true:
+    let (s, e) = criticFindToken(ft, off)
+    if s < 0: app.msg = "no comment here"; return
+    if ft[s ..< e].startsWith("{>>"):
+      let inner = ft[s+3 ..< e-3]                 # between {>> and <<}
+      if "[DONE]" in inner: (app.msg = "already DONE"; return)
+      var ip = 0                                  # insert after a [Author] prefix
+      if inner.startsWith("[") and ']' in inner:
+        ip = inner.find(']') + 1
+        while ip < inner.len and inner[ip] == ' ': inc ip
+      let newInner = inner[0 ..< ip] & "[DONE] " & inner[ip ..< inner.len]
+      app.ed.setText(ft[0 ..< s] & "{>>" & newInner & "<<}" & ft[e ..< ft.len])
+      app.ed.markChanged(); app.msg = "marked DONE"; return
+    off = e                                       # skip non-comment tokens
+
+proc criticCleanDone*(app: var App) =
+  ## Remove every comment already marked `[DONE]`; keep all other markup & text.
+  if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
+  let ft = app.ed.fullText()
+  var res = newStringOfCap(ft.len)
+  var i = 0
+  var n = 0
+  proc closeOf(o: int; c: char): int =
+    var q = o + 3
+    while q + 2 < ft.len:
+      if ft[q] == c and ft[q+1] == c and ft[q+2] == '}': return q + 3
+      inc q
+    -1
+  while i < ft.len:
+    if ft[i] == '{' and i + 4 < ft.len and ft[i+1] == '>' and ft[i+2] == '>':
+      let e = closeOf(i, '<')
+      if e > 0:
+        if "[DONE]" in ft[i+3 ..< e-3]: (inc n; i = e; continue)   # drop resolved
+    res.add ft[i]; inc i
+  if n == 0: app.msg = "no DONE comments to clean"; return
+  app.ed.setText(res); app.ed.markChanged()
+  app.msg = "cleaned " & $n & " DONE comment" & (if n == 1: "" else: "s")
+
+proc nextComment*(app: var App) =
+  let n = app.ed.getLineCount()
+  var i = app.ed.currentLine + 1
+  while i < n:
+    if "{>>" in app.ed.getLineText(i): (app.ed.gotoLine(i + 1, 0); app.msg = "next comment"; return)
+    inc i
+  app.msg = "no next comment"
+
+proc prevComment*(app: var App) =
+  var i = app.ed.currentLine - 1
+  while i >= 0:
+    if "{>>" in app.ed.getLineText(i): (app.ed.gotoLine(i + 1, 0); app.msg = "previous comment"; return)
+    dec i
+  app.msg = "no previous comment"
+
 # -- two-pane diff (for agents to show before/after) -------------------------
 proc lineDiff(a, b: seq[string]): tuple[l, r: seq[string]; lk, rk: seq[char]] =
   ## LCS line alignment: each output row is (left, right) with a kind --
@@ -1910,6 +2010,12 @@ proc registerBuiltins*() =
   defcommand("prev-chunk", "Go to the previous src block", prevChunk)
   defcommand("criticmarkup-accept-all", "CriticMarkup: accept all tracked changes", criticAcceptAll)
   defcommand("criticmarkup-reject-all", "CriticMarkup: reject all tracked changes", criticRejectAll)
+  defcommand("criticmarkup-accept", "CriticMarkup: accept change at point", criticAcceptOne)
+  defcommand("criticmarkup-reject", "CriticMarkup: reject change at point", criticRejectOne)
+  defcommand("criticmarkup-mark-done", "CriticMarkup: mark comment at point [DONE]", criticMarkDone)
+  defcommand("criticmarkup-clean-done", "CriticMarkup: remove all [DONE] comments", criticCleanDone)
+  defcommand("next-comment", "Go to the next comment", nextComment)
+  defcommand("prev-comment", "Go to the previous comment", prevComment)
   defcommand("diff-buffer", "Diff: buffer vs saved file (two panes)", diffBuffer)
   defcommand("close-diff", "Diff: close the diff view", closeDiff)
   defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)

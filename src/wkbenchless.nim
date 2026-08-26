@@ -266,6 +266,19 @@ proc feedTerminalKey(t: var Pty; e: Event): bool =
     of KeyDown: t.feed("\e[B"); true
     of KeyRight: t.feed("\e[C"); true
     of KeyLeft: t.feed("\e[D"); true
+    of KeyV:
+      # Paste clipboard into the terminal (Ctrl+V / Cmd+V). Wrap in bracketed
+      # paste markers when the app has enabled them so multi-line pastes aren't
+      # re-indented / re-executed by the shell's readline.
+      if CtrlPressed in e.mods or GuiPressed in e.mods:
+        let text = getClipboardText()
+        if text.len > 0:
+          if t.vt != nil and t.vt.bracketedPaste:
+            t.feed("\e[200~" & text & "\e[201~")
+          else:
+            t.feed(text)
+        true
+      else: false
     else:
       if CtrlPressed in e.mods and e.key in {KeyA..KeyZ}:
         t.feed($chr(ord(e.key) - ord(KeyA) + 1))   # Ctrl-A..Ctrl-Z
@@ -463,6 +476,7 @@ proc main() =
       let ap = activePtyPtr()
       if ap != nil: pump(ap[])
     poll(ctrl, app)                           # handle any wkbctl / agent request
+    autoRevertActive(app)                     # reload the buffer if the file changed on disk
 
     if app.reloadPending:                     # recompile finished -> snapshot & re-exec
       if pty.vt != nil and pty.alive:
@@ -549,8 +563,15 @@ proc main() =
     const tbBtns = [("Open", "open-file"), ("Save", "save"),
                     ("Export", "otd-export"), ("Find", "find"),
                     ("▲", "prev-chunk"), ("▼", "next-chunk"),
+                    ("△", "prev-comment"), ("▽", "next-comment"),
                     ("Edit", "src-edit-block")]
-    const tbMenu = [("Increase font", "zoom-in"), ("Decrease font", "zoom-out")]
+    const tbMenu = [("Accept change", "criticmarkup-accept"),
+                    ("Reject change", "criticmarkup-reject"),
+                    ("Accept all", "criticmarkup-accept-all"),
+                    ("Reject all", "criticmarkup-reject-all"),
+                    ("Mark DONE", "criticmarkup-mark-done"),
+                    ("Clean DONE", "criticmarkup-clean-done"),
+                    ("Increase font", "zoom-in"), ("Decrease font", "zoom-out")]
     var toolbarRects: seq[tuple[r: Rect; cmd, label: string]]
     block:
       var x = 6
