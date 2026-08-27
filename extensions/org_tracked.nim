@@ -12,7 +12,7 @@
 ## revisions; comments are emitted best-effort as Word comments.
 
 import wkbcore
-import std/[osproc, os, strutils, times, tables, sequtils]
+import std/[osproc, os, strutils, times, tables, sequtils, sets]
 
 var
   gPandoc* = "pandoc"
@@ -300,6 +300,113 @@ proc extractOrgSource*(docx: string): string =
         return cdataUnescape(content[payStart ..< e-3]).replace("\r\n", "\n").replace("\r", "\n")
   ""
 
+# ---- import merge: embedded canonical + reviewer's tracked changes ---------
+# Recover cite keys / cross-refs / #+headers / structure from the embedded
+# canonical org; overlay only the paragraphs the reviewer actually edited.
+# Port (paragraph-level) of org-tracked-docx's otd--merge-content.
+
+type
+  UnitKind = enum ukStruct, ukBody
+  Unit = tuple[kind: UnitKind; text: string]
+
+proc isHeading(t: string): bool =
+  var k = 0
+  while k < t.len and t[k] == '*': inc k
+  k > 0 and k < t.len and t[k] == ' '
+
+proc hasCriticMarkup(s: string): bool =
+  "{++" in s or "{--" in s or "{~~" in s or "{>>" in s or "{==" in s
+
+proc parseUnits(text: string): seq[Unit] =
+  ## Split TEXT into structural units (headers, headings, property drawers,
+  ## export/src blocks, blank lines -- kept verbatim) and body paragraphs.
+  var cur: seq[string]
+  var inDrawer, inExport, inSrc = false
+  proc flush(res: var seq[Unit]) =
+    if cur.len > 0: res.add (ukBody, cur.join("\n")); cur = @[]
+  for line in text.split("\n"):
+    let t = line.strip()
+    let low = t.toLowerAscii
+    if inDrawer:
+      result.add (ukStruct, line)
+      if t == ":END:": inDrawer = false
+    elif inExport:
+      result.add (ukStruct, line)
+      if low.startsWith("#+end_export"): inExport = false
+    elif inSrc:
+      result.add (ukStruct, line)
+      if low.startsWith("#+end_src"): inSrc = false
+    elif t == ":PROPERTIES:":
+      flush(result); inDrawer = true; result.add (ukStruct, line)
+    elif low.startsWith("#+begin_export"):
+      flush(result); inExport = true; result.add (ukStruct, line)
+    elif low.startsWith("#+begin_src"):
+      flush(result); inSrc = true; result.add (ukStruct, line)
+    elif t.len == 0 or t.startsWith("#+") or isHeading(t):
+      flush(result); result.add (ukStruct, line)
+    else:
+      cur.add line
+  flush(result)
+
+proc bodyParas(units: seq[Unit]): seq[string] =
+  for u in units:
+    if u.kind == ukBody: result.add u.text
+
+proc wordSet(s: string): HashSet[string] =
+  ## Long (>=4 char) lowercased alphanumeric words of the accepted text -- a
+  ## citation-tolerant fingerprint (a few rendered-vs-key token differences do
+  ## not tank the overlap of the surrounding prose).
+  let accepted = applyCriticMarkup(s, accept = true)
+  var w = ""
+  for ch in accepted:
+    if ch.isAlphaNumeric: w.add ch.toLowerAscii
+    else:
+      if w.len >= 4: result.incl w
+      w = ""
+  if w.len >= 4: result.incl w
+
+proc similarity(a, b: HashSet[string]): float =
+  if a.len == 0 or b.len == 0: return 0.0
+  (a * b).len.float / (a + b).len.float
+
+proc alignParas(canon, tracked: seq[string]): seq[int] =
+  ## For each canonical body paragraph, the greedily best-matching tracked
+  ## paragraph index (each used once) above a similarity threshold, else -1.
+  let cs = canon.mapIt(wordSet(it))
+  let ts = tracked.mapIt(wordSet(it))
+  var used = newSeq[bool](tracked.len)
+  result = newSeq[int](canon.len)
+  for ci in 0 ..< canon.len:
+    var best = -1
+    var bestSim = 0.45
+    for ti in 0 ..< tracked.len:
+      if used[ti]: continue
+      let sim = similarity(cs[ci], ts[ti])
+      if sim > bestSim: bestSim = sim; best = ti
+    result[ci] = best
+    if best >= 0: used[best] = true
+
+proc mergeContent*(canonical, tracked: string): string =
+  ## Walk CANONICAL preserving its structure; replace a body paragraph with the
+  ## aligned TRACKED paragraph only when the reviewer edited it (CriticMarkup
+  ## present) -- untouched paragraphs keep the canonical form, so their cite
+  ## keys / cross-refs survive. Unaligned tracked paragraphs (e.g. the rendered
+  ## author block or bibliography) are dropped.
+  let units = parseUnits(canonical)
+  let cParas = bodyParas(units)
+  let tParas = bodyParas(parseUnits(tracked))
+  let align = alignParas(cParas, tParas)
+  var outLines: seq[string]
+  var bi = 0
+  for u in units:
+    if u.kind == ukStruct:
+      outLines.add u.text
+    else:
+      let ti = align[bi]; inc bi
+      if ti >= 0 and hasCriticMarkup(tParas[ti]): outLines.add tParas[ti]
+      else: outLines.add u.text
+  outLines.join("\n")
+
 # ---- commands --------------------------------------------------------------
 
 proc docxOf(app: App): string =
@@ -400,10 +507,17 @@ proc otdImport(app: var App) =
   let orgOut = getTempDir() / "otd-import.org"
   (code, outp) = pandoc(@["-f", "markdown", "-t", "org", "--wrap=none", md, "-o", orgOut])
   if code != 0: (app.msg = "pandoc md->org failed: " & outp.strip(); return)
-  let org = unstash(readFile(orgOut), toks)
-  app.ed.setText("#+OTD_DOCX: " & docx & "\n\n" & org.strip())
-  app.ed.markChanged()
-  app.msg = "otd: imported " & extractFilename(docx) & " (tracked changes as CriticMarkup)"
+  let tracked = unstash(readFile(orgOut), toks)
+  let canonical = extractOrgSource(docx)          # embedded .org, if this docx has one
+  if canonical.len > 0:
+    app.ed.setText(mergeContent(canonical, tracked).strip())
+    app.ed.markChanged()
+    app.msg = "otd: imported " & extractFilename(docx) &
+              " (merged reviewer edits onto embedded org source)"
+  else:
+    app.ed.setText("#+OTD_DOCX: " & docx & "\n\n" & tracked.strip())
+    app.ed.markChanged()
+    app.msg = "otd: imported " & extractFilename(docx) & " (tracked changes as CriticMarkup)"
 
 proc otdExport(app: var App) =
   let docx = docxOf(app)
