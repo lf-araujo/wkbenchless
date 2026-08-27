@@ -62,6 +62,23 @@ proc langIdOf(ext: string): string =
   of ".js": "javascript"
   else: ""
 
+proc fitText(app: App; s: string; maxPx: int): string =
+  ## Middle-ellipsize S to fit MAXPX pixels, keeping head + tail (so a long file
+  ## name shows its distinguishing prefix and its extension). Prevents palette
+  ## rows / the dir prompt from overflowing the box.
+  if maxPx <= 0: return ""
+  if measureText(app.font, s).w <= maxPx: return s
+  const ell = "\u2026"
+  var head = s.len div 2
+  var tail = s.len - head
+  while head + tail > 0:
+    let cand = s[0 ..< head] & ell & s[s.len - tail ..< s.len]
+    if measureText(app.font, cand).w <= maxPx: return cand
+    if head >= tail and head > 0: dec head
+    elif tail > 0: dec tail
+    else: break
+  ell
+
 proc drawPalette(app: App; area: Rect; lineH: int) =
   let boxW = min(area.w - 80, 620)
   let bx = area.x + (area.w - boxW) div 2
@@ -75,6 +92,7 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     of pmCommands: "> "
     of pmBuffers: "buffer: "
     of pmFiles: app.paletteDir & "/ "
+    of pmSaveAs: "save as " & app.paletteDir & "/ "
     of pmThemes: "theme: "
     of pmOrg: "org: "
     of pmRecent: "recent: "
@@ -84,14 +102,18 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
   top = clamp(top, 0, max(0, items.len - maxRows))
   let more = items.len - top - rows
   let countTag = if items.len > maxRows: "   (" & $(app.paletteSel + 1) & "/" & $items.len & ")" else: ""
-  discard drawText(app.font, bx + 10, by + 8, prompt & app.paletteQuery & countTag,
-                   app.theme.boxFg, boxBg)
+  let tailTxt = app.paletteQuery & countTag
+  let promptPx = boxW - 20 - measureText(app.font, tailTxt).w
+  discard drawText(app.font, bx + 10, by + 8,
+                   fitText(app, prompt, max(0, promptPx)) & tailTxt, app.theme.boxFg, boxBg)
   var y = by + 8 + lineH + 4
   for i in top ..< top + rows:
     let rowBg = if i == app.paletteSel: app.theme.boxSelBg else: boxBg
     fillRect(rect(bx + 4, y, boxW - 8, lineH), rowBg)
     let suffix = if i == top + rows - 1 and more > 0: "   \u2026 +" & $more else: ""
-    discard drawText(app.font, bx + 12, y, items[i][1] & suffix, app.theme.boxFg, rowBg)
+    let lblPx = boxW - 20 - measureText(app.font, suffix).w
+    discard drawText(app.font, bx + 12, y,
+                     fitText(app, items[i][1], max(0, lblPx)) & suffix, app.theme.boxFg, rowBg)
     y += lineH
 
 proc drawSearch(app: App; sr: Rect; lineH: int) =
@@ -172,6 +194,17 @@ proc paletteAccept(app: var App) =
   of pmRecent:
     app.paletteActive = false
     openFile(app, id)
+  of pmSaveAs:
+    if app.paletteQuery.len > 0 and not dirExists(app.paletteDir / app.paletteQuery):
+      app.paletteActive = false
+      saveBufferAs(app, app.paletteDir / app.paletteQuery)
+    elif id == "..":
+      app.paletteDir = parentDir(app.paletteDir); app.paletteQuery = ""; app.paletteSel = 0
+    elif dirExists(id):
+      app.paletteDir = id; app.paletteQuery = ""; app.paletteSel = 0
+    else:
+      app.paletteActive = false
+      saveBufferAs(app, id)
 
 proc handlePalette(app: var App; e: Event) =
   if e.kind == KeyDownEvent:
@@ -565,7 +598,8 @@ proc main() =
                     ("▲", "prev-chunk"), ("▼", "next-chunk"),
                     ("△", "prev-comment"), ("▽", "next-comment"),
                     ("Edit", "src-edit-block")]
-    const tbMenu = [("Accept change", "criticmarkup-accept"),
+    const tbMenu = [("Save As\u2026", "save-as"),
+                    ("Accept change", "criticmarkup-accept"),
                     ("Reject change", "criticmarkup-reject"),
                     ("Accept all", "criticmarkup-accept-all"),
                     ("Reject all", "criticmarkup-reject-all"),

@@ -86,7 +86,7 @@ type
     run*: proc(app: var App)
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
-  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent
+  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent, pmSaveAs
   SearchMode* = enum smFind, smReplace
   SearchField* = enum sfQuery, sfReplace
   VimMode* = enum vmNormal, vmInsert
@@ -572,13 +572,14 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
       if q.len == 0 or q in nm.toLowerAscii:
         let dirty = if b.ed.changed: " [+]" else: ""
         result.add ($i, nm & dirty & (if i == app.curBuf: "  (current)" else: ""))
-  of pmFiles:
+  of pmFiles, pmSaveAs:
     result.add ("..", "../")
     var dirs, files: seq[tuple[id, label: string]]
+    let filter = app.paletteMode == pmFiles
     for kind, path in walkDir(app.paletteDir):
       let nm = extractFilename(path)
       if nm.startsWith("."): continue
-      if q.len > 0 and q notin nm.toLowerAscii: continue
+      if filter and q.len > 0 and q notin nm.toLowerAscii: continue
       if kind == pcDir: dirs.add (path, nm & "/")
       else: files.add (path, nm)
     dirs.sort(proc(a, b: (string, string)): int = cmp(a[1], b[1]))
@@ -778,6 +779,23 @@ proc openPalette(app: var App; mode: PaletteMode) =
       if e.id == gLastCommand: app.paletteSel = i; break
 
 proc paletteCmd*(app: var App) = openPalette(app, pmCommands)
+
+proc saveBufferAs*(app: var App; path: string) =
+  ## Save the buffer to PATH (becoming the buffer's file), for `save-as`.
+  var p = expandTilde(path)
+  if not isAbsolute(p): p = getCurrentDir() / p
+  try:
+    app.ed.saveToFile(p); app.filePath = p; app.ed.markSaved()
+    app.noteDiskMtime(); app.runHooks("after-save")
+    app.msg = "saved as " & extractFilename(p)
+  except CatchableError as ex:
+    app.msg = "save failed: " & ex.msg
+
+proc saveAsCmd*(app: var App) =
+  ## Prompt (file palette) for a target path, prefilled with the current name.
+  openPalette(app, pmSaveAs)
+  app.paletteDir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
+  app.paletteQuery = if app.filePath.len > 0: extractFilename(app.filePath) else: ""
 
 proc orgNavCmd*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
@@ -1979,6 +1997,7 @@ proc registerBuiltins*() =
     "except Exception as _e:\n    print('no help for {word}:', _e)\n"
 
   defcommand("save", "Save", saveCmd)
+  defcommand("save-as", "Save the buffer to a new path", saveAsCmd)
   defcommand("quit", "Quit", quitCmd)
   defcommand("run-line", "Run current line in session", runLine)
   defcommand("babel-execute", "Org-babel: run this src block", babelExecute)
