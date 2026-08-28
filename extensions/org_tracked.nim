@@ -83,6 +83,32 @@ proc criticToSpans(md: string): string =
       inc q
     -1
   while i < md.len:
+    # {==range==} optionally followed by {>>comment<<}: anchor the comment to
+    # the highlighted range (a real commented span in Word), else keep the text.
+    if i + 4 < md.len and md[i] == '{' and md[i+1] == '=' and md[i+2] == '=':
+      let he = closeOf('=', '=')                 # index of the highlight's '}'
+      if he >= 0:
+        let rng = orgCiteToPandoc(md[i+3 ..< he-2])
+        if he + 3 < md.len and md[he+1] == '{' and md[he+2] == '>' and md[he+3] == '>':
+          var q = he + 4
+          var ce = -1
+          while q + 2 < md.len:
+            if md[q] == '<' and md[q+1] == '<' and md[q+2] == '}': ce = q + 2; break
+            inc q
+          if ce >= 0:
+            var note = md[he+4 ..< ce-2].strip()
+            var cauth = a
+            if note.startsWith("[") and ']' in note:
+              let rb = note.find(']')
+              cauth = note[1 ..< rb]
+              note = note[rb+1 .. ^1].strip()
+            result.add "[" & orgCiteToPandoc(note) & "]{.comment-start id=\"" & $cid &
+                       "\" author=\"" & cauth & "\" date=\"" & d & "\"}" & rng &
+                       "[]{.comment-end id=\"" & $cid & "\"}"
+            inc cid
+            i = ce + 1; continue
+        result.add rng                           # orphan highlight: keep the text
+        i = he + 1; continue
     if i + 4 < md.len and md[i] == '{':
       let x = md[i+1]; let y = md[i+2]
       if x == y and x in {'+', '-', '=', '~'}:
