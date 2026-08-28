@@ -67,7 +67,7 @@ proc orgCiteToPandoc(s: string): string =
         continue
     result.add s[i]; inc i
 
-proc criticToSpans(md: string): string =
+proc criticToSpans(md: string; doneIds: var seq[int]): string =
   ## CriticMarkup tokens -> pandoc markdown spans (for md -> docx). Uses the same
   ## split scanner style as wkbcore.applyCriticMarkup.
   let a = trackAuthor()
@@ -102,6 +102,9 @@ proc criticToSpans(md: string): string =
               let rb = note.find(']')
               cauth = note[1 ..< rb]
               note = note[rb+1 .. ^1].strip()
+            if "[DONE]" in note:
+              doneIds.add cid
+              note = note.replace("[DONE] ", "").replace("[DONE]", "").strip()
             result.add "[" & orgCiteToPandoc(note) & "]{.comment-start id=\"" & $cid &
                        "\" author=\"" & cauth & "\" date=\"" & d & "\"}" & rng &
                        "[]{.comment-end id=\"" & $cid & "\"}"
@@ -141,6 +144,9 @@ proc criticToSpans(md: string): string =
             let rb = note.find(']')
             cauth = note[1 ..< rb]
             note = note[rb+1 .. ^1].strip()
+          if "[DONE]" in note:
+            doneIds.add cid
+            note = note.replace("[DONE] ", "").replace("[DONE]", "").strip()
           result.add "[" & orgCiteToPandoc(note) & "]{.comment-start id=\"" & $cid & "\" author=\"" &
                      cauth & "\" date=\"" & d & "\"}[]{.comment-end id=\"" & $cid & "\"}"
           inc cid
@@ -325,6 +331,98 @@ proc extractOrgSource*(docx: string): string =
       if e >= payStart + 3 and content[e-3 ..< e] == "]]>":
         return cdataUnescape(content[payStart ..< e-3]).replace("\r\n", "\n").replace("\r", "\n")
   ""
+
+proc resolveDoneComments(docx: string; doneIds: seq[int]): bool =
+  ## Mark the given comment ids "Resolved" in Word's reviewing pane: inject a
+  ## w14:paraId on each comment's first <w:p> and write word/commentsExtended.xml
+  ## with w15:done="1" for those ids, registered in [Content_Types].xml and the
+  ## document rels. Port of org-tracked-docx's otd-resolve-comments.py.
+  if doneIds.len == 0: return false
+  let unzipExe = findExe("unzip")
+  let zipExe   = findExe("zip")
+  if unzipExe.len == 0 or zipExe.len == 0: return false
+  let docxAbs = absolutePath(docx)
+  let tmp = getTempDir() / ("otd-done-" & $getCurrentProcessId() & "-" & $int(epochTime()))
+  removeDir(tmp); createDir(tmp)
+  defer: removeDir(tmp)
+  if execCmdEx(quoteShell(unzipExe) & " -q " & quoteShell(docxAbs) &
+               " -d " & quoteShell(tmp)).exitCode != 0: return false
+  let cPath = tmp / "word" / "comments.xml"
+  if not fileExists(cPath): return false            # no comments -> nothing to do
+  var comments = readFile(cPath)
+  let headEnd = comments.find('>')
+  if headEnd > 0 and "xmlns:w14=" notin comments[0 .. headEnd]:
+    comments = comments.replace("<w:comments ",
+      "<w:comments xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" ")
+  var paraIds = initTable[int, string]()
+  var counter = 0x10000001
+  var res = ""
+  var i = 0
+  while true:
+    let cs = comments.find("<w:comment ", i)
+    if cs < 0: res.add comments[i .. ^1]; break
+    res.add comments[i ..< cs]
+    let ce = comments.find("</w:comment>", cs)
+    if ce < 0: res.add comments[cs .. ^1]; break
+    let ceEnd = ce + "</w:comment>".len
+    var blk = comments[cs ..< ceEnd]
+    let tagEnd = blk.find('>')
+    var cid = -1
+    let idp = blk.find("w:id=\"")
+    if idp >= 0 and idp < tagEnd:
+      var k = idp + 6
+      var num = ""
+      while k < blk.len and blk[k] in {'0'..'9'}: num.add blk[k]; inc k
+      if num.len > 0: cid = parseInt(num)
+    var pp = -1                                        # first <w:p> (not <w:pPr>)
+    var sp = tagEnd
+    while true:
+      let cand = blk.find("<w:p", sp)
+      if cand < 0: break
+      if cand + 4 < blk.len and blk[cand+4] in {' ', '>', '/'}: pp = cand; break
+      sp = cand + 4
+    if pp >= 0:
+      let pe = blk.find('>', pp)
+      if pe >= 0 and "w14:paraId" notin blk[pp .. pe]:
+        let pid = toHex(counter, 8); inc counter
+        if blk[pe-1] == '/': blk = blk[0 ..< pe-1] & " w14:paraId=\"" & pid & "\"/>" & blk[pe+1 .. ^1]
+        else:                blk = blk[0 ..< pe] & " w14:paraId=\"" & pid & "\">" & blk[pe+1 .. ^1]
+        if cid >= 0: paraIds[cid] = pid
+    res.add blk
+    i = ceEnd
+  var entries = ""
+  for cid in doneIds:
+    if paraIds.hasKey(cid):
+      entries.add "<w15:commentEx w15:paraId=\"" & paraIds[cid] & "\" w15:done=\"1\"/>"
+  writeFile(cPath, res)
+  writeFile(tmp / "word" / "commentsExtended.xml",
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n" &
+    "<w15:commentsEx xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">" &
+    entries & "</w15:commentsEx>")
+  let ct = tmp / "[Content_Types].xml"
+  if fileExists(ct):
+    let c = readFile(ct)
+    if "commentsExtended" notin c:
+      writeFile(ct, c.replace("</Types>",
+        "<Override PartName=\"/word/commentsExtended.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml\"/></Types>"))
+  let rels = tmp / "word" / "_rels" / "document.xml.rels"
+  if fileExists(rels):
+    let r = readFile(rels)
+    if "commentsExtended.xml" notin r:
+      var maxId = 0
+      var k = 0
+      while true:
+        let p = r.find("Id=\"rId", k)
+        if p < 0: break
+        var j = p + 7
+        var num = ""
+        while j < r.len and r[j] in {'0'..'9'}: num.add r[j]; inc j
+        if num.len > 0: maxId = max(maxId, parseInt(num))
+        k = j + 1
+      writeFile(rels, r.replace("</Relationships>",
+        "<Relationship Id=\"rId" & $(maxId+1) & "\" Type=\"http://schemas.microsoft.com/office/2011/relationships/commentsExtended\" Target=\"commentsExtended.xml\"/></Relationships>"))
+  removeFile(docxAbs)
+  execCmdEx(quoteShell(zipExe) & " -q -r " & quoteShell(docxAbs) & " .", workingDir = tmp).exitCode == 0
 
 # ---- import merge: embedded canonical + reviewer's tracked changes ---------
 # Recover cite keys / cross-refs / #+headers / structure from the embedded
@@ -573,7 +671,8 @@ proc otdExport(app: var App) =
   # -s carries #+TITLE etc. as YAML metadata into the markdown.
   var (code, outp) = pandoc(@["-f", "org", "-t", "markdown", "--wrap=none", "-s", orgTmp, "-o", md])
   if code != 0: (app.msg = "pandoc org->md failed: " & outp.strip(); return)
-  writeFile(md, unescapeRefs(criticToSpans(unstash(readFile(md), toks))))
+  var doneIds: seq[int]
+  writeFile(md, unescapeRefs(criticToSpans(unstash(readFile(md), toks), doneIds)))
   # md -> docx: standalone (title), citeproc + bibliography (references),
   # pandoc-crossref (fig:/tbl: cross-refs), optional CSL + reference-doc.
   var dargs = @["-f", "markdown", "-t", "docx", "-s"]
@@ -588,6 +687,7 @@ proc otdExport(app: var App) =
   if code != 0: (app.msg = "pandoc md->docx failed: " & outp.strip(); return)
   # Embed the canonical org so re-import can recover cite keys / cross-refs / headers.
   let embedded = gEmbedSource and embedOrgSource(docx, app.ed.fullText())
+  if doneIds.len > 0: discard resolveDoneComments(docx, doneIds)
   app.msg = "otd: exported -> " & extractFilename(docx) &
             (if embedded: "  [+org]" else: "") &
             (if bib.len > 0: "  [refs: " & extractFilename(bib) & "]" else: "")
