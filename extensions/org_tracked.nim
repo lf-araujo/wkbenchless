@@ -13,6 +13,7 @@
 
 import wkbcore
 import std/[osproc, os, strutils, times, tables, sequtils, sets]
+import zippy/ziparchives   # vendored pure-Nim zip: embed the .org into the docx
 
 var
   gPandoc* = "pandoc"
@@ -20,6 +21,8 @@ var
   gBib* = ""          ## bibliography path; else #+bibliography: header, else sibling .bib
   gCsl* = ""          ## CSL citation-style file (optional)
   gRefDoc* = ""       ## Word reference-doc / template (optional)
+  gMediaDir* = ""     ## extra dir (relative to the org, e.g. "graphs") to search
+                      ## for figure images, on top of the org's own directory
   gEmbedSource* = true ## embed the canonical .org inside the exported docx (round-trip)
 
 proc trackAuthor(): string =
@@ -238,72 +241,86 @@ const
   cxItemProps = "itemProps-otd-source.xml"
   cxNamespace = "urn:org-tracked-docx:source"
 
-proc cdataEscape(s: string): string =
-  "<![CDATA[" & s.replace("]]>", "]]]]><![CDATA[>") & "]]>"
-
 proc cdataUnescape(s: string): string =
   s.replace("]]]]><![CDATA[>", "]]>")
 
+proc cdataEscape(s: string): string =
+  "<![CDATA[" & s.replace("]]>", "]]]]><![CDATA[>") & "]]>"
+
+proc nextRelId(rel: string): int =
+  ## One past the highest rIdN in a relationships part.
+  var i = 0
+  while true:
+    let p = rel.find("Id=\"rId", i)
+    if p < 0: break
+    var j = p + 7
+    var num = ""
+    while j < rel.len and rel[j] in {'0'..'9'}: num.add rel[j]; inc j
+    if num.len > 0: result = max(result, parseInt(num))
+    i = j + 1
+  inc result
+
 proc embedOrgSource*(docx, orgContent: string): bool =
-  ## Embed ORGCONTENT inside DOCX as a customXml part, registered in
-  ## [Content_Types].xml and word/_rels/document.xml.rels so Word and
-  ## LibreOffice preserve it across saves and tracked edits. Port of
-  ## otd--embed-org-source. Returns true on success.
-  let unzipExe = findExe("unzip")
-  let zipExe   = findExe("zip")
-  if unzipExe.len == 0 or zipExe.len == 0: return false
+  ## Embed ORGCONTENT inside DOCX as a customXml part (registered in
+  ## [Content_Types].xml and word/_rels/document.xml.rels) so Word / LibreOffice
+  ## preserve it across saves and tracked edits, and re-import can recover cite
+  ## keys / cross-refs / #+headers. Rewrites the package with vendored zippy
+  ## (pure Nim): [Content_Types].xml first, NO directory entries -- a conformant
+  ## OPC docx Word accepts (unlike a shell `zip -r`, which reorders parts and
+  ## injects directory entries, making Word flag the file read-only). Returns
+  ## true on success.
   let docxAbs = absolutePath(docx)
   if not fileExists(docxAbs): return false
-  let tmp = getTempDir() / ("otd-embed-" & $getCurrentProcessId() & "-" & $int(epochTime()))
-  removeDir(tmp); createDir(tmp)
-  defer: removeDir(tmp)
-  if execCmdEx(quoteShell(unzipExe) & " -q " & quoteShell(docxAbs) &
-               " -d " & quoteShell(tmp)).exitCode != 0: return false
-  let cxDir = tmp / "customXml"
-  createDir(cxDir); createDir(cxDir / "_rels")
-  writeFile(cxDir / cxItemName,
-    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
-    "<orgTrackedSource xmlns=\"" & cxNamespace & "\">" &
-    cdataEscape(orgContent) & "</orgTrackedSource>\n")
-  writeFile(cxDir / cxItemProps,
-    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
-    "<ds:datastoreItem ds:itemID=\"{ORG-TRACKED-DOCX-SOURCE}\"" &
-    " xmlns:ds=\"http://schemas.openxmlformats.org/officeDocument/2006/customXml\">" &
-    "<ds:schemaRefs><ds:schemaRef ds:uri=\"" & cxNamespace & "\"/></ds:schemaRefs>" &
-    "</ds:datastoreItem>\n")
-  writeFile(cxDir / "_rels" / (cxItemName & ".rels"),
-    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
-    "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" &
-    "<Relationship Id=\"rId1\"" &
-    " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps\"" &
-    " Target=\"" & cxItemProps & "\"/></Relationships>\n")
-  let ct = tmp / "[Content_Types].xml"
-  if fileExists(ct):
-    let ins = "<Override PartName=\"/customXml/" & cxItemName &
-              "\" ContentType=\"application/xml\"/>" &
-              "<Override PartName=\"/customXml/" & cxItemProps &
-              "\" ContentType=\"application/vnd.openxmlformats-officedocument.customXmlProperties+xml\"/>"
-    writeFile(ct, readFile(ct).replace("</Types>", ins & "</Types>"))
-  let rels = tmp / "word" / "_rels" / "document.xml.rels"
-  if fileExists(rels):
-    let r = readFile(rels)
-    var maxId = 0
-    var i = 0
-    while true:
-      let p = r.find("Id=\"rId", i)
-      if p < 0: break
-      var j = p + 7
-      var num = ""
-      while j < r.len and r[j] in {'0'..'9'}: num.add r[j]; inc j
-      if num.len > 0: maxId = max(maxId, parseInt(num))
-      i = j + 1
-    let ins = "<Relationship Id=\"rId" & $(maxId + 1) & "\"" &
-              " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\"" &
-              " Target=\"../customXml/" & cxItemName & "\"/>"
-    writeFile(rels, r.replace("</Relationships>", ins & "</Relationships>"))
-  removeFile(docxAbs)
-  execCmdEx(quoteShell(zipExe) & " -q -r " & quoteShell(docxAbs) & " .",
-            workingDir = tmp).exitCode == 0
+  try:
+    var entries: OrderedTable[string, string]
+    block:
+      let reader = openZipArchive(docxAbs)
+      defer: reader.close()
+      for path in reader.walkFiles: entries[path] = reader.extractFile(path)
+    if "[Content_Types].xml" notin entries or
+       "word/_rels/document.xml.rels" notin entries: return false
+
+    entries["customXml/" & cxItemName] =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
+      "<orgTrackedSource xmlns=\"" & cxNamespace & "\">" &
+      cdataEscape(orgContent) & "</orgTrackedSource>\n"
+    entries["customXml/" & cxItemProps] =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
+      "<ds:datastoreItem ds:itemID=\"{ORG-TRACKED-DOCX-SOURCE}\"" &
+      " xmlns:ds=\"http://schemas.openxmlformats.org/officeDocument/2006/customXml\">" &
+      "<ds:schemaRefs><ds:schemaRef ds:uri=\"" & cxNamespace & "\"/></ds:schemaRefs>" &
+      "</ds:datastoreItem>\n"
+    entries["customXml/_rels/" & cxItemName & ".rels"] =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
+      "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" &
+      "<Relationship Id=\"rId1\"" &
+      " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps\"" &
+      " Target=\"" & cxItemProps & "\"/></Relationships>\n"
+
+    var rel = entries["word/_rels/document.xml.rels"]
+    if ("customXml/" & cxItemName) notin rel:
+      rel = rel.replace("</Relationships>",
+        "<Relationship Id=\"rId" & $nextRelId(rel) & "\"" &
+        " Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml\"" &
+        " Target=\"../customXml/" & cxItemName & "\"/></Relationships>")
+      entries["word/_rels/document.xml.rels"] = rel
+
+    # [Content_Types].xml must be the FIRST archive entry; zippy emits entries in
+    # reverse insertion order, so patch it and re-insert it LAST.
+    var ct = entries["[Content_Types].xml"]
+    if ("customXml/" & cxItemName) notin ct:
+      ct = ct.replace("</Types>",
+        "<Override PartName=\"/customXml/" & cxItemName &
+        "\" ContentType=\"application/xml\"/>" &
+        "<Override PartName=\"/customXml/" & cxItemProps &
+        "\" ContentType=\"application/vnd.openxmlformats-officedocument.customXmlProperties+xml\"/></Types>")
+    entries.del("[Content_Types].xml")
+    entries["[Content_Types].xml"] = ct
+
+    writeFile(docxAbs, createZipArchive(entries))
+    result = true
+  except CatchableError:
+    result = false
 
 proc extractOrgSource*(docx: string): string =
   ## Recover the embedded canonical org from DOCX, or "" if absent. Identifies
@@ -676,6 +693,15 @@ proc otdExport(app: var App) =
   # md -> docx: standalone (title), citeproc + bibliography (references),
   # pandoc-crossref (fig:/tbl: cross-refs), optional CSL + reference-doc.
   var dargs = @["-f", "markdown", "-t", "docx", "-s"]
+  # Resolve relative image paths (e.g. [[file:media/fig.png]]) against the org's
+  # directory -- pandoc runs on a copy in /tmp, so without this it can't fetch
+  # them and drops the figures ("replacing image with description").
+  let srcDir = if app.filePath.len > 0: parentDir(absolutePath(app.filePath))
+               else: getCurrentDir()
+  var rpaths = @[srcDir]
+  if gMediaDir.len > 0:                        # e.g. gMediaDir = "graphs"
+    rpaths.add (if isAbsolute(gMediaDir): gMediaDir else: srcDir / gMediaDir)
+  dargs.add "--resource-path=" & rpaths.join($PathSep)   # PathSep: ':' / ';'
   if findExe("pandoc-crossref").len > 0: (dargs.add "--filter"; dargs.add "pandoc-crossref")
   dargs.add "--citeproc"
   let bib = findBib(app)

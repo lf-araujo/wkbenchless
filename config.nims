@@ -9,6 +9,11 @@ switch("path", "src")
 ## `import uirelays`, `import uirelays/…`, and `import widgets/…` resolve to it.
 switch("path", "src/vendor/uirelays")
 
+## zippy (pure-Nim zip, dependency-free) vendored in-tree -- the org-tracked
+## extension uses it to embed the canonical .org into the exported .docx as a
+## conformant OPC package (no python / shell `zip` needed).
+switch("path", "src/vendor/zippy")
+
 ## GTK4/libadwaita here come from a conda-forge env (this network's Zscaler
 ## proxy blocks gnu.org, which brew's from-source build of these needs --
 ## see DESIGN.md). Their dylibs use @rpath install names, so the binary
