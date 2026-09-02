@@ -311,7 +311,12 @@ proc setPtySize*(t: Pty; rows, cols: int) =
   if t.vt != nil: t.vt.resize(rows, cols)
 
 proc setVtColors*(t: Pty; fg, bg: Color) =
-  if t.vt != nil: (t.vt.defFg = fg; t.vt.defBg = bg)
+  if t.vt != nil:
+    if t.vt.defFg != fg or t.vt.defBg != bg:
+      # Theme changed: repaint cells that used the old defaults so the terminal
+      # follows the buffer above (explicit SGR colours are left alone).
+      t.vt.recolorDefaults(t.vt.defFg, t.vt.defBg, fg, bg)
+      t.vt.defFg = fg; t.vt.defBg = bg
 
 proc notRunningPty*(): Pty =
   ## A Pty in the not-running state (POSIX master defaults to 0, a valid fd, so

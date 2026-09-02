@@ -128,9 +128,8 @@ The editor exposes a loopback control socket (127.0.0.1, token-authenticated)
 that drives a running instance — handy for scripts and for agents in the
 embedded terminal. It's built into the binary, so **`wkbenchless ctl <verb>`**
 is all you need; the shipped release is a single binary. (`wkbctl` is an
-optional convenience — build it with `nimble build`, or symlink it to
-`wkbenchless`; the examples below work with either name.) Works on
-Linux/macOS/Windows.
+optional convenience — symlink it to `wkbenchless`; the examples below work
+with either name.) Works on Linux/macOS/Windows.
 
 ```sh
 wkbctl buffer                          # print the current buffer

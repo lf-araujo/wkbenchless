@@ -40,7 +40,7 @@ proc configure*(app: var App) =
   bindkey("C-c o", "refresh-objects")
   bindkey("C-c n", "focus-next")        # cycle pane focus
   bindkey("C-c s", "switch-session")    # cycle the current session
-  bindkey("C-c k", "new-terminal")      # bash terminal session
+  bindkey("C-c k", "terminal")          # bash terminal in the bottom panel
   bindkey("C-c f", "edit-config")       # open this file
   bindkey("C-c r", "reload-config")     # recompile & restart
   bindkey("C-x C-f", "open-file")       # browse & open a file (palette)

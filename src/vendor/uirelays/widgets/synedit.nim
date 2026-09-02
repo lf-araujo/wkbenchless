@@ -278,7 +278,7 @@ proc setRenderFlag*(s: var SynEdit; flag: RenderFlag; enabled = true) =
 # Gap buffer access
 # ---------------------------------------------------------------------------
 
-proc getCell(s: SynEdit; i: Natural): Cell {.inline.} =
+proc getCell*(s: SynEdit; i: Natural): Cell {.inline.} =
   if i < s.front.len:
     s.front[i]
   else:
@@ -1161,6 +1161,34 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
         lp = q + 2
         continue
     inc lp
+  # [cite:...] citations (org-cite): colour the whole construct as a link and
+  # pick out each @key in the reference face so the keys read at a glance.
+  var cp = first
+  while cp + 5 <= last:
+    if s[cp] == '[' and s[cp + 1] == 'c' and s[cp + 2] == 'i' and
+       s[cp + 3] == 't' and s[cp + 4] == 'e' and not s.inSrcBlock(cp):
+      # optional /style after "cite", then ':'
+      var k = cp + 5
+      if k < last and s[k] == '/':
+        inc k
+        while k < last and s[k] notin {':', ']', '\L'}: inc k
+      if k < last and s[k] == ':':
+        var q = k + 1
+        while q <= last and s[q] notin {']', '\L'}: inc q
+        if q <= last and s[q] == ']':
+          for j in cp .. q: s.setCellStyle(j, TokenClass.Link)
+          # @key runs in the reference face
+          var t = k + 1
+          while t < q:
+            if s[t] == '@':
+              var u = t
+              while u < q and s[u] notin {' ', ';', ']', '\L'}: inc u
+              for j in t ..< u: s.setCellStyle(j, TokenClass.Reference)
+              t = u
+            else: inc t
+          cp = q + 1
+          continue
+    inc cp
   # inline emphasis: *bold* /italic/ _underline_ =verbatim= ~code~. Org requires
   # the markers to hug non-space text, so a lone '*' or a spaced '/' is left be.
   proc emph(s: var SynEdit; ch: char; flag: CellFlag; first, last: int) =
@@ -1306,12 +1334,26 @@ proc getLineFromOffset(s: SynEdit; pos: int): Natural =
     if s[p] == '\L': inc result
     dec p
 
+# Sequential line-offset cache: getLineOffset is called once per line when
+# iterating a whole buffer (getLineText(i) in a loop), and scanning from the
+# start each time is O(n^2) on large files. Remembering the last resolved line
+# makes a forward pass O(n). Keyed by cacheId so edits invalidate it.
+var gLastLine, gLastLineOffset, gLastLineVersion: int
+
 proc getLineOffset(s: SynEdit; lines: Natural): int =
   var y = lines.int
   if y == 0: return 0
   for ce in s.offsetToLineCache:
     if ce.version == s.cacheId and ce.line == lines:
       return ce.offset
+  # Sequential scans (iterating every line) reuse the last resolved offset so
+  # the whole pass is O(n) instead of O(n^2) -- getLineText(i) in a loop was
+  # quadratic on large files (e.g. a 7.8 MB .bib) and froze the app.
+  var start = 0
+  if gLastLineVersion == s.cacheId and lines.int >= gLastLine:
+    start = gLastLineOffset
+    y = lines.int - gLastLine
+  var result = start
   while true:
     if s[result] == '\L':
       dec y
@@ -1319,6 +1361,10 @@ proc getLineOffset(s: SynEdit; lines: Natural): int =
         inc result
         break
     inc result
+  gLastLine = lines.int
+  gLastLineOffset = result
+  gLastLineVersion = s.cacheId
+  result
 
 proc updateLineCache(s: var SynEdit; offset: int; line: Natural) =
   var idx = 0
@@ -2430,31 +2476,81 @@ proc parseImageLinkPath(line: string; path: var string): bool =
     path = inner
     return path.len > 0 and isImagePath(path)
 
-proc parseMathLine*(line: string; inner: var string): bool =
-  ## A whole line that is a single display-math fragment; sets `inner` to the
-  ## math body with delimiters stripped. Recognises $$..$$, \[..\], \(..\) and
-  ## a whole-line $..$.
-  let t = line.strip
-  if t.len < 3: return
-  template body(a, b: string): string =
-    (if t.startsWith(a) and t.endsWith(b) and t.len >= a.len + b.len:
-       t[a.len ..< t.len - b.len].strip else: "")
-  var m = body("$$", "$$")
-  if m.len == 0: m = body("\\[", "\\]")
-  if m.len == 0: m = body("\\(", "\\)")
-  if m.len == 0 and t.len >= 3 and t[0] == '$' and t[^1] == '$' and
-     not t.startsWith("$$"):
-    m = t[1 ..< t.len - 1].strip
-  if m.len == 0: return
-  inner = m
+proc latexDisplayMathAt*(s: SynEdit; lineStart: int; body: var string;
+                         blockEnd: var int): bool =
+  ## If the line beginning at buffer offset `lineStart` is a display-math
+  ## fragment, set `body` to the clean math (delimiters and any trailing
+  ## `{#label}` stripped) and `blockEnd` to the buffer offset just past the
+  ## closing line, returning true.
+  ##
+  ## Handles single-line `$$..$$` / `\[..\]` and multi-line blocks opened by a
+  ## bare `$$` / `\[` line and closed by a matching `$$` / `\]` line (the
+  ## close may carry an org label, e.g. `\]#{eq:req}` or `$${#eq:org}`).
+  var j = lineStart
+  while j < s.len and s[j] != '\L': inc j
+  var t = newStringOfCap(max(0, j - lineStart))
+  for p in lineStart ..< j:
+    t.add s[p]
+  let ts = t.strip
+  if ts.len < 2: return
+
+  proc peelLabel(x: string): string =
+    ## Drop a trailing `{#label}` suffix so a labelled close still matches.
+    if x.len > 0 and x[^1] == '}':
+      let k = x.rfind("{#")
+      if k >= 0 and k + 1 < x.len and
+         (k == 0 or x[k - 1] in {' ', '\t', ']'}):
+        return x[0 ..< (if k > 0 and x[k - 1] in {' ', '\t'}: k - 1 else: k)]
+    x
+
+  template single(a, b: string): string =
+    (if ts.startsWith(a) and ts.endsWith(b) and ts.len >= a.len + b.len:
+       ts[a.len ..< ts.len - b.len].strip else: "")
+  var m = single("$$", "$$")
+  var openerDollar = false
+  var openerBracket = false
+  if m.len == 0:
+    let tlb = peelLabel(ts)
+    if tlb.startsWith("\\[") and tlb.endsWith("\\]"):
+      m = tlb[2 ..< tlb.len - 2].strip
+  if m.len == 0 and ts == "$$": openerDollar = true
+  if m.len == 0 and ts == "\\[": openerBracket = true
+  if m.len > 0:
+    body = m
+    blockEnd = j
+    return true                       # self-contained single-line fragment
+  if not openerDollar and not openerBracket: return
+
+  # multi-line block: accumulate lines until the closing delimiter
+  var outBuf = newStringOfCap(256)
+  var start = j + 1                   # first byte of the line after the opener
+  var closed = false
+  var e = start
+  while start <= s.len:
+    e = start
+    while e < s.len and s[e] != '\L': inc e
+    var ltxt = newStringOfCap(max(0, e - start))
+    for p in start ..< e:
+      ltxt.add s[p]
+    let ls = peelLabel(ltxt.strip)
+    let closeTok = if openerDollar: "$$" else: "\\]"
+    if ls.len >= closeTok.len and ls.startsWith(closeTok):
+      closed = true
+      break
+    if outBuf.len > 0: outBuf.add "\n"
+    outBuf.add ltxt
+    start = e + 1
+  if not closed: return
+  blockEnd = e + (if e < s.len: 1 else: 0)   # just past the closing line
+  body = outBuf
   result = true
 
-proc ltxCachePath*(lineText: string): string =
-  ## Deterministic PNG cache path for a math line's rendered image -- identical
-  ## for the renderer (lookup) and `M-x latex-preview` (generation), so no
-  ## shared state is needed, only the line's (trimmed) text.
+proc ltxCachePath*(body: string): string =
+  ## Deterministic PNG cache path for a math fragment's rendered image -- the
+  ## body hash is the render loop's lookup key, so generation (in `M-x
+  ## latex-preview`) and lookup stay in sync without shared state.
   getCacheDir() / "wkbenchless" / "ltximg" /
-    (toHex(hash(lineText.strip).uint64) & ".png")
+    (toHex(hash(body).uint64) & ".png")
 
 proc attrDim(line, key: string): int =
   ## Leading integer after `:key` in an org attribute line (units ignored), or 0.
@@ -2520,10 +2616,11 @@ proc renderMarkdownImageLine(
   var handled = false
   if rfInlineImages in s.flags and parseImageLinkPath(line, imgPath):
     handled = true                                  # image link (relative ok)
+  var blockEnd = -1                                 # byte past a multi-line math block
   if not handled and rfLatexPreview in s.flags:     # cached LaTeX math preview
     var inner = ""
-    if parseMathLine(line, inner):
-      let cp = ltxCachePath(line)
+    if latexDisplayMathAt(s, lineStart, inner, blockEnd):
+      let cp = ltxCachePath(inner)
       if fileExists(cp): imgPath = cp; handled = true   # else: show source
   if not handled:
     return
@@ -2546,6 +2643,18 @@ proc renderMarkdownImageLine(
   if wantW == 0 and wantH == 0 and s.imageDefaultWidth > 0:
     wantW = s.imageDefaultWidth
 
+  # For a multi-line block the image replaces all its source lines, so size it
+  # to fill the block's vertical space (capped by the pane) rather than the
+  # native/tight height, which would leave a gap or overlap the next line.
+  var blockRows = 1
+  if blockEnd > j:
+    blockRows = 0
+    var k = lineStart
+    while k < blockEnd:
+      if s[k] == '\L': inc blockRows
+      inc k
+    if blockRows < 1: blockRows = 1
+
   var tw, th: int
   if img != Image(0) and iw > 0 and ih > 0:
     # Derive from the native aspect ratio -- never stretch.
@@ -2555,6 +2664,8 @@ proc renderMarkdownImageLine(
     else: (tw, th) = (iw, ih)                        # default: native size
     if tw > maxW: th = max(1, th * maxW div tw); tw = maxW   # fit width, keep aspect
     if th > maxH: tw = max(1, tw * maxH div th); th = maxH   # fit height, keep aspect
+    if blockRows > 1 and th > blockRows * lineH:
+      tw = max(1, tw * (blockRows * lineH) div th); th = blockRows * lineH
   else:
     # Placeholder box (backend without image relays, or a format that could not
     # be loaded/converted): no native aspect to honour.
@@ -2572,9 +2683,21 @@ proc renderMarkdownImageLine(
     discard drawText(s.font, dst.x + 6, dst.y + 4, imgPath, color(220, 220, 220), color(52, 56, 64))
 
   dim.y += th + 2
-  nextIndex = j + 1
-  consumedRows = max(1, (th + lineH - 1) div lineH)
-  result = true
+  if blockEnd > j:
+    # multi-line block: skip all its source lines and advance the line/span
+    # counters by the number of buffer lines it occupies.
+    nextIndex = blockEnd
+    consumedRows = 0
+    var k = lineStart
+    while k < blockEnd:
+      if s[k] == '\L': inc consumedRows
+      inc k
+    if consumedRows < 1: consumedRows = 1
+    result = true
+  else:
+    nextIndex = j + 1
+    consumedRows = 1
+    result = true
 
 proc spaceForLines(s: SynEdit): int =
   if s.showLineNumbers:
@@ -2780,24 +2903,27 @@ proc drawToken(db: var DrawBuf; fg, bg: Color) =
     drawSubtoken(db, 0, db.charsLen - 1, fg, bg)
     db.dim.x += w
   else:
-    # wrapping: just draw what fits, then continue on next line
+    # wrapping: just draw what fits, then continue on next line. Width is
+    # monotonic in length, so binary-search the longest prefix that fits --
+    # the old linear scan rebuilt the string for every probe (O(n^2) on long
+    # lines, e.g. a .bib abstract), which froze the app.
     var ra = 0
     while ra < db.charsLen:
+      # Build the longest prefix that fits, one char at a time (so we don't
+      # rebuild the string for every probe -- O(n^2) on long lines like a .bib
+      # abstract). Width is monotonic, so the first char that overflows ends
+      # the segment, matching the original linear scan's wrap points exactly.
+      db.tempStr.setLen 0
       var probe = ra
       while probe < db.charsLen:
-        db.tempStr.setLen 0
-        for k in ra..probe: db.tempStr.add db.chars[k]
-        let w2 = textWidth(db.font, db.tempStr)
-        if db.dim.x + db.spaceWidth + w2 > db.dim.w:
-          dec probe
+        db.tempStr.add db.chars[probe]
+        if db.dim.x + db.spaceWidth + textWidth(db.font, db.tempStr) > db.dim.w:
+          db.tempStr.setLen db.tempStr.len - 1   # drop the char that overflowed
           break
         inc probe
       if probe <= ra: break
-      let rb = probe - 1
-      db.tempStr.setLen 0
-      for k in ra..rb: db.tempStr.add db.chars[k]
       let ext2 = textWidth(db.font, db.tempStr)
-      drawSubtoken(db, ra, rb, fg, bg)
+      drawSubtoken(db, ra, probe - 1, fg, bg)
       db.dim.x += ext2
       ra = probe
       if ra < db.charsLen:
@@ -3052,7 +3178,7 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
       if s.renderMarkdownImageLine(i, dim, endX, endY, lineH, showCursor, nextI, consumedRows):
         i = nextI
         inc s.span, consumedRows
-        inc renderLine
+        renderLine = (renderLine.int + consumedRows).Natural
         continue
 
     let thisLine = renderLine.int

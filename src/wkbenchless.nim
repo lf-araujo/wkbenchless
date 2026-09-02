@@ -325,8 +325,11 @@ proc blend(a, b: Color; t: int): Color =
   color(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
 
 proc tabLabel(app: App; key: string): string =
-  ## Display text for a bottom-pane tab key (the terminal shows its command).
-  if key == terminalTabKey: app.termLabel else: key
+  ## Display text for a bottom-pane tab key (a terminal tab shows its label).
+  if key.startsWith("·term:"):
+    let idx = (try: parseInt(key["·term:".len .. ^1]) except: -1)
+    if idx >= 0 and idx < app.terminals.len: return app.terminals[idx].label
+  key
 
 proc tabWidth(app: App; key: string; lineH: int): int =
   (" " & tabLabel(app, key) & " ").len * (lineH div 2) + 4
@@ -384,7 +387,7 @@ proc main() =
                 objects: createSynEdit(font), help: createSynEdit(font),
                 curLang: "r", curSession: "default", focus: "editor",
                 font: font, bigFont: bigFont, fontSize: fontSize,
-                running: true, msg: "ready")
+                termActive: -1, running: true, msg: "ready")
   app.ed.showLineNumbers = true
   app.ed.bigFont = bigFont
   applyEmphasisFonts(app.ed)
@@ -454,33 +457,39 @@ proc main() =
   var lastMouse = (x: 0, y: 0)
   var toolbarMenuOpen = false             # the header [☰] menu is showing
   var toolbarMenuX = 0                    # its right edge (menu grows left from here)
-  var pty = notRunningPty()               # thread-free in-pane terminal
   var ctrl = startControl()              # control socket for wkbctl / agents
   let termGridPath = getTempDir() / "wkbenchless-termgrid"
   var termRepaintFrames = 0              # fallback nudge if no grid snapshot exists
-  block:                                 # adopt sessions/terminal from a hot reload
+  block:                                 # adopt sessions/terminals from a hot reload
     let ti = adoptHandoff(app)
-    if ti.master >= 0:
-      pty = adoptTerminal(ti.master, ti.pid, app.theme.termFg, app.theme.panelBg)
-      app.hasTerminal = true; app.termLabel = ti.label; app.termActive = ti.active
+    for t in ti.terminals:
+      var nt = t
+      when defined(posix):                 # fd-handoff hot reload is POSIX-only;
+                                           # adoptHandoff yields no terminals on Windows
+        nt.pty = adoptTerminal(t.pty.master, t.pty.pid.int, app.theme.termFg, app.theme.panelBg)
+      app.terminals.add nt
+    if ti.active >= 0 and ti.active < app.terminals.len:
+      app.termActive = ti.active
+    if app.terminals.len > 0:
       if getEnv("WKB_TERMGRID").len > 0 and fileExists(getEnv("WKB_TERMGRID")):
-        pty.vt.restore(readFile(getEnv("WKB_TERMGRID")))   # identical screen, no repaint wait
+        app.terminals[app.termActive].pty.vt.restore(readFile(getEnv("WKB_TERMGRID")))
         removeFile(getEnv("WKB_TERMGRID")); delEnv("WKB_TERMGRID")
       else:
         termRepaintFrames = 3            # no snapshot: fall back to SIGWINCH nudges
-    if app.sessions.len > 0 or ti.master >= 0:
+    if app.sessions.len > 0 or app.terminals.len > 0:
       app.sessionHidden = false
-      app.msg = "reloaded -- sessions & terminal preserved"
+      app.msg = "reloaded -- sessions & terminals preserved"
   # Terminal text selection (drag to select, copy on release). Coords are
   # (row, col) within the drawn terminal body.
   var selecting = false
   var selHas = false
   var selA, selB = (r: 0, c: 0)
 
-  # The bottom pane is a live terminal on whichever Pty is current: the
-  # standalone terminal (M-t / claude), or else the current REPL session.
+  # The bottom pane is a live terminal on whichever Pty is current: the active
+  # standalone terminal tab, or else the current REPL session.
   proc activePtyPtr(): ptr Pty =
-    if app.termActive: addr pty
+    if app.termActive >= 0 and app.termActive < app.terminals.len:
+      addr app.terminals[app.termActive].pty
     else:
       let cs = currentSession(app)
       if cs != nil: addr cs.pty else: nil
@@ -489,22 +498,31 @@ proc main() =
 
   var e: Event
   while app.running:
-    let livePane = not app.sessionHidden and (app.termActive or currentSession(app) != nil)
+    let livePane = not app.sessionHidden and
+                   (app.termActive >= 0 or currentSession(app) != nil)
     # A timeout so we still poll the pty and the control socket while idle.
     if not waitEvent(e, if livePane: 30 else: 100):
       e = Event(kind: NoEvent)
     if e.kind in {WindowCloseEvent, QuitEvent}: break
 
-    if app.termRequest.len > 0:               # (re)start the terminal process
-      closePty(pty)
-      pty = startPty(app.termRequest, terminalDir(app), app.theme.termFg, app.theme.panelBg)
-      if not pty.alive: app.msg = "could not start " & app.termRequest
-      app.termRequest = ""
-    # Retire the terminal tab once its process has ended and we've moved off it.
-    if app.hasTerminal and not pty.alive and not app.termActive:
-      app.hasTerminal = false
-    when defined(posix):
-      app.termMaster = pty.master; app.termPid = pty.pid.int  # so a hot reload can hand it off
+    # Start a freshly opened terminal (one the host hasn't spawned yet).
+    for i in 0 ..< app.terminals.len:
+      if not app.terminals[i].started:
+        app.terminals[i].pty = startPty(app.terminals[i].cmd, terminalDir(app),
+                                        app.theme.termFg, app.theme.panelBg)
+        app.terminals[i].started = true
+        if not app.terminals[i].pty.alive:
+          app.msg = "could not start " & app.terminals[i].cmd
+    # Retire a terminal tab once its process has ended and we've moved off it.
+    var i = 0
+    while i < app.terminals.len:
+      if app.terminals[i].started and not app.terminals[i].pty.alive and
+         i != app.termActive:
+        closePty(app.terminals[i].pty)
+        app.terminals.delete(i)
+        if app.termActive > i: dec app.termActive
+      else:
+        inc i
     block:                                    # drain the live pane's pty each frame
       let ap = activePtyPtr()
       if ap != nil: pump(ap[])
@@ -512,9 +530,11 @@ proc main() =
     autoRevertActive(app)                     # reload the buffer if the file changed on disk
 
     if app.reloadPending:                     # recompile finished -> snapshot & re-exec
-      if pty.vt != nil and pty.alive:
+      if app.termActive >= 0 and app.termActive < app.terminals.len and
+         app.terminals[app.termActive].pty.vt != nil and
+         app.terminals[app.termActive].pty.alive:
         try:
-          writeFile(termGridPath, pty.vt.serialize())
+          writeFile(termGridPath, app.terminals[app.termActive].pty.vt.serialize())
           putEnv("WKB_TERMGRID", termGridPath)
         except CatchableError: discard
       execReload(app)                         # execv; only returns on failure
@@ -586,7 +606,7 @@ proc main() =
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc
-              elif (app.sessions.len > 0 or app.hasTerminal) and not app.sessionHidden: layPlain
+              elif (app.sessions.len > 0 or app.terminals.len > 0) and not app.sessionHidden: layPlain
               else: layBare
     let toolbarH = lineH + 8
     var cells = resolve(lay, screen.width, screen.height - toolbarH, lineH)
@@ -994,7 +1014,7 @@ proc main() =
 
     refresh()
 
-  closePty(pty)
+  for t in app.terminals.mitems: closePty(t.pty)
   for s in app.sessions.values: closeSession(s)
   for c in app.lsp.values: shutdownLsp(c)
   closeFont(font)

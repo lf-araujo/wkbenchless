@@ -5,7 +5,7 @@ author        = "Luis F. Araujo"
 description   = "A native, deeply Nim-configurable literate editor: org-babel, LSP, interactive REPL sessions, org-src fontification -- a workbench-less alternative to heavier IDEs."
 license       = "MIT"
 srcDir        = "src"
-bin           = @["wkbenchless", "wkbctl"]   # wkbctl: drive a running editor
+bin           = @["wkbenchless"]   # `wkbenchless ctl <verb>` drives a running editor (no separate wkbctl)
 
 requires "nim >= 2.0.0"
 # uirelays is vendored in src/vendor/uirelays (patched for inline images), so

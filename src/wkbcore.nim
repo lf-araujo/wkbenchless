@@ -16,6 +16,12 @@ export uirelays, synedit, wkbsession, wkblsp   # config sees Event/SynEdit/ReplS
   # uirelays + `synedit` above come from the vendored tree in src/vendor/uirelays
 
 type
+  Terminal* = object
+    pty*: Pty                            ## the live PTY (host pumps/renders it)
+    label*: string                       ## tab label ("bash", "claude", ...)
+    cmd*: string                         ## the shell command it runs
+    started*: bool                       ## host has spawned the PTY at least once
+
   App* = object
     ed*, sess*, objects*, help*: SynEdit
     sessions*: Table[string, Session]     ## key: langId & "/" & sessionName
@@ -59,13 +65,9 @@ type
     vimMode*: VimMode
     vimPending*: string                   ## pending operator/prefix (d, g, y)
     sessionHidden*: bool                  ## bottom panel hidden (x on the tab bar)
-    termActive*: bool                     ## the standalone terminal is the current tab
-    termRequest*: string                  ## command the host should run in the PTY
-    hasTerminal*: bool                    ## a standalone terminal tab exists (alive)
-    termLabel*: string                    ## its tab label ("claude", "bash", ...)
+    terminals*: seq[Terminal]             ## standalone terminals (bash, claude, ...), one tab each
+    termActive*: int                      ## index into `terminals` shown now, -1 if none
     termScroll*: int                      ## bottom-pane scrollback: lines up from tail
-    termMaster*: cint                     ## host keeps this synced with the terminal pty
-    termPid*: int                         ## (so a hot reload can hand the terminal off)
     reloadPending*: bool                  ## recompile done -> host snapshots + re-execs
     reloadBin*, reloadFile*: string       ## the freshly built binary + file to reopen
     reloadLine*: int                      ## cursor line to restore
@@ -1479,21 +1481,22 @@ proc srcEditBlock*(app: var App) =
 proc srcEditSession*(app: var App) =
   if app.editMode != emNone: srcEditExit(app) else: srcEditEnter(app, true)
 
-const terminalTabKey* = "·terminal"   # sentinel tab key for the standalone terminal
+proc terminalTabKey*(i: int): string = "·term:" & $i   # tab key for terminal index i
 
 proc sessionKeys*(app: App): seq[string] =
   for k in app.sessions.keys: result.add k
   sort(result)
 
 proc tabKeys*(app: App): seq[string] =
-  ## Every bottom-pane tab, in order: the REPL sessions, then the standalone
-  ## terminal (if one is open). Used for rendering, clicking, and cycling.
+  ## Every bottom-pane tab, in order: the REPL sessions, then each standalone
+  ## terminal (one tab per open terminal). Used for rendering, clicking, cycling.
   result = app.sessionKeys()
-  if app.hasTerminal: result.add terminalTabKey
+  for i in 0 ..< app.terminals.len: result.add terminalTabKey(i)
 
 proc currentTabKey*(app: App): string =
   ## Which tab the pane is showing right now.
-  if app.termActive: terminalTabKey else: app.curLang.toLowerAscii & "/" & app.curSession
+  if app.termActive >= 0: terminalTabKey(app.termActive)
+  else: app.curLang.toLowerAscii & "/" & app.curSession
 
 proc selectTab*(app: var App; key: string) =
   ## Make `key` the current tab. Selecting a session turns the terminal off (and
@@ -1501,11 +1504,13 @@ proc selectTab*(app: var App; key: string) =
   ## invisible while the terminal was active.
   app.focus = "session"
   app.termScroll = 0                    # a freshly selected tab starts at the tail
-  if key == terminalTabKey:
-    app.termActive = true
-    app.msg = "terminal: " & app.termLabel
+  if key.startsWith("·term:"):
+    let idx = (try: parseInt(key["·term:".len .. ^1]) except: -1)
+    if idx >= 0 and idx < app.terminals.len:
+      app.termActive = idx
+      app.msg = "terminal: " & app.terminals[idx].label
     return
-  app.termActive = false
+  app.termActive = -1
   let parts = key.split('/')
   app.curLang = parts[0]
   app.curSession = if parts.len > 1: parts[1] else: "default"
@@ -1515,7 +1520,7 @@ proc selectTab*(app: var App; key: string) =
 proc setSession*(app: var App; key: string) = selectTab(app, key)
 
 proc switchSession*(app: var App) =
-  ## Cycle to the next bottom-pane tab (sessions and the terminal alike).
+  ## Cycle to the next bottom-pane tab (sessions and the terminals alike).
   let keys = app.tabKeys()
   if keys.len == 0: app.msg = "no sessions yet"; return
   let cur = app.currentTabKey()
@@ -1657,21 +1662,24 @@ proc writeHandoff(app: var App): string =
         let parts = key.split('/')
         blob.add "S\t" & $s.pty.master & "\t" & $s.pty.pid & "\t" &
                  parts[0] & "\t" & (if parts.len > 1: parts[1] else: "default") & "\n"
-    if app.termMaster >= 0 and app.hasTerminal:
-      discard fcntl(app.termMaster, F_SETFD, 0.cint)
-      blob.add "T\t" & $app.termMaster & "\t" & $app.termPid & "\t" &
-               app.termLabel & "\t" & $app.termActive & "\n"
+    for i, t in app.terminals:
+      if t.pty.alive:
+        discard fcntl(t.pty.master, F_SETFD, 0.cint)
+        blob.add "T\t" & $t.pty.master & "\t" & $t.pty.pid & "\t" &
+                 t.label & "\t" & $i & "\t" & $app.termActive & "\t" &
+                 t.cmd & "\n"
     if blob.len == 0: return ""
     let path = getTempDir() / ("wkbenchless-handoff." & $getpid())
     writeFile(path, blob)
     path
   else: ""
 
-proc adoptHandoff*(app: var App): tuple[master: cint; pid: int; label: string; active: bool] =
-  ## If a hot reload handed off sessions/terminal (WKB_HANDOFF), rebuild the REPL
-  ## sessions here and return the terminal's inherited fd/pid for the host to
-  ## adopt. Called once at startup after configure() (so gRepls is populated).
-  result = (master: cint(-1), pid: 0, label: "", active: false)
+proc adoptHandoff*(app: var App): tuple[terminals: seq[Terminal]; active: int] =
+  ## If a hot reload handed off sessions/terminals (WKB_HANDOFF), rebuild the REPL
+  ## sessions here and return the inherited terminals (fd/pid/label/cmd) for the
+  ## host to adopt, plus the index that was active. Called once at startup after
+  ## configure() (so gRepls is populated).
+  result = (terminals: @[], active: -1)
   when defined(posix):
     let path = getEnv("WKB_HANDOFF")
     if path.len == 0 or not fileExists(path): return
@@ -1687,7 +1695,11 @@ proc adoptHandoff*(app: var App): tuple[master: cint; pid: int; label: string; a
         app.sessions[f[3] & "/" & f[4]] =
           Session(pty: Pty(master: fd, pid: Pid(parseInt(f[2]))), spec: gRepls[f[3]])
       elif f[0] == "T":
-        result = (master: fd, pid: parseInt(f[2]), label: f[3], active: f[4] == "true")
+        let idx = (if f.len > 4: (try: parseInt(f[4]) except: -1) else: -1)
+        result.terminals.add Terminal(
+          pty: Pty(master: fd, pid: Pid(parseInt(f[2]))),
+          label: f[3], cmd: (if f.len > 6: f[6] else: f[3]), started: true)
+        if f.len > 5 and f[5] == $idx: result.active = idx
 
 proc nimblePkgSourceDir(): string =
   ## For a binary put on PATH by `nimble install <github-url>` (which lands in
@@ -1814,15 +1826,23 @@ proc terminalDir*(app: App): string =
   if gTerminalDir.len > 0: expandTilde(gTerminalDir) else: projectRoot(app)
 
 proc openTerminal*(app: var App; cmd: string) =
-  ## Ask the host to run `cmd` in the thread-free PTY terminal (bottom panel),
-  ## and register it as a selectable tab.
-  app.termActive = true
-  app.hasTerminal = true
-  app.termLabel = cmd.splitWhitespace()[0]   # "claude", "bash", ...
+  ## Open `cmd` in its own bottom-panel terminal tab. Reuses an existing tab
+  ## running the same command (so M-t twice doesn't stack bash tabs); otherwise
+  ## adds a new one. Each terminal keeps its own PTY, so opening claude after a
+  ## bash terminal no longer kills the bash session.
+  let label = cmd.splitWhitespace()[0]   # "claude", "bash", ...
+  for i, t in app.terminals:
+    if t.cmd == cmd:
+      app.termActive = i
+      app.sessionHidden = false
+      app.focus = "session"
+      app.msg = "terminal: " & label
+      return
+  app.terminals.add Terminal(pty: notRunningPty(), label: label, cmd: cmd)
+  app.termActive = app.terminals.len - 1
   app.sessionHidden = false
-  app.termRequest = cmd
   app.focus = "session"
-  app.msg = "terminal: " & cmd
+  app.msg = "terminal: " & label
 
 proc showPanel*(app: var App) =
   app.sessionHidden = false; app.focus = "session"; app.msg = "panel shown"

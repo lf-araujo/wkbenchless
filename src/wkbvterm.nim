@@ -25,6 +25,7 @@ type
     viewOffset*: int           ## lines scrolled up into scrollback (0 == live tail)
     mouseRep*: bool            ## app enabled mouse reporting (DECSET 1000/1002/1003)
     mouseSgr*: bool            ## app enabled SGR mouse encoding (DECSET 1006)
+    bracketedPaste*: bool      ## app enabled bracketed paste (DECSET 2004)
     cx*, cy*: int              ## cursor column, row (0-based)
     scx, scy: int              ## saved cursor (DECSC / ESC7)
     top, bot: int              ## scroll region rows [top, bot]
@@ -37,6 +38,7 @@ type
     osc: string
 
 const maxScrollback = 5000    ## cap history so a long-running shell stays bounded
+const scrollbackTrimAt = maxScrollback * 2   ## trim only past this, so the cap is amortized O(1)
 
 proc blankCell(t: VTerm): Cell = Cell(ch: "", fg: t.curFg, bg: t.curBg, inv: false)
 
@@ -74,6 +76,20 @@ proc resize*(t: VTerm; rows, cols: int) =
 
 proc maxViewOffset*(t: VTerm): int = t.scrollback.len
 
+proc recolorDefaults*(t: VTerm; oldFg, oldBg, newFg, newBg: Color) =
+  ## After a theme change, repaint every cell that used the old default
+  ## foreground/background with the new defaults. Cells carrying an explicit
+  ## SGR colour (which differs from the old default) are left alone.
+  for row in t.grid.mitems:
+    for c in row.mitems:
+      if c.fg == oldFg: c.fg = newFg
+      if c.bg == oldBg: c.bg = newBg
+  for row in t.scrollback.mitems:
+    for c in row.mitems:
+      if c.fg == oldFg: c.fg = newFg
+      if c.bg == oldBg: c.bg = newBg
+  t.curFg = newFg; t.curBg = newBg
+
 proc scrollView*(t: VTerm; delta: int) =
   ## Move the viewport by `delta` lines (positive = back into history).
   t.viewOffset = max(0, min(t.viewOffset + delta, t.scrollback.len))
@@ -81,12 +97,22 @@ proc scrollView*(t: VTerm; delta: int) =
 proc viewRow*(t: VTerm; ry: int): seq[Cell] =
   ## Row `ry` (0-based, top of body) of the viewport, accounting for how far the
   ## user has scrolled back. When `viewOffset == 0` this is just `grid[ry]`.
+  ## A scrollback row may predate a resize and be shorter than `cols`; pad it so
+  ## the caller can index `0 ..< cols` safely.
   let idx = t.scrollback.len - t.viewOffset + ry
-  if idx < 0: return t.blankRow()
-  if idx < t.scrollback.len: return t.scrollback[idx]
-  let g = idx - t.scrollback.len
-  if g >= 0 and g < t.grid.len: return t.grid[g]
-  t.blankRow()
+  var row: seq[Cell]
+  if idx < 0: row = t.blankRow()
+  elif idx < t.scrollback.len: row = t.scrollback[idx]
+  else:
+    let g = idx - t.scrollback.len
+    if g >= 0 and g < t.grid.len: row = t.grid[g]
+    else: row = t.blankRow()
+  if row.len < t.cols:
+    let old = row
+    row = newSeq[Cell](t.cols)
+    for c in 0 ..< t.cols:
+      row[c] = if c < old.len: old[c] else: Cell(ch: "", fg: t.defFg, bg: t.defBg)
+  row
 
 # --- screen ops -------------------------------------------------------------
 
@@ -101,7 +127,7 @@ proc scrollUp(t: VTerm; n = 1) =
     for r in t.top ..< t.bot:
       t.grid[r] = t.grid[r + 1]
     t.grid[t.bot] = t.blankRow()
-  if history and t.scrollback.len > maxScrollback:
+  if history and t.scrollback.len > scrollbackTrimAt:
     t.scrollback = t.scrollback[^maxScrollback .. ^1]
   # Keep a scrolled-up viewport looking at the same content as history grows.
   if history and t.viewOffset > 0:
@@ -277,7 +303,8 @@ proc handleCsi(t: VTerm; final: char) =
             if p == 1049: (t.cx = t.scx; t.cy = t.scy)
         of 1000, 1002, 1003: t.mouseRep = on   # mouse click/drag/any reporting
         of 1006: t.mouseSgr = on               # SGR mouse encoding
-        else: discard                    # ?25 (cursor), ?2004 (bracketed paste): ignored
+        of 2004: t.bracketedPaste = on         # bracketed paste mode
+        else: discard                    # ?25 (cursor): ignored
   else: discard
   t.clampCursor()
 
@@ -321,6 +348,20 @@ proc feedByte(t: VTerm; b: char) =
     elif b == '\e': t.st = vsEsc           # ST: next char is '\'; ESC handler resets
     else: t.osc.add b
 
+proc putCharRun(t: VTerm; s: string; a, b: int) =
+  ## Write the plain-ASCII run `s[a ..< b]` to the grid in bulk, handling wrap
+  ## and line-feed. Avoids the per-char string allocation of `putChar`.
+  var i = a
+  while i < b:
+    if t.cx >= t.cols:            # wrap
+      t.cx = 0
+      t.lineFeed()
+    t.clampCursor()
+    while i < b and t.cx < t.cols:
+      t.grid[t.cy][t.cx] = Cell(ch: $s[i], fg: t.curFg, bg: t.curBg, inv: t.inv)
+      inc t.cx
+      inc i
+
 proc write*(t: VTerm; s: string) =
   ## Feed raw PTY bytes. UTF-8 multibyte sequences are reassembled into one cell.
   var i = 0
@@ -334,6 +375,12 @@ proc write*(t: VTerm; s: string) =
       let stop = min(i + nbytes, s.len)
       t.putChar(s[i ..< stop])
       i = stop
+    elif t.st == vsGround and c >= ' ' and c < '\x7f':
+      # Fast path: a run of plain printable ASCII (no escape/control bytes).
+      var j = i + 1
+      while j < s.len and s[j] >= ' ' and s[j] < '\x7f': inc j
+      t.putCharRun(s, i, j)
+      i = j
     else:
       t.feedByte(c)
       inc i
