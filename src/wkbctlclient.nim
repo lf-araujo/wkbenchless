@@ -21,7 +21,8 @@ proc buildRequest(args: seq[string]; req: var string): string =
   if args.len == 0:
     return "usage: ctl buffer|blocks|command <name>|eval [lang] [session]|\n" &
            "           set-buffer|insert <line>|replace <from> <to>|goto <line>|\n" &
-           "           run-block [line]|diff <old> <new> [title]\n" &
+           "           run-block [line]|diff <old> <new> [title]|bib <query>\n" &
+           "           cite-goto <key>|open <path>|where|selection\n" &
            "  (verbs that take text read it from stdin)"
   case args[0]
   of "buffer", "blocks":
@@ -46,6 +47,17 @@ proc buildRequest(args: seq[string]; req: var string): string =
     req = "goto\t" & args[1]
   of "run-block":
     req = "run-block" & (if args.len > 1: "\t" & args[1] else: "")
+  of "bib":
+    if args.len < 2: return "ctl bib <query>"
+    req = "bib\t" & args[1 .. ^1].join(" ")
+  of "cite-goto":
+    if args.len < 2: return "ctl cite-goto <key>"
+    req = "cite-goto\t" & args[1]
+  of "open":
+    if args.len < 2: return "ctl open <path>"
+    req = "open\t" & args[1]
+  of "where", "selection":
+    req = args[0]
   of "diff":
     if args.len < 3: return "ctl diff <oldfile> <newfile> [title]"
     let title = if args.len > 3: args[3] else: extractFilename(args[2])

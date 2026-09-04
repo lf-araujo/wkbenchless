@@ -26,6 +26,117 @@ type ControlServer* = object
   inbuf*: string
   token*: string
 
+# --- BibTeX search (wkbctl bib <query>) ------------------------------------
+# Find citation keys without loading the .bib into an agent's context. Returns
+# `key — Author (year). Title` lines. Searches the buffer's own
+# `#+bibliography:` paths plus an optional master set via $WKB_BIB.
+proc bibValue(entry, field: string): string =
+  ## Value of `field = {…}` / `field = "…"` / `field = bareword` in an entry.
+  let low = entry.toLowerAscii
+  var i = 0
+  while true:
+    i = low.find(field, i)
+    if i < 0: return ""
+    var j = i + field.len
+    while j < entry.len and entry[j] in {' ', '\t', '\n', '\r'}: inc j
+    if j < entry.len and entry[j] == '=':
+      inc j
+      while j < entry.len and entry[j] in {' ', '\t', '\n', '\r'}: inc j
+      if j >= entry.len: return ""
+      if entry[j] == '{':
+        var depth = 1
+        var k = j + 1
+        var buf = ""
+        while k < entry.len and depth > 0:
+          if entry[k] == '{': inc depth
+          elif entry[k] == '}':
+            dec depth
+            if depth == 0: break
+          buf.add entry[k]; inc k
+        return strip(buf).replace("\r", " ").replace("\n", " ")
+      elif entry[j] == '"':
+        var k = j + 1
+        var buf = ""
+        while k < entry.len and entry[k] != '"': buf.add entry[k]; inc k
+        return strip(buf).replace("\r", " ").replace("\n", " ")
+      else:
+        var k = j
+        while k < entry.len and entry[k] notin {',', '\n', '}'}: inc k
+        return strip(entry[j ..< k])
+    i = i + field.len
+
+proc bibPathsFromBuffer(app: App): seq[string] =
+  for i in 0 ..< app.ed.getLineCount():
+    let ln = strip(app.ed.getLineText(i))
+    if ln.toLowerAscii.startsWith("#+bibliography:"):
+      let p = strip(ln[ln.find(':') + 1 .. ^1])
+      if p.len > 0 and p notin result: result.add p
+  let master = getEnv("WKB_BIB")
+  if master.len > 0 and master notin result: result.add master
+
+proc resolveBib(p: string): string =
+  let q = expandTilde(p)
+  if q.len > 0 and not isAbsolute(q):
+    let alt = getCurrentDir() / q
+    if fileExists(alt): return alt
+  q
+
+proc bibSearch(app: App; query: string; limit = 30): string =
+  let terms = query.toLowerAscii.splitWhitespace()
+  var seen: seq[string]
+  var hits: seq[string]
+  for raw in bibPathsFromBuffer(app):
+    let path = resolveBib(raw)
+    if not fileExists(path): continue
+    var txt = ""
+    try: txt = readFile(path)
+    except CatchableError: continue
+    var i = txt.find('@')
+    while i >= 0:
+      let nxt = txt.find('@', i + 1)
+      let entry = if nxt < 0: txt[i .. ^1] else: txt[i ..< nxt]
+      let lb = entry.find('{')
+      let comma = entry.find(',')
+      if lb >= 0 and comma > lb:
+        let key = strip(entry[lb + 1 ..< comma])
+        if key.len > 0 and key notin seen:
+          let author = bibValue(entry, "author")
+          let title  = bibValue(entry, "title")
+          let year   = bibValue(entry, "year")
+          let hay = (key & " " & author & " " & title & " " & year).toLowerAscii
+          var ok = true
+          for t in terms:
+            if not hay.contains(t): ok = false; break
+          if ok:
+            seen.add key
+            let a1 = (if author.len > 0: author.split(" and ")[0] else: "?").multiReplace(("{", ""), ("}", ""))
+            let yr = if year.len > 0: year else: "n.d."
+            hits.add key & " — " & a1 & " (" & yr & "). " & title.multiReplace(("{", ""), ("}", ""))
+      i = nxt
+  if hits.len == 0: return "(no bib entry matches: " & query & ")"
+  if hits.len > limit:
+    hits = hits[0 ..< limit] & @["… (" & $hits.len & " matches; showing " & $limit & ")"]
+  hits.join("\n")
+
+proc citeGoto(app: var App; key: string): string =
+  ## Open the .bib that defines `@type{key,` and move the cursor to that entry.
+  let needle = "{" & key.toLowerAscii & ","        # matches @article{key,
+  for raw in bibPathsFromBuffer(app):
+    let path = resolveBib(raw)
+    if not fileExists(path): continue
+    var txt = ""
+    try: txt = readFile(path)
+    except CatchableError: continue
+    var i = 0
+    for ln in txt.splitLines():
+      let low = ln.toLowerAscii.replace(" ", "")
+      if low.startsWith("@") and low.contains(needle):
+        openFile(app, path)
+        app.ed.gotoLine(i + 1, 0)
+        return "ok: " & key & " at " & extractFilename(path) & ":" & $(i + 1)
+      inc i
+  "cite-goto: key not found: " & key
+
 proc handle(app: var App; req: string): string =
   let nl = req.find('\n')
   let header = (if nl >= 0: req[0 ..< nl] else: req).strip()
@@ -88,8 +199,9 @@ proc handle(app: var App; req: string): string =
     var ln = (if parts.len > 1: (try: parseInt(parts[1]) except: 1) else:
                 app.ed.currentLine + 1) - 1
     ln = clamp(ln, 0, app.ed.getLineCount() - 1)
-    # `blocks` reports the #+begin_src header line; babel wants a body line.
-    if strutils.strip(app.ed.getLineText(ln)).toLowerAscii.startsWith("#+begin_src"):
+    # `blocks` reports the header line; babel wants a body line.
+    let low = strutils.strip(app.ed.getLineText(ln)).toLowerAscii
+    if low.startsWith("#+begin_src") or low.startsWith("```"):
       ln = min(ln + 1, app.ed.getLineCount() - 1)
     app.ed.gotoLine(ln + 1, 0)           # `ln` is 0-based; gotoLine is 1-based
     babelExecute(app)
@@ -99,10 +211,37 @@ proc handle(app: var App; req: string): string =
     var i = 0
     while i < total:
       let ln = strutils.strip(app.ed.getLineText(i))
-      if ln.toLowerAscii.startsWith("#+begin_src"):
+      let low = ln.toLowerAscii
+      if low.startsWith("#+begin_src") or low.startsWith("```{r"):
         result.add $(i + 1) & ": " & ln & "\n"
       inc i
     if result.len == 0: result = "(no src blocks)"
+  of "bib":                                # search BibTeX for citation keys
+    let q = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
+    if q.len == 0: return "(usage: bib <query>)"
+    result = bibSearch(app, q)
+  of "cite-goto":                          # jump to a BibTeX @key entry (opens the .bib)
+    let key = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
+    if key.len == 0: return "(usage: cite-goto <key>)"
+    result = citeGoto(app, key)
+  of "open":                               # open a file into a buffer
+    let p = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
+    if p.len == 0: return "(usage: open <path>)"
+    let path = expandTilde(p)
+    if not fileExists(path): return "open: no such file: " & path
+    openFile(app, path)
+    result = "ok: open " & extractFilename(path) &
+             " (" & $app.ed.getLineCount() & " lines)"
+  of "where":                              # cursor location + current file
+    var off = 0
+    for i in 0 ..< app.ed.currentLine: off += app.ed.getLineText(i).len + 1
+    let col = app.ed.cursor - off
+    result = (if app.filePath.len > 0: app.filePath else: "*scratch*") &
+             ":" & $(app.ed.currentLine + 1) & ":" & $(col + 1) &
+             " (" & $app.ed.getLineCount() & " lines)"
+  of "selection":                          # current selection text (empty if none)
+    let sel = app.ed.getSelectedText()
+    result = if sel.len > 0: sel else: "(no selection)"
   else:
     result = "unknown verb: " & parts[0]
 

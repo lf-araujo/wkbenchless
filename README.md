@@ -142,11 +142,46 @@ wkbctl goto 40                         # move the cursor
 wkbctl run-block 16                    # run the src block at line 16 (writes #+RESULTS)
 wkbctl diff old.txt new.txt "changes"  # show a side-by-side diff
 wkbctl command <name>                  # run any M-x command (echoes its status line)
+wkbctl bib maes 2022                   # search BibTeX -> "key — Author (year). Title"
 ```
+
+`bib` searches the buffer's own `#+bibliography:` paths plus an optional master
+set via `$WKB_BIB`, matching all query terms against key/author/title/year — so
+an agent can find citation keys without loading the (possibly large) `.bib` into
+its context.
 
 When driving an org file, prefer `wkbctl run-block <line>` over piping code to
 `eval`: it runs through the editor's own babel, so the block executes in its
 `:session`, in its language, and writes `#+RESULTS:` back into the buffer.
+
+## Roadmap
+
+- [ ] **Ctrl-click `[cite:@key]` → its BibTeX entry** — a click/keybinding hook
+  on a citation that calls `cite-goto` (the `wkbctl cite-goto <key>` verb already
+  does the jump for agents; this is the in-editor UI on top of it).
+- [ ] **`bib --insert`** — drop `[cite:@key]` at the cursor from a search result.
+- [ ] **`bib --extract`** — write the current file's cited keys to a slim project
+  `refs.bib` at export time.
+- [ ] **`ctl diagnostics`** — surface LSP errors/warnings (`wkblsp` already speaks
+  LSP); the last `/ide`-parity gap (`open`/`where`/`selection` now shipped).
+
+## Changelog (recent)
+
+- **Agent-control verbs**: `bib <query>` (search BibTeX without loading it),
+  `cite-goto <key>` (open the `.bib` and jump to the entry), and the `/ide`-parity
+  `open <path>` / `where` / `selection`.
+- **org/Rmd reading mode**: line numbers off by default (`C-c n` /
+  `toggle-line-numbers` restores them); base font ~12pt (16px); per-extension
+  reading margins via `setReadingMargin` (prose centers, code blocks & tables stay
+  full width); Rmd/Markdown headings enlarged like org; org/Rmd table rules drawn
+  with box-drawing glyphs (`│ ─ ┼ ├ ┤`, display-only — the buffer stays ASCII).
+- **Citations render as `@key`** — the `[cite:` / `[cite/style:` prefix and the
+  closing `]` are hidden (delimiters remain in the file, so export is unaffected).
+- **Rendering fixes**: `firstLineOffset` is re-derived from `firstLine` each frame
+  (text-wrap drift after an edit/scroll no longer needs a window resize);
+  `downFirstLineOffset` guards end-of-buffer; the draw buffer never splits a
+  multi-byte UTF-8 rune at its 80-byte flush boundary.
+- **Tab folds Rmd `` ```{r} `` chunks** (was org `#+begin_src` only).
 
 ## Releases
 

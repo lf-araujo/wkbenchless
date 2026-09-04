@@ -292,7 +292,7 @@ proc feedTerminalKey(t: var Pty; e: Event): bool =
   of KeyDownEvent:
     case e.key
     of KeyEnter: t.feed("\r"); true
-    of KeyBackspace: t.feed("\x7f"); true
+    of KeyBackspace: t.feed("\b"); true   # 0x08: the byte REPLs (R/Python) erase on
     of KeyTab: t.feed("\t"); true
     of KeyEsc: t.feed("\e"); true
     of KeyUp: t.feed("\e[A"); true
@@ -370,7 +370,7 @@ proc main() =
   var screen = createWindow(960, 700)
   setWindowTitle("wkbenchless")
   var metrics, bigMetrics: FontMetrics
-  var fontSize = 15
+  var fontSize = 16   # ~12pt at 96dpi
   var font = openFont(fontPath, fontSize, metrics)
   var bigFont = openFont(fontPath, fontSize * 3 div 2, bigMetrics)   # ~1.5x
   var lineH = metrics.lineHeight
@@ -388,7 +388,7 @@ proc main() =
                 curLang: "r", curSession: "default", focus: "editor",
                 font: font, bigFont: bigFont, fontSize: fontSize,
                 termActive: -1, running: true, msg: "ready")
-  app.ed.showLineNumbers = true
+  app.ed.showLineNumbers = false   # off by default; toggle with C-c n
   app.ed.bigFont = bigFont
   applyEmphasisFonts(app.ed)
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
@@ -400,7 +400,7 @@ proc main() =
     app.docLang = langIdOf(ext)            # for LSP
     app.ed.loadFromFile(app.filePath)
     noteRecentFile(app.filePath)
-    if app.ed.lang == langOrg:
+    if app.ed.lang in {langOrg, langMarkdown}:
       app.ed.foldAllPending = true
   else:
     app.ed.lang = langOrg                  # before setText, so org highlights now
@@ -558,11 +558,17 @@ proc main() =
         handlePalette(app, e); consumed = true
       elif app.completionActive:
         consumed = handleCompletion(app, e)
-    # Tab on a #+begin_src line folds/unfolds the block instead of indenting.
+    # Tab accepts the Copilot ghost-text completion when one is showing.
     if not consumed and app.focus == "editor" and not app.completionActive and
-       e.kind == KeyDownEvent and e.key == KeyTab and app.ed.lang == langOrg:
+       e.kind == KeyDownEvent and e.key == KeyTab and app.ed.ghostText.len > 0:
+      ghostAccept(app); consumed = true; suppressText = true
+    # Tab on a block-opener line folds/unfolds instead of indenting: an org
+    # #+begin_src header, or an Rmd ```{r} chunk fence (langMarkdown).
+    if not consumed and app.focus == "editor" and not app.completionActive and
+       e.kind == KeyDownEvent and e.key == KeyTab and
+       app.ed.lang in {langOrg, langMarkdown}:
       let ln = strutils.strip(app.ed.getLineText(app.ed.currentLine)).toLowerAscii
-      if ln.startsWith("#+begin_src"):
+      if ln.startsWith("#+begin_src") or ln.startsWith("```{r"):
         toggleFold(app); consumed = true; suppressText = true
 
     if not consumed and not app.paletteActive and not app.searchActive:
@@ -788,6 +794,11 @@ proc main() =
         y += lineH
     elif cells.hasKey("editor"):
       editorRect = cells["editor"]
+      block:                           # per-extension reading margin: the editor
+        # applies it per line (prose only; code blocks & tables stay full width).
+        let ext = splitFile(app.filePath).ext.toLowerAscii.strip(chars = {'.'})
+        let want = gReadingMargins.getOrDefault(ext, 0)
+        app.ed.readingMargin = min(want, max(0, (editorRect.w - 240) div 2))  # keep >=240px of text
       let act = app.ed.draw(evFor("editor"), editorRect, focused = app.focus == "editor" and not overlay)
       if act.kind == ctrlClick:              # Ctrl+click an org link -> open it
         app.ed.gotoPos(act.pos)
@@ -806,7 +817,9 @@ proc main() =
         let edited =
           (e.kind == TextInputEvent and not consumed) or
           (e.kind == KeyDownEvent and e.key == KeyBackspace)
-        if edited: autoComplete(app)
+        if edited:
+          autoComplete(app)
+          app.runHooks("after-edit")   # Copilot ghost-text suggestion, etc.
     if cells.hasKey("session"):
       let r = cells["session"]
       fillRect(r, sessBg)

@@ -30,6 +30,19 @@ proc configure*(app: var App) =
   bindkey("M-Right", "scroll-right")    # pan a wide table into view
   bindkey("M-Left", "scroll-left")
   bindkey("C-c u", "unfold-all")        # reveal every folded src block
+  bindkey("C-c z", "toggle-fold")       # fold / unfold the src block / Rmd chunk
+  bindkey("C-c F", "fold-all")          # fold all src blocks / Rmd chunks
+  bindkey("C-c n", "toggle-line-numbers")  # show / hide the line-number gutter
+
+  # ---- Reading margins ------------------------------------------------------
+  # Side margin (px) per file extension, so prose documents read as a centered
+  # column while code stays flush-left. 0 / unset = no margin. The host caps it
+  # so the text column never shrinks below ~240px.
+  setReadingMargin("org", 360)
+  setReadingMargin("md", 360)
+  setReadingMargin("markdown", 360)
+  setReadingMargin("rmd", 360)
+  setReadingMargin("qmd", 360)
   bindkey("C-Space", "complete")        # LSP completion
   bindkey("F1", "show-help")            # help for word at cursor
   bindkey("C-Enter", "run-line")        # send the current line to the session
@@ -107,6 +120,8 @@ proc configure*(app: var App) =
   # ~ expanded); set gLoadLoginPath = false to skip the login-shell probe.
   addExecPath("~/.local/bin")
   addExecPath("~/bin")
+  # GitHub Copilot language server (installed by the Emacs copilot package).
+  addExecPath("~/.emacs.d/.cache/copilot/bin")
   # gLoadLoginPath = false
 
   # The `claude` action (C-c a) runs this. It's a real shell command (see

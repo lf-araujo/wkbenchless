@@ -115,6 +115,7 @@ var
   gLastCommand*: string                   ## last command run from the palette
                                           ## (M-x reopens preselecting it)
   gKeymap*: Table[string, string]         ## chord (or "C-c C-c") -> command name
+  gReadingMargins*: Table[string, int]    ## file ext (no dot, lowercase) -> px side margin; 0/absent = none
   gRepls*: Table[string, ReplSpec]        ## langId -> interpreter spec
   gHooks*: Table[string, seq[Hook]]       ## event name -> hooks
   gObjectsQuery*: Table[string, string]   ## langId -> code listing the env
@@ -136,6 +137,9 @@ var
 proc defcommand*(name, label: string; run: proc(app: var App)) =
   gCommands[name] = Command(label: label, run: run)
 proc bindkey*(chord, name: string) = gKeymap[chord] = name
+proc setReadingMargin*(ext: string; px: int) =
+  ## Side margin (px) for files with this extension (no dot), e.g. "org", "rmd".
+  gReadingMargins[ext.toLowerAscii] = px
 proc registerRepl*(langId: string; spec: ReplSpec) =
   gRepls[langId.toLowerAscii] = spec
 proc addHook*(name: string; h: Hook) =
@@ -500,7 +504,7 @@ proc openFile*(app: var App; path: string) =
   for i, b in app.buffers:
     if b.filePath == path: switchToBuffer(app, i); return   # already open
   var ed = createSynEdit(app.font)
-  ed.showLineNumbers = true
+  ed.showLineNumbers = false   # off by default; toggle with C-c n
   ed.bigFont = app.bigFont
   ed.setEmphasisFonts(app.ed.boldFont, app.ed.italicFont,
                       app.ed.boldItalicFont, app.ed.captionFont)
@@ -514,7 +518,7 @@ proc openFile*(app: var App; path: string) =
     ed.setRenderFlag(rfInlineImages)          # [[file:x.bmp]] / ![](x.bmp) inline
     ed.imageBaseDir = parentDir(path)         # resolve relative image paths here
     ed.imageDefaultWidth = gInlineImageWidth  # 0 = native size
-  if ed.lang == langOrg:
+  if ed.lang in {langOrg, langMarkdown}:
     ed.foldAllPending = true
   app.syncActive()
   app.buffers.add BufferState(ed: ed, filePath: path, docLang: extToLangId(ext))
@@ -712,6 +716,21 @@ proc completionAccept*(app: var App) =
   for _ in 0 ..< app.completionPrefix.len: app.ed.backspace(false)
   app.ed.insertText(label)
   app.msg = "inserted " & label
+
+proc setGhostText*(app: var App; text: string) =
+  ## Set (or clear, with "") the Copilot ghost-text inline completion.
+  app.ed.ghostText = text
+
+proc ghostAccept*(app: var App) =
+  ## Insert the ghost text (Copilot inline completion) at the cursor.
+  if app.ed.ghostText.len == 0: (app.msg = "no ghost text"; return)
+  let t = app.ed.ghostText
+  app.ed.ghostText = ""
+  app.ed.insertText(t)
+  app.msg = "copilot: accepted"
+
+proc ghostDismiss*(app: var App) =
+  app.ed.ghostText = ""
 
 # -- built-in commands -----------------------------------------------------
 proc dedentBody(lines: seq[string]): string =
@@ -941,18 +960,22 @@ proc lineStartOffset(app: App; line: int): int =
   off
 
 proc blockStartLineAtCursor(app: App): int =
-  ## Line index of the #+begin_src that opens the block the cursor sits in, -1.
+  ## Line index of the #+begin_src / Rmd ```{r} that opens the block the cursor
+  ## sits in, -1.
   let cur = app.ed.currentLine
   var i = cur
   while i >= 0:
     let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
     if low.startsWith("#+begin_src"): return i
+    if low.startsWith("```{r"): return i
     if low.startsWith("#+end_src") and i < cur: return -1
+    if low.startsWith("```") and i < cur: return -1   # a plain ``` above: not in a chunk
     dec i
   -1
 
 proc toggleFold*(app: var App) =
-  if app.ed.lang != langOrg: app.msg = "folding is for org files"; return
+  if app.ed.lang notin {langOrg, langMarkdown}:
+    app.msg = "folding is for org / Rmd files"; return
   let line = blockStartLineAtCursor(app)
   if line < 0: app.msg = "not on a src block"; return
   let off = lineStartOffset(app, line)
@@ -963,9 +986,9 @@ proc scrollRight*(app: var App) = app.ed.hScroll = min(app.ed.hScroll + 8, 400)
 proc scrollLeft*(app: var App) = app.ed.hScroll = max(app.ed.hScroll - 8, 0)
 
 proc foldAllSrc*(app: var App) =
-  if app.ed.lang == langOrg: app.ed.foldAllBlocks(); app.msg = "all blocks folded"
+  if app.ed.lang in {langOrg, langMarkdown}: app.ed.foldAllBlocks(); app.msg = "all blocks folded"
 proc unfoldAllSrc*(app: var App) =
-  if app.ed.lang == langOrg: app.ed.unfoldAll(); app.msg = "all blocks unfolded"
+  if app.ed.lang in {langOrg, langMarkdown}: app.ed.unfoldAll(); app.msg = "all blocks unfolded"
 
 proc linkAtCursor*(app: App): string =
   ## The org link target under the cursor, or "" (for plain-click activation).
@@ -1128,21 +1151,26 @@ proc applyOrgStartup*(app: var App) =
   elif "inlineimages" in toks: app.ed.setRenderFlag(rfInlineImages, true)
   if "latexpreview" in toks: discard enableLatexPreview(app)
 
+proc isChunkStart(line: string): bool =
+  ## True if `line` opens a runnable chunk: org #+begin_src or an Rmd ```{r} fence.
+  let low = line.strip.toLowerAscii
+  low.startsWith("#+begin_src") or low.startsWith("```{r")
+
 proc nextChunk*(app: var App) =
-  ## Jump to the next org src block (#+begin_src) after the cursor.
+  ## Jump to the next src block / Rmd chunk after the cursor.
   let n = app.ed.getLineCount()
   var i = app.ed.currentLine + 1
   while i < n:
-    if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+begin_src"):
+    if isChunkStart(app.ed.getLineText(i)):
       app.ed.gotoLine(i + 1, 0); app.msg = "next src block"; return   # gotoLine is 1-based
     inc i
   app.msg = "no next src block"
 
 proc prevChunk*(app: var App) =
-  ## Jump to the previous org src block (#+begin_src) before the cursor.
+  ## Jump to the previous src block / Rmd chunk before the cursor.
   var i = app.ed.currentLine - 1
   while i >= 0:
-    if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+begin_src"):
+    if isChunkStart(app.ed.getLineText(i)):
       app.ed.gotoLine(i + 1, 0); app.msg = "previous src block"; return   # gotoLine is 1-based
     dec i
   app.msg = "no previous src block"
@@ -1561,23 +1589,39 @@ proc babelExecute*(app: var App) =
   let cur = app.ed.currentLine
   var b = -1
   var header = ""
+  var isRmd = false
   for i in countdown(cur, 0):
     let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
     if low.startsWith("#+begin_src"):
       b = i; header = strutils.strip(app.ed.getLineText(i)); break
+    if low.startsWith("```"):
+      # Rmd chunk opener: ```{r ...} (or a closing ``` that ends the chunk).
+      # Match on the opener line itself too (cursor on the fence), but a plain
+      # ``` above the cursor means we're not inside an R chunk.
+      if "{r" in low or "{r," in low or low.startsWith("```{r"):
+        b = i; header = strutils.strip(app.ed.getLineText(i)); isRmd = true; break
+      elif i < cur:
+        break   # a plain ``` fence above the cursor: not inside an R chunk
     if low.startsWith("#+end_src") and i < cur: break
   if b < 0: app.msg = "not in a src block"; return
   var e = -1
   for i in b + 1 ..< total:
-    if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+end_src"):
+    let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
+    if (if isRmd: low.startsWith("```") else: low.startsWith("#+end_src")):
       e = i; break
   if e < 0 or cur > e: app.msg = "not in a src block"; return
 
   let hdr = strutils.splitWhitespace(header)
-  let lang = if hdr.len >= 2: hdr[1] else: ""
-  var sessName, host, dir = ""
-  # Parse :session / :ssh / :dir from a token list; only fill unset fields (so
-  # the BLOCK header wins over document #+PROPERTY defaults, applied after).
+  var lang = if hdr.len >= 2: hdr[1] else: ""
+  if isRmd:
+    # Rmd chunk header is ```{r ...}; the language is the token after the brace.
+    lang = "r"
+  var sessName, host, dir, fileOut = ""
+  var gW, gH, gRes = 0
+  var gType = ""
+  # Parse :session / :ssh / :dir / :file / :width / :height / :res / :type from
+  # a token list; only fill unset fields (so the BLOCK header wins over document
+  # #+PROPERTY defaults, applied after).
   proc apply(toks: seq[string]) =
     var k = 0
     while k < toks.len:
@@ -1589,6 +1633,16 @@ proc babelExecute*(app: var App) =
         let (h, p) = parseSshDir(toks[k + 1])
         if h.len > 0: host = h
         dir = p
+      elif toks[k] == ":file" and k + 1 < toks.len and fileOut.len == 0:
+        fileOut = toks[k + 1]
+      elif toks[k] == ":width" and k + 1 < toks.len and gW == 0:
+        gW = (try: parseInt(toks[k + 1]) except: 0)
+      elif toks[k] == ":height" and k + 1 < toks.len and gH == 0:
+        gH = (try: parseInt(toks[k + 1]) except: 0)
+      elif toks[k] == ":res" and k + 1 < toks.len and gRes == 0:
+        gRes = (try: parseInt(toks[k + 1]) except: 0)
+      elif toks[k] == ":type" and k + 1 < toks.len and gType.len == 0:
+        gType = toks[k + 1]
       inc k
   apply(strutils.splitWhitespace(header)[2 .. ^1])   # the block header first
   apply(headerArgTokens(app, lang))                  # then document defaults
@@ -1603,7 +1657,29 @@ proc babelExecute*(app: var App) =
   # block IN that dir is deferred -- for now we just send code and capture results.
   let s = getSession(app, lang, sessName)
   if s == nil: app.msg = "no session for '" & lang & "'"; return
-  let outp = s.runBlock(dedentBody(bodyLines))
+
+  # A `:file <path>` header (with graphics results) means the block draws a
+  # figure: wrap the body in a graphics device so R saves it, then insert a
+  # [[file:...]] link below the block instead of the raw output.
+  var body = dedentBody(bodyLines)
+  if fileOut.len > 0:
+    let ext = splitFile(fileOut).ext.toLowerAscii
+    let dev = case ext
+      of ".png": "png"
+      of ".pdf": "pdf"
+      of ".svg": "svg"
+      of ".jpeg", ".jpg": "jpeg"
+      of ".bmp": "bmp"
+      of ".tiff", ".tif": "tiff"
+      else: "png"
+    var devArgs = "\"" & fileOut & "\""
+    if gW > 0: devArgs.add ", width=" & $gW
+    if gH > 0: devArgs.add ", height=" & $gH
+    if gRes > 0: devArgs.add ", res=" & $gRes
+    if gType.len > 0: devArgs.add ", type=\"" & gType & "\""
+    body = dev & "(" & devArgs & ")\n" & body & "\ntry(dev.off(), silent=TRUE)\n"
+
+  let outp = s.runBlock(body)
   app.sess.appendOutput("# " & (if lang.len > 0: lang else: "?") &
                         " [" & sessName & "]\n" & outp & "\n")
 
@@ -1619,7 +1695,9 @@ proc babelExecute*(app: var App) =
   for i in 0 .. e: outLines.add app.ed.getLineText(i)
   outLines.add ""
   outLines.add "#+RESULTS:"
-  if strutils.strip(outp).len == 0:
+  if fileOut.len > 0:
+    outLines.add "[[file:" & fileOut & "]]"
+  elif strutils.strip(outp).len == 0:
     outLines.add ": "
   else:
     for ln in outp.split('\n'): outLines.add ": " & ln
@@ -2021,6 +2099,9 @@ proc registerBuiltins*() =
   defcommand("quit", "Quit", quitCmd)
   defcommand("run-line", "Run current line in session", runLine)
   defcommand("babel-execute", "Org-babel: run this src block", babelExecute)
+  defcommand("toggle-line-numbers", "Show/hide line numbers", proc(a: var App) =
+    a.ed.showLineNumbers = not a.ed.showLineNumbers
+    a.msg = (if a.ed.showLineNumbers: "line numbers on" else: "line numbers off"))
   defcommand("comment-toggle", "Comment: toggle line", proc(app: var App) = app.ed.toggleComment())
   defcommand("undo", "Undo", proc(app: var App) = app.ed.undo())
   defcommand("redo", "Redo", proc(app: var App) = app.ed.redo())
@@ -2068,6 +2149,8 @@ proc registerBuiltins*() =
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)
   defcommand("complete", "LSP: complete at cursor", lspComplete)
+  defcommand("ghost-accept", "Copilot: accept the ghost-text completion", ghostAccept)
+  defcommand("ghost-dismiss", "Copilot: dismiss the ghost-text completion", ghostDismiss)
   defcommand("toggle-src-edit", "Toggle objects/help (src-edit)", toggleSrcEdit)
   defcommand("src-edit-block", "Src-edit: this block (org-edit-special)", srcEditBlock)
   defcommand("src-edit-session", "Src-edit: tangle this session's blocks", srcEditSession)

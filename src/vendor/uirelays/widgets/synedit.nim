@@ -101,7 +101,7 @@ proc fileExtToLanguage*(ext: string): SourceLanguage =
   of ".html", ".htm": langHtml
   of ".py", ".pyw": langPython
   of ".rs": langRust
-  of ".md", ".markdown": langMarkdown
+  of ".md", ".markdown", ".rmd", ".Rmd", ".RMD": langMarkdown
   of ".r", ".R": langR
   of ".org": langOrg
   else: langNone
@@ -193,6 +193,7 @@ type
     theme*: Theme
     flags*: set[RenderFlag]
     showLineNumbers*: bool
+    readingMargin*: int             ## px side margin for prose lines; code blocks & tables stay full width
     cursorVisible: bool
     lastBlinkTick: int
     cursorDim: tuple[x, y, h: int]
@@ -246,6 +247,9 @@ type
     imageDefaultWidth*: int         ## default inline image width in px, applied
                                     ## when no #+ATTR_* :width is given; 0 = use
                                     ## the image's own (native) dimensions
+    # Ghost text (Copilot inline completion): greyed text drawn after the cursor,
+    # accepted with M-x ghost-accept / Tab. Empty = none.
+    ghostText*: string
     # Cache
     offsetToLineCache: array[20, tuple[version, offset, line: int]]
 
@@ -976,6 +980,8 @@ proc strToLanguage*(s: string): SourceLanguage =
 proc highlightMarkdown(s: var SynEdit; first, last: int) =
   var insideFence = false
   var fenceLang = langNone
+  var chunkStart = first
+  s.srcBlockRanges.setLen(0)             # rebuild (Rmd chunks are foldable)
   var pos = first
   while pos > 0 and s[pos-1] != '\L': dec pos
   while pos <= last:
@@ -993,11 +999,20 @@ proc highlightMarkdown(s: var SynEdit; first, last: int) =
         s.setCellStyle(j, TokenClass.MarkdownFence)
       let rest = stripped[3..^1].strip
       if rest.len > 0 and not insideFence:
-        fenceLang = strToLanguage(rest)
+        # Rmd uses ```{r} fences (with braces + optional chunk options); the
+        # language is the token before any space/comma/brace.
+        var langTok = rest
+        if langTok.startsWith("{"):
+          langTok = langTok[1 .. ^1]
+        let sp = langTok.find({' ', ',', '}'})
+        if sp >= 0: langTok = langTok[0 ..< sp]
+        fenceLang = strToLanguage(langTok)
         insideFence = true
+        chunkStart = lineStart
       elif insideFence:
         insideFence = false
         fenceLang = langNone
+        s.srcBlockRanges.add(chunkStart .. lineEnd)
     elif insideFence and fenceLang != langNone:
       var g: GeneralTokenizer
       g.buf = addr s
@@ -1015,12 +1030,73 @@ proc highlightMarkdown(s: var SynEdit; first, last: int) =
       if lineEnd <= last:
         s.setCellStyle(lineEnd, TokenClass.None)
     else:
+      var tc = TokenClass.Text
+      if stripped.len > 0 and stripped[0] == '#':
+        tc = TokenClass.Keyword          # Markdown heading (# / ## / ...)
       for j in lineStart..<min(lineEnd, last+1):
-        s.setCellStyle(j, TokenClass.Text)
+        s.setCellStyle(j, tc)
       if lineEnd <= last:
         s.setCellStyle(lineEnd, TokenClass.None)
 
     pos = lineEnd + 1
+
+  # Inline emphasis: **bold**, *italic*, and `code` (Markdown syntax).
+  proc emph(s: var SynEdit; ch: char; flag: CellFlag; first, last: int) =
+    var p = first
+    while p < last:
+      if s[p] == ch and
+         (p == first or s[p - 1] in {' ', '\t', '\L', '(', '{', '\''}) and
+         p + 1 <= last and s[p + 1] notin {' ', '\t', '\L'}:
+        var q = p + 1
+        while q <= last and s[q] != '\L':
+          if s[q] == ch and s[q - 1] notin {' ', '\t'}: break
+          inc q
+        if q <= last and s[q] == ch and q > p + 1:
+          s.addCellFlags(p, {cfHidden}); s.addCellFlags(q, {cfHidden})
+          for k in p + 1 .. q - 1: s.addCellFlags(k, {flag})
+          p = q + 1
+          continue
+      inc p
+  # Markdown bold is **text** (double star); italic is *text* (single star).
+  # Handle **bold** first (double star), then *italic* (single star).
+  proc emphBold(s: var SynEdit; first, last: int) =
+    var p = first
+    while p + 1 < last:
+      if s[p] == '*' and s[p + 1] == '*' and
+         (p == first or s[p - 1] in {' ', '\t', '\L', '(', '{', '\''}) and
+         p + 2 <= last and s[p + 2] notin {' ', '\t', '\L'}:
+        var q = p + 2
+        while q + 1 <= last and s[q] != '\L':
+          if s[q] == '*' and s[q + 1] == '*' and s[q - 1] notin {' ', '\t'}:
+            break
+          inc q
+        if q + 1 <= last and s[q] == '*' and s[q + 1] == '*' and q > p + 1:
+          s.addCellFlags(p, {cfHidden}); s.addCellFlags(p + 1, {cfHidden})
+          s.addCellFlags(q, {cfHidden}); s.addCellFlags(q + 1, {cfHidden})
+          for k in p + 2 .. q - 1: s.addCellFlags(k, {cfBold})
+          p = q + 2
+          continue
+      inc p
+  s.emphBold(first, last)
+  s.emph('*', cfItalic, first, last)
+  # `code` spans: colour the content in the code face, hide the backticks.
+  proc emphCode(s: var SynEdit; ch: char; tc: TokenClass; first, last: int) =
+    var p = first
+    while p < last:
+      if s[p] == ch and
+         (p == first or s[p - 1] in {' ', '\t', '\L', '(', '{', '\''}) and
+         p + 1 <= last and s[p + 1] notin {' ', '\t', '\L'}:
+        var q = p + 1
+        while q <= last and s[q] != '\L':
+          if s[q] == ch and s[q - 1] notin {' ', '\t'}: break
+          inc q
+        if q <= last and s[q] == ch and q > p + 1:
+          s.addCellFlags(p, {cfHidden}); s.addCellFlags(q, {cfHidden})
+          for k in p + 1 .. q - 1: s.setCellStyle(k, tc)
+          p = q + 1
+          continue
+      inc p
+  s.emphCode('`', TokenClass.StringLit, first, last)
 
 proc highlight(s: var SynEdit; first, last: int; initialState: TokenClass) =
   var g: GeneralTokenizer
@@ -1177,6 +1253,10 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
         while q <= last and s[q] notin {']', '\L'}: inc q
         if q <= last and s[q] == ']':
           for j in cp .. q: s.setCellStyle(j, TokenClass.Link)
+          # Hide the "[cite:" / "[cite/style:" prefix and the closing "]" so the
+          # citation reads as bare @key(s); the delimiters stay in the buffer.
+          for j in cp .. k: s.addCellFlags(j, {cfHidden})
+          s.addCellFlags(q, {cfHidden})
           # @key runs in the reference face
           var t = k + 1
           while t < q:
@@ -1353,6 +1433,7 @@ proc getLineOffset(s: SynEdit; lines: Natural): int =
   if gLastLineVersion == s.cacheId and lines.int >= gLastLine:
     start = gLastLineOffset
     y = lines.int - gLastLine
+    if y == 0: return start   # the requested line is the cached one
   var result = start
   while true:
     if s[result] == '\L':
@@ -1451,8 +1532,8 @@ proc upFirstLineOffset(s: var SynEdit) =
 
 proc downFirstLineOffset(s: var SynEdit) =
   var i = s.firstLineOffset.int
-  while s[i] != '\L': inc i
-  s.firstLineOffset = i + 1
+  while i < s.len and s[i] != '\L': inc i   # guard: last line may lack a trailing \L
+  s.firstLineOffset = min(i + 1, s.len)
 
 proc scrollLines(s: var SynEdit; amount: int) =
   let oldFirstLine = s.firstLine
@@ -2945,6 +3026,19 @@ proc fontForFlags(s: SynEdit; f: CellFlags; base: Font): Font =
   elif cfItalic in f: (if s.italicFont.int != 0: s.italicFont else: base)
   else: base
 
+proc tableGlyph(c: char; sep, atFirst, atLast: bool): string =
+  ## Display-only box-drawing substitution for org/rmd table cells. `sep` marks a
+  ## rule row (|---+---|); the buffer keeps the ASCII so tables stay editable.
+  case c
+  of '|':
+    if not sep: "│"                       # │
+    elif atFirst: "├"                     # ├
+    elif atLast: "┤"                      # ┤
+    else: "┼"                             # ┼
+  of '+': (if sep: "┼" else: $c)          # ┼ (only in rule rows)
+  of '-': (if sep: "─" else: $c)          # ─ (only in rule rows)
+  else: $c
+
 proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
   var tokenClass = s.getCell(i).s
   var styleBg = s.getBg(i)
@@ -2958,6 +3052,24 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
   db.lineNoWrap = isTableLine(s, i)
   if db.lineNoWrap and s.hScroll > 0:
     db.dim.x -= s.hScroll * textWidth(baseFont, " ")   # pan a wide table left
+  # box-drawing metadata for this row: is it a rule row (only |,+,-,ws with a
+  # dash), and the offsets of the first/last '|' (so rule-row ends get ├ / ┤).
+  var tblSep = false
+  var firstBar = -1
+  var lastBar = -1
+  if db.lineNoWrap:
+    var j = i
+    var onlyRule = true
+    var sawDash = false
+    while j < s.len and s[j] != '\L':
+      let c = s[j]
+      if c == '|':
+        if firstBar < 0: firstBar = j
+        lastBar = j
+      elif c == '-': sawDash = true
+      elif c notin {'+', ' ', '\t'}: onlyRule = false
+      inc j
+    tblSep = onlyRule and sawDash
   db.font = fontForFlags(s, styleFlags, baseFont)
   db.s = addr s
   db.i = i
@@ -2988,6 +3100,18 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
         if cell.s != tokenClass or s.getBg(db.i) != styleBg or cell.f != styleFlags:
           break
         elif db.charsLen == high(db.chars):
+          # Buffer full: flush, but never split a multi-byte UTF-8 rune across
+          # the flush boundary. If the next byte is a continuation byte
+          # (0b10xxxxxx), the buffer currently ends mid-rune -- pop that rune's
+          # bytes back off and re-read them in the next chunk, so every drawn
+          # token is valid UTF-8. Otherwise measureText/drawText mis-size the
+          # run and later text on the line is drawn over it (appears hidden
+          # until a selection re-render reveals it).
+          if (cell.c.ord and 0xC0) == 0x80:
+            while db.charsLen > 0 and (db.chars[db.charsLen - 1].ord and 0xC0) == 0x80:
+              dec db.charsLen; dec db.i
+            if db.charsLen > 0:
+              dec db.charsLen; dec db.i     # drop the rune's lead byte too
           break
         if cell.c == '\t':
           # expand tab
@@ -3001,6 +3125,15 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
             inc db.charsLen
             inc col
           db.chars[db.charsLen] = '\0'
+        elif db.lineNoWrap and cell.c in {'|', '+', '-'}:
+          # substitute a box-drawing glyph (1-3 UTF-8 bytes, still one column)
+          let g = tableGlyph(cell.c, tblSep, db.i == firstBar, db.i == lastBar)
+          if db.charsLen + g.len > high(db.chars):
+            break                          # no room for the glyph; flush + re-read
+          for b in g:
+            db.chars[db.charsLen] = b
+            db.toCursor[db.charsLen] = db.i
+            inc db.charsLen
         else:
           db.chars[db.charsLen] = cell.c
           db.toCursor[db.charsLen] = db.i
@@ -3101,13 +3234,18 @@ proc scrollGrip(s: SynEdit; area: Rect; lineH: int): Rect =
                 ScrollBarWidth - 2, gripH)
 
 proc isBigOrgLine(s: SynEdit; i: int): bool =
-  ## org #+title / #+author / top-level headings render in bigFont.
-  if s.lang != langOrg: return false
+  ## org #+title / #+author / top-level headings, and Markdown/Rmd # headings,
+  ## render in bigFont.
+  if s.lang notin {langOrg, langMarkdown}: return false
   var t = ""
   var j = i
   while j < s.len and s[j] != '\L' and t.len < 12:
     t.add s[j]; inc j
   let ls = t.strip(leading = true, trailing = false).toLowerAscii
+  if s.lang == langMarkdown:
+    # Markdown/Rmd ATX headings (# / ## / ###). Exclude '#' inside a code chunk
+    # (```{r}), where R comments also start with '#'.
+    return ls.len > 0 and ls[0] == '#' and not s.inSrcBlock(i)
   result = ls.startsWith("#+title") or ls.startsWith("#+author") or
            (ls.len > 0 and ls[0] == '*')
 
@@ -3143,7 +3281,16 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
   let spl = s.spaceForLines()
   if s.showLineNumbers:
     dim.x = area.x + spl + 4
+  let baseX = dim.x       # left of text (after gutter); reading margin adds to this
+  let fullEndX = endX     # full right edge; code blocks & tables use it, prose insets
 
+  # Keep the top-of-viewport byte offset consistent with firstLine on every
+  # frame. firstLineOffset can drift from firstLine after an edit shifts byte
+  # offsets or a byte-walked scroll, which mis-starts the draw and looks like
+  # broken text wrapping until a window resize re-derives the viewport. Deriving
+  # it here (getLineOffset is cacheId-keyed, so this is cheap) makes every redraw
+  # self-correct.
+  s.firstLineOffset = s.getLineOffset(s.firstLine).Natural
   var renderLine = s.firstLine
   var i = s.firstLineOffset.int
   s.span = 0
@@ -3159,6 +3306,13 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
     blink = s.cursorVisible
 
   while dim.y + fontSize < endY and i <= s.len:
+    # Reading margin: prose sits in a centered column; code blocks and tables
+    # span the full width (baseX..fullEndX) so wide content isn't cramped.
+    block:
+      let wide = s.readingMargin <= 0 or s.inSrcBlock(i) or isTableLine(s, i)
+      let lm = if wide: 0 else: s.readingMargin
+      dim.x = baseX + lm
+      dim.w = fullEndX - lm
     if s.showLineNumbers:
       let num = $(renderLine + 1)
       var numColor = if renderLine == s.currentLine: s.theme.fg[TokenClass.None]
@@ -3263,6 +3417,13 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
     let gripColor = if s.scrollGrabbed: s.theme.scrollBarActiveColor
                     else: s.theme.scrollBarColor
     fillRect(finalGrip, gripColor)
+
+  # Ghost text (Copilot inline completion): greyed text after the cursor.
+  if s.ghostText.len > 0 and s.cursorDim.h > 0:
+    let gx = s.cursorDim.x
+    let gy = s.cursorDim.y
+    if gx + textWidth(s.font, s.ghostText) <= endX:
+      discard drawText(s.font, gx, gy, s.ghostText, s.theme.lineNumColor, s.theme.bg)
 
   restoreState()
 
