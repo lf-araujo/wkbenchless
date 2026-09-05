@@ -2557,6 +2557,16 @@ proc parseImageLinkPath(line: string; path: var string): bool =
     path = inner
     return path.len > 0 and isImagePath(path)
 
+proc isImageLine(s: SynEdit; i: int): bool =
+  ## True if the line at byte offset `i` is a figure link (![](p) / [[file:p]]),
+  ## so figures render full-width rather than inside the reading margin.
+  var line = ""
+  var j = i
+  while j < s.len and s[j] != '\L':
+    line.add s[j]; inc j
+  var p = ""
+  parseImageLinkPath(line, p)
+
 proc latexDisplayMathAt*(s: SynEdit; lineStart: int; body: var string;
                          blockEnd: var int): bool =
   ## If the line beginning at buffer offset `lineStart` is a display-math
@@ -3309,7 +3319,8 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
     # Reading margin: prose sits in a centered column; code blocks and tables
     # span the full width (baseX..fullEndX) so wide content isn't cramped.
     block:
-      let wide = s.readingMargin <= 0 or s.inSrcBlock(i) or isTableLine(s, i)
+      let wide = s.readingMargin <= 0 or s.inSrcBlock(i) or
+                 isTableLine(s, i) or isImageLine(s, i)
       let lm = if wide: 0 else: s.readingMargin
       dim.x = baseX + lm
       dim.w = fullEndX - lm

@@ -38,11 +38,11 @@ proc configure*(app: var App) =
   # Side margin (px) per file extension, so prose documents read as a centered
   # column while code stays flush-left. 0 / unset = no margin. The host caps it
   # so the text column never shrinks below ~240px.
-  setReadingMargin("org", 360)
-  setReadingMargin("md", 360)
-  setReadingMargin("markdown", 360)
-  setReadingMargin("rmd", 360)
-  setReadingMargin("qmd", 360)
+  setReadingMargin("org", 180)
+  setReadingMargin("md", 180)
+  setReadingMargin("markdown", 180)
+  setReadingMargin("rmd", 180)
+  setReadingMargin("qmd", 180)
   bindkey("C-Space", "complete")        # LSP completion
   bindkey("F1", "show-help")            # help for word at cursor
   bindkey("C-Enter", "run-line")        # send the current line to the session
