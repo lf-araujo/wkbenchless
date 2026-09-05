@@ -32,15 +32,34 @@ proc pick(n: JsonNode; keys: varargs[string]): string =
     if v != nil and v.kind == JString and v.getStr.len > 0: return v.getStr
   ""
 
+proc copilotCmd(): string =
+  ## The command to launch copilot-language-server. If it's on PATH (including
+  ## a snap, whose /snap/bin entry is a symlink to /usr/bin/snap), keep the
+  ## bare name so the shell resolves it correctly -- resolving the symlink to
+  ## /usr/bin/snap would drop the app name and break the snap. Only fall back
+  ## to an explicit path when it's not on PATH at all.
+  let name = gCopilotCmd.splitWhitespace()[0]
+  if findExe(name).len > 0: return gCopilotCmd
+  for dir in [getHomeDir() / ".emacs.d" / ".cache" / "copilot" / "bin",
+              getHomeDir() / ".npm-global" / "bin",
+              getHomeDir() / ".local" / "bin",
+              getHomeDir() / "bin"]:
+    let cand = dir / name
+    if fileExists(cand): return cand & " --stdio"
+  ""
+
 proc ensureCop(app: var App): bool =
   if cop != nil and cop.initialized: return true
   let root = uriOf(if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir())
-  cop = startLsp(gCopilotCmd, root, %*{
+  let cmd = copilotCmd()
+  if cmd.len == 0:
+    app.msg = "copilot: couldn't find copilot-language-server (install it or add it to PATH)"
+    return false
+  cop = startLsp(cmd, root, %*{
     "editorInfo": {"name": "wkbenchless", "version": "0.1"},
     "editorPluginInfo": {"name": "wkbenchless-copilot", "version": "0.1"}})
   if cop == nil or not cop.initialized:
-    app.msg = "copilot: couldn't start '" & gCopilotCmd.splitWhitespace()[0] &
-              "' (is the binary on PATH?)"
+    app.msg = "copilot: couldn't start '" & cmd.splitWhitespace()[0] & "'"
     return false
   true
 
@@ -107,8 +126,28 @@ proc copilotSuggest(app: var App) =
   let sug = suggestionOf(if resp != nil: resp{"result"} else: nil)
   if sug.len == 0: (app.msg = "copilot: no suggestion here"; return)
   gSuggestion = sug
-  app.help.setText("Copilot suggestion  (M-x copilot-accept to insert):\n\n" & sug)
-  app.msg = "copilot: suggestion ready (Help pane) -- copilot-accept inserts it"
+  app.setGhostText(sug)                     # greyed inline after the cursor
+  app.msg = "copilot: suggestion ready -- Tab / M-x ghost-accept inserts it"
+
+proc copilotAutoSuggest*(app: var App) =
+  ## Always-on ghost suggestion: query copilot after an edit and show the result
+  ## greyed after the cursor. Silent (no status noise); clears the ghost when
+  ## there's nothing to suggest. Only fires once the server is up (lazy start).
+  if app.filePath.len == 0: return
+  if not ensureCop(app): return
+  let uri = uriOf(app.filePath)
+  let lang = if app.docLang.len > 0: app.docLang else: "plaintext"
+  cop.syncDoc(uri, lang, app.ed.fullText())
+  let resp = cop.request("textDocument/inlineCompletion", %*{
+    "textDocument": {"uri": uri},
+    "position": {"line": app.ed.currentLine, "character": app.ed.currentCol},
+    "context": {"triggerKind": 2}})       # 2 = Automatic
+  let sug = suggestionOf(if resp != nil: resp{"result"} else: nil)
+  if sug.len == 0:
+    app.setGhostText("")
+    return
+  gSuggestion = sug
+  app.setGhostText(sug)
 
 proc copilotAccept(app: var App) =
   if gSuggestion.len == 0: (app.msg = "copilot: no pending suggestion"; return)
@@ -116,6 +155,7 @@ proc copilotAccept(app: var App) =
   app.ed.markChanged()
   app.msg = "copilot: inserted suggestion"
   gSuggestion = ""
+  app.setGhostText("")
 
 proc extend*(app: var App) =
   # Let a COPILOT_LANGUAGE_SERVER / WKB_COPILOT_CMD env override the binary path.
@@ -127,3 +167,5 @@ proc extend*(app: var App) =
   defcommand("copilot-suggest", "Copilot: suggest at cursor", copilotSuggest)
   defcommand("copilot-accept", "Copilot: insert the last suggestion", copilotAccept)
   bindkey("M-\\", "copilot-suggest")
+  # Always-on ghost suggestions after each edit (silent; lazy server start).
+  addHook("after-edit", proc(a: var App) = copilotAutoSuggest(a))

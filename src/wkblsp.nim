@@ -59,11 +59,12 @@ proc startLsp*(command, rootUri: string; initOptions: JsonNode = nil): LspClient
   ## needs editorInfo there. Returns nil if the server isn't found / handshake fails.
   let parts = command.splitWhitespace()
   if parts.len == 0: return nil
-  let exe = findExe(parts[0])
-  if exe.len == 0: return nil
+  # Run via a shell so a snap (whose /snap/bin entry is a symlink to
+  # /usr/bin/snap) resolves correctly -- findExe would collapse it to
+  # /usr/bin/snap and drop the app name, breaking the launch.
   var p: Process
   try:
-    p = startProcess(exe, args = parts[1 .. ^1], options = {poStdErrToStdOut})
+    p = startProcess("/bin/sh", args = ["-c", command], options = {poStdErrToStdOut})
   except OSError:
     return nil
   result = LspClient(process: p, nextId: 0, initialized: false,
