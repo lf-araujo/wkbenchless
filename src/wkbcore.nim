@@ -504,6 +504,7 @@ proc openFile*(app: var App; path: string) =
   for i, b in app.buffers:
     if b.filePath == path: switchToBuffer(app, i); return   # already open
   var ed = createSynEdit(app.font)
+  ed.theme = app.ed.theme      # inherit the active theme so new buffers match
   ed.showLineNumbers = false   # off by default; toggle with C-c n
   ed.bigFont = app.bigFont
   ed.setEmphasisFonts(app.ed.boldFont, app.ed.italicFont,
