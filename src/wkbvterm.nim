@@ -198,10 +198,18 @@ proc deleteChars(t: VTerm; n: int) =
 
 proc xterm256(n: int; defFg, defBg: Color): Color =
   if n < 16:
+    # On a light theme the stock 16-colour palette (black/white/…) clashes with
+    # the pale background -- e.g. white text on off-white is unreadable. Swap in
+    # a light-theme palette: the "dark" half stays dark enough, the "bright"
+    # half is darkened so it reads on the light background.
+    let light = defBg.r.int + defBg.g.int + defBg.b.int > 3 * 128
     const base = [0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080,
                   0x008080, 0xc0c0c0, 0x808080, 0xff0000, 0x00ff00, 0xffff00,
                   0x0000ff, 0xff00ff, 0x00ffff, 0xffffff]
-    let h = base[n]
+    const lightBase = [0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080,
+                       0x008080, 0x404040, 0x606060, 0xb00000, 0x006000, 0xb0a000,
+                       0x0000b0, 0xb000b0, 0x00a0a0, 0x808080]
+    let h = (if light: lightBase[n] else: base[n])
     color(uint8(h shr 16 and 0xFF), uint8(h shr 8 and 0xFF), uint8(h and 0xFF))
   elif n < 232:
     let i = n - 16

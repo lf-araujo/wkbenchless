@@ -233,7 +233,12 @@ proc base16Theme*(name: string; b: Base16): AppTheme =
   result.statusBg = b[0x1]; result.statusFg = b[0x4]
   result.chipBg = b[0x1]; result.chipFg = b[0x5]
   result.chipActiveBg = b[0x2]; result.chipActiveFg = b[0xA]
-  result.termFg = b[0x5]; result.dimFg = b[0x3]; result.dividerColor = b[0x2]
+  result.termFg = b[0x5]
+  # On a light theme base03 (a pale grey) is too faint for dim text on the
+  # near-white panel; use base04 so the scrollback/status hints stay readable.
+  let light = b[0x0].r.int + b[0x0].g.int + b[0x0].b.int > 3 * 128
+  result.dimFg = (if light: b[0x4] else: b[0x3])
+  result.dividerColor = b[0x2]
   result.boxBg = b[0x1]; result.boxSelBg = b[0x2]; result.boxFg = b[0x5]
   result.closeBg = b[0x8]; result.closeFg = b[0x0]
 
@@ -1388,27 +1393,69 @@ proc langToExt(lang: string): string =
   of "bash", "sh": ".sh"
   else: ".txt"
 
+proc rmdChunkOpen(line: string): bool =
+  ## True if `line` opens an Rmd chunk fence (```{lang ...} / ~~~{lang ...}).
+  let s = strutils.strip(line)
+  if s.startsWith("```") or s.startsWith("~~~"):
+    let rest = s[3 .. ^1].strip
+    return rest.len > 0 and rest[0] == '{'
+  false
+
+proc rmdChunkClose(line: string): bool =
+  ## True if `line` is a plain Rmd fence closer (``` / ~~~ with nothing after).
+  let s = strutils.strip(line)
+  (s.startsWith("```") or s.startsWith("~~~")) and s[3 .. ^1].strip.len == 0
+
 proc headerLangSession(header: string): (string, string) =
-  let hdr = strutils.splitWhitespace(header)
-  let lang = if hdr.len >= 2: hdr[1] else: ""
-  var sess = "default"
-  var k = 2
-  while k < hdr.len:
-    if hdr[k] == ":session" and k + 1 < hdr.len: sess = hdr[k + 1]
-    inc k
-  (lang, sess)
+  let hdr = strutils.strip(header)
+  if hdr.toLowerAscii.startsWith("#+begin_src"):
+    let parts = strutils.splitWhitespace(hdr)
+    let lang = if parts.len >= 2: parts[1] else: ""
+    var sess = "default"
+    var k = 2
+    while k < parts.len:
+      if parts[k] == ":session" and k + 1 < parts.len: sess = parts[k + 1]
+      inc k
+    (lang, sess)
+  else:
+    # Rmd chunk header: ```{lang, opt=val, ...} / ~~~{lang ...}. The language is
+    # the token after the brace; `session=name` (quotes optional) sets the session.
+    var inner = hdr
+    if inner.startsWith("```"): inner = inner[3 .. ^1]
+    elif inner.startsWith("~~~"): inner = inner[3 .. ^1]
+    inner = inner.strip
+    if inner.startsWith("{"): inner = inner[1 .. ^1]
+    if inner.endsWith("}"): inner = inner[0 .. ^2]
+    inner = inner.strip
+    var i = 0
+    while i < inner.len and inner[i] notin {',', ' ', '\t'}: inc i
+    let lang = inner[0 ..< i].strip
+    var sess = "default"
+    for p in inner.split(','):
+      let kv = p.strip
+      let eq = kv.find('=')
+      if eq > 0 and kv[0 ..< eq].strip == "session":
+        var v = kv[eq + 1 .. ^1].strip
+        if v.len >= 2 and v[0] == '"' and v[^1] == '"': v = v[1 .. ^2]
+        sess = v
+    (lang, sess)
 
 proc findBlockAt(app: App; cur: int): tuple[b, e: int; header: string] =
   result = (-1, -1, "")
   let total = app.ed.getLineCount()
+  var isRmd = false
   for i in countdown(cur, 0):
     let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
     if low.startsWith("#+begin_src"):
       result.b = i; result.header = strutils.strip(app.ed.getLineText(i)); break
+    if rmdChunkOpen(low):
+      result.b = i; result.header = strutils.strip(app.ed.getLineText(i)); isRmd = true; break
     if low.startsWith("#+end_src") and i < cur: return
+    if rmdChunkClose(low) and i < cur: return
   if result.b < 0: return
   for i in result.b + 1 ..< total:
-    if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+end_src"):
+    let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
+    if (if isRmd: rmdChunkClose(low) else: low.startsWith("#+end_src")):
       result.e = i; break
   if result.e < 0 or cur > result.e: result = (-1, -1, "")
 
@@ -1427,11 +1474,14 @@ proc srcEditEnter(app: var App; sessionWide: bool) =
   else:
     var i = 0
     while i < total:
-      if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+begin_src"):
+      let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
+      if low.startsWith("#+begin_src") or rmdChunkOpen(low):
+        let isRmd = rmdChunkOpen(low)
         let (l2, s2) = headerLangSession(strutils.strip(app.ed.getLineText(i)))
         var e2 = -1
         for j in i + 1 ..< total:
-          if strutils.strip(app.ed.getLineText(j)).toLowerAscii.startsWith("#+end_src"):
+          let lj = strutils.strip(app.ed.getLineText(j)).toLowerAscii
+          if (if isRmd: rmdChunkClose(lj) else: lj.startsWith("#+end_src")):
             e2 = j; break
         if e2 < 0: break
         if l2.toLowerAscii == lang.toLowerAscii and s2 == sess:
@@ -1497,7 +1547,7 @@ proc srcEditExit*(app: var App) =
     org[r.a ..< r.b] = reindented
 
   app.filePath = app.orgFilePath
-  app.ed.lang = langOrg           # set lang BEFORE setText: setText highlights now
+  app.ed.lang = fileExtToLanguage(splitFile(app.orgFilePath).ext)  # before setText
   app.ed.setText(org.join("\n"))
   app.docLang = ""
   app.editMode = emNone
