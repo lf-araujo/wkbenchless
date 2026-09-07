@@ -192,5 +192,72 @@ no manual `--passL` flag needed for normal builds.
 
 ## Not yet done
 
-- No further features requested as of this session's end. Everything
-  above is committed and pushed.
+- No further GTK-nimacs features requested. Everything above is committed
+  and pushed. Active development is on **wkbenchless** (see the planned
+  work below).
+
+## Planned: reference management (wkbenchless)
+
+Design settled in discussion (2026-09). Land on a `[cite:@key]` in an org
+buffer (cites are already fontified) and surface everything *you* have ever
+associated with that reference, in the help/objects pane. The whole feature
+is an **offline reader over Zotero's SQLite + your filesystem** — three
+sources, all reached by the same `citekey → …` shape, all returned as plain
+text (so `wkbctl`/Claude-in-terminal can pull a reference dossier too).
+
+Three sources, keyed on one `@key`:
+
+| Source | Access (verified on this machine) | Unit | Section label |
+|---|---|---|---|
+| Your **notes** | `itemNotes` join in `zotero.sqlite` (read a copy — Zotero holds a lock); citekey via Better BibTeX `citekeys` table. **524 keys have notes.** Must **filter out Mktero snapshot notes** (see below) so this stays *your* thinking, not a paper dump. | note (HTML→text) | "Notes" |
+| Your **prose** | walk `gCorpusRoots` for `.org`, split to body paragraphs (reuse `org_tracked` `parseUnits`/`bodyParas`), extract `[cite:@key]` + bare `@key`. Corpus measured: 114 files / 8.1 MB / **15 ms to scrape**. | paragraph | "You've written about this" |
+| The **paper** | Mktero (the tool being adopted) saves a PDF snapshot as a Zotero **note** plus a **`source.md`** attachment → the `.md` resolves via `itemAttachments` → `~/Zotero/storage/<attachmentKey>/source.md`. Optional layer; empty when no such attachment exists. | full text | "From the paper" (kept visually distinct — source, not you) |
+
+Verbs to add (control socket + `wkbctl`/`wkbenchless ctl`):
+
+- [ ] `cite-context <key>` — all available sections for a key (the dossier).
+- [ ] `cite-notes <key>` — Zotero notes only (SQLite join).
+- [ ] `cite-prose <key>` — your manuscript paragraphs, each with `file:line`
+      for a jump (reuse `cite-goto`'s jump mechanic).
+- [ ] `cite-paper <key>` — path/preview of the attached Mktero `source.md`
+      full text (optional; only when present).
+- [ ] `zotero-search <query>` — general library search over Zotero's SQLite
+      (titles / authors / notes, and Mktero `source.md` full text when
+      indexed), returning `citekey — Author (year). Title` + flags for what
+      each hit has (notes / paper-md / cited-in-my-prose). Broader than the
+      existing `bib` verb, which only searches the `.bib` files; this finds a
+      paper you read but have not cited yet. Reuses the same offline SQLite.
+- [ ] (editor) `M-x cite-context` — fill the help pane for the cite at point;
+      on-demand first, automatic-on-cursor as a later toggle.
+
+Design decisions already made:
+
+- **Unit is the paragraph** (not the section) — org_tracked already splits
+  this way.
+- **Corpus = configured roots** (`gCorpusRoots`, active + archive dirs), NOT
+  Zotero-attached manuscripts: Zotero stores attachments as *copies* in its
+  storage dir, which would drift from the working `.org`. The live files are
+  the truth; one config line survives archiving.
+- **Ownership stays split**: Zotero owns *notes*, the filesystem owns
+  *manuscripts*. Don't cross them.
+- **Subversion sprawl** (~30 `_v2`/`-tracked`/dated copies): group by
+  manuscript family, collapse near-identical paragraphs with org_tracked's
+  `wordSet`/`similarity`, newest wins. "Paragraph evolution across drafts" is
+  a later opt-in, not the default.
+- **Mktero writes to BOTH note and attachment** — the workflow being adopted
+  saves a PDF snapshot as a Zotero *note* (lands in `itemNotes`, so it would
+  otherwise pollute the "Notes" = your-thinking section) **and** a `source.md`
+  attachment (the reflowed full text). So: **route Mktero notes to "From the
+  paper", not "Notes".** Detection TBD at build time — match a Mktero marker
+  in the note HTML, and/or treat a note as a paper-snapshot when the item also
+  carries a `source.md` and the note is large/structured. Confirm the exact
+  marker against a real Mktero note once one exists in the library.
+- **Decoupled from the OCR stack**: wkbenchless only *reads* the note and the
+  `source.md`; it never calls Estravon's `Zotero.Estravon.extract()` hook or
+  Mktero's MinerU backend — conversion stays Zotero/Mktero's job.
+- **Cost**: negligible (15 ms full scrape) — rebuild the index on demand; a
+  persistent cache is a nicety, not a requirement.
+
+First slice: the paragraph index + `cite-prose` / `M-x cite-context` for the
+prose source (the novel half), against the real 36 citing `.org` files. Notes
+and paper-text sections slot into the same pane afterward as further joins.
