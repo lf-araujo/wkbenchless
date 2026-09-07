@@ -224,6 +224,17 @@ proc handle(app: var App; req: string): string =
     let key = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
     if key.len == 0: return "(usage: cite-goto <key>)"
     result = citeGoto(app, key)
+  of "cite-prose":                         # paragraphs across your corpus citing @key
+    let key = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
+    if key.len == 0: return "(usage: cite-prose <key>)"
+    result = formatProse(key, citeProse(app.filePath, key), getHomeDir())
+  of "cite-reindex":                       # force a rebuild of the prose index
+    result = "ok: reindexed " & $reindexProse(app.filePath) & " citekeys"
+  of "cite-context":                       # everything you've associated with @key
+    # For now this is the prose section; notes (Zotero) + paper (Mktero) join later.
+    let key = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
+    if key.len == 0: return "(usage: cite-context <key>)"
+    result = formatProse(key, citeProse(app.filePath, key), getHomeDir())
   of "open":                               # open a file into a buffer
     let p = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
     if p.len == 0: return "(usage: open <path>)"

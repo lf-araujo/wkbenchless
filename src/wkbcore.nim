@@ -9,10 +9,11 @@ import uirelays              # vendored: src/vendor/uirelays (see config.nims pa
 import widgets/synedit          # our patched SynEdit (langR/langOrg, inline images)
 import wkbsession
 import wkblsp                    # pure std/json LSP client -- portable, no GTK
+import wkbref                    # reference context: prose/notes/paper by citekey
 import std/[tables, strutils, os, osproc, algorithm, times]
 when defined(posix): import std/posix
 
-export uirelays, synedit, wkbsession, wkblsp   # config sees Event/SynEdit/ReplSpec/LspClient/...
+export uirelays, synedit, wkbsession, wkblsp, wkbref   # config sees Event/SynEdit/ReplSpec/LspClient/gCorpusRoots/...
   # uirelays + `synedit` above come from the vendored tree in src/vendor/uirelays
 
 type
@@ -531,6 +532,30 @@ proc openFile*(app: var App; path: string) =
   app.activate(app.buffers.high)
   applyOrgStartup(app)                         # #+STARTUP: latexpreview / inlineimages
   app.msg = "opened " & extractFilename(path)
+
+proc showInfoBuffer*(app: var App; name, text: string) =
+  ## Show TEXT in a reusable, non-file info buffer named `*<name>*` (e.g.
+  ## `*cite-context*`) -- always visible (unlike the src-edit-only side panes),
+  ## org-fontified, and marked saved so a reload never writes it to disk.
+  let tag = "*" & name & "*"
+  var found = -1
+  for i, b in app.buffers:
+    if b.filePath == tag: found = i; break
+  if found >= 0:
+    switchToBuffer(app, found)
+  else:
+    var ed = createSynEdit(app.font)
+    ed.theme = app.ed.theme
+    ed.showLineNumbers = false
+    ed.bigFont = app.bigFont
+    ed.setEmphasisFonts(app.ed.boldFont, app.ed.italicFont,
+                        app.ed.boldItalicFont, app.ed.captionFont)
+    ed.lang = langOrg
+    app.syncActive()
+    app.buffers.add BufferState(ed: ed, filePath: tag, docLang: "")
+    app.activate(app.buffers.high)
+  app.ed.setText(text)
+  app.ed.markSaved()                      # never dirty -> never saved on reload
 
 # -- palette entries (commands / buffers / files) --------------------------
 proc orgOutline*(app: App): seq[tuple[line: int; label: string]] =

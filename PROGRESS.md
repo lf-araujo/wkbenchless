@@ -215,10 +215,14 @@ Three sources, keyed on one `@key`:
 
 Verbs to add (control socket + `wkbctl`/`wkbenchless ctl`):
 
-- [ ] `cite-context <key>` — all available sections for a key (the dossier).
+- [~] `cite-context <key>` — all available sections for a key (the dossier).
+      *Done for the prose section; notes + paper join it next.*
 - [ ] `cite-notes <key>` — Zotero notes only (SQLite join).
-- [ ] `cite-prose <key>` — your manuscript paragraphs, each with `file:line`
-      for a jump (reuse `cite-goto`'s jump mechanic).
+- [x] `cite-prose <key>` — your manuscript paragraphs, each with `file:line`.
+      **Done** (`src/wkbref.nim`): critic-aware paragraph index, CriticMarkup
+      accepted to clean prose, near-duplicate drafts collapsed. Verified on the
+      real corpus (26 deduped paragraphs for a real key, 0 residual markup,
+      ~170 ms). Plus `cite-reindex` and editor `M-x cite-context` (C-c ?).
 - [ ] `cite-paper <key>` — path/preview of the attached Mktero `source.md`
       full text (optional; only when present).
 - [ ] `zotero-search <query>` — general library search over Zotero's SQLite

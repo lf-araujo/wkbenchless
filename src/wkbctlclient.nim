@@ -53,6 +53,14 @@ proc buildRequest(args: seq[string]; req: var string): string =
   of "cite-goto":
     if args.len < 2: return "ctl cite-goto <key>"
     req = "cite-goto\t" & args[1]
+  of "cite-prose":
+    if args.len < 2: return "ctl cite-prose <key>"
+    req = "cite-prose\t" & args[1]
+  of "cite-context":
+    if args.len < 2: return "ctl cite-context <key>"
+    req = "cite-context\t" & args[1]
+  of "cite-reindex":
+    req = "cite-reindex"
   of "open":
     if args.len < 2: return "ctl open <path>"
     req = "open\t" & args[1]
