@@ -216,8 +216,13 @@ Three sources, keyed on one `@key`:
 Verbs to add (control socket + `wkbctl`/`wkbenchless ctl`):
 
 - [~] `cite-context <key>` — all available sections for a key (the dossier).
-      *Done for the prose section; notes + paper join it next.*
-- [ ] `cite-notes <key>` — Zotero notes only (SQLite join).
+      **Notes + prose done** (unioned in `formatContext`); paper (Mktero) joins next.
+- [x] `cite-notes <key>` — Zotero notes only (SQLite join). **Done**
+      (`src/wkbref.nim`): joins Better BibTeX `citekeys` → Zotero `itemNotes`,
+      both opened `immutable=1` (no copy, no lock, Zotero-running-safe); note
+      HTML → plain text; duplicate itemNotes rows collapsed (DISTINCT); a
+      printable sentinel separates notes (the sqlite3 CLI caret-escapes control
+      chars). Verified live against `~/Zotero`.
 - [x] `cite-prose <key>` — your manuscript paragraphs, each with `file:line`.
       **Done** (`src/wkbref.nim`): critic-aware paragraph index, CriticMarkup
       accepted to clean prose, near-duplicate drafts collapsed. Verified on the

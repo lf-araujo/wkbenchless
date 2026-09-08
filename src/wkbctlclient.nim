@@ -56,6 +56,9 @@ proc buildRequest(args: seq[string]; req: var string): string =
   of "cite-prose":
     if args.len < 2: return "ctl cite-prose <key>"
     req = "cite-prose\t" & args[1]
+  of "cite-notes":
+    if args.len < 2: return "ctl cite-notes <key>"
+    req = "cite-notes\t" & args[1]
   of "cite-context":
     if args.len < 2: return "ctl cite-context <key>"
     req = "cite-context\t" & args[1]

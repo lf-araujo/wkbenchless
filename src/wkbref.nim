@@ -13,12 +13,15 @@
 ## with neither -- the open file's own directory). Indexing is cheap (a few MB),
 ## so the index is built lazily and rebuilt when any root's newest file changes.
 
-import std/[os, strutils, tables, times, sets, hashes, algorithm]
+import std/[os, strutils, tables, times, sets, hashes, algorithm, osproc]
 
 var
   gCorpusRoots*: seq[string]   ## dirs to index for prose (config; `~` ok). Empty
                                ## -> `$WKB_CORPUS` (`:`/`;`-separated), else the
                                ## open file's directory.
+  gZoteroDir*: string          ## Zotero data dir (holds zotero.sqlite + the
+                               ## Better BibTeX db). Empty -> `$ZOTERO_DIR`, else
+                               ## `~/Zotero`.
 
 type
   Occurrence* = object
@@ -299,6 +302,76 @@ proc reindexProse*(currentFile: string): int =
   gIdx = buildProseIndex(roots); gIdxSig = rootsSignature(roots)
   gIdx.len
 
+# ---- Zotero: notes on the cited item (offline SQLite read) ------------------
+# Read a citekey's Zotero notes by joining Better BibTeX's citekey table to
+# Zotero's itemNotes. The two SQLite files are opened `immutable=1` -- no copy,
+# no lock fight, works whether Zotero is running or not.
+
+proc zoteroDir*(): string =
+  if gZoteroDir.len > 0: return expandTilde(gZoteroDir)
+  let env = getEnv("ZOTERO_DIR")
+  if env.len > 0: return expandTilde(env)
+  getHomeDir() / "Zotero"
+
+proc zoteroDbs(): tuple[zt, bbt: string] =
+  ## (zotero.sqlite, better-bibtex db) paths, or "" for a missing one.
+  let dir = zoteroDir()
+  let zt = dir / "zotero.sqlite"
+  result.zt = if fileExists(zt): zt else: ""
+  for name in ["better-bibtex-search.sqlite", "better-bibtex.sqlite"]:
+    if fileExists(dir / name): result.bbt = dir / name; break
+
+proc safeKey(key: string): bool =
+  ## A citekey is safe to interpolate into SQL iff it is all key chars (no
+  ## quotes/spaces) -- our keys are validated to this set, so this just guards.
+  if key.len == 0: return false
+  for c in key:
+    if c notin keyChars: return false
+  true
+
+proc htmlToText*(html: string): string =
+  ## Zotero notes are HTML; render to plain text: block tags -> newlines, list
+  ## items -> "- ", other tags dropped, common entities decoded.
+  var s = html
+  s = s.multiReplace(("</p>", "\n"), ("<br>", "\n"), ("<br/>", "\n"),
+                     ("<br />", "\n"), ("</div>", "\n"), ("</h1>", "\n"),
+                     ("</h2>", "\n"), ("</h3>", "\n"), ("</li>", "\n"),
+                     ("<li>", "\n- "))
+  var noTags = newStringOfCap(s.len)            # drop remaining < … > tags
+  var inTag = false
+  for c in s:
+    if c == '<': inTag = true
+    elif c == '>': inTag = false
+    elif not inTag: noTags.add c
+  result = noTags.multiReplace(("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"),
+                               ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'"),
+                               ("&apos;", "'"))
+  # collapse 3+ newlines to a blank line, trim
+  while "\n\n\n" in result: result = result.replace("\n\n\n", "\n\n")
+  result = result.strip
+
+proc citeNotes*(key: string): seq[string] =
+  ## Your Zotero notes on the item with citekey KEY (plain text), or @[].
+  if not safeKey(key): return
+  let sqlite = findExe("sqlite3")
+  if sqlite.len == 0: return
+  let (zt, bbt) = zoteroDbs()
+  if zt.len == 0 or bbt.len == 0: return
+  # A printable sentinel between notes: the sqlite3 CLI renders control chars
+  # (e.g. char(30)) in caret notation, so a control-char separator would not
+  # survive. DISTINCT collapses Zotero's duplicate itemNotes rows (sync can leave
+  # several identical note rows on one item).
+  const sep = "@@WKB_NOTE_SEP@@"
+  let sql = "ATTACH 'file:" & bbt & "?immutable=1' AS bbt;" &
+    "SELECT DISTINCT n.note || '" & sep & "' FROM bbt.citekeys b " &
+    "JOIN itemNotes n ON n.parentItemID = b.itemID WHERE b.citekey = '" & key & "';"
+  let (outp, code) = execCmdEx(quoteShell(sqlite) & " " &
+    quoteShell("file:" & zt & "?immutable=1") & " " & quoteShell(sql))
+  if code != 0: return
+  for chunk in outp.split(sep):
+    let t = htmlToText(chunk)
+    if t.len > 0: result.add t
+
 # ---- formatting ------------------------------------------------------------
 
 proc shorten(s: string; n: int): string =
@@ -313,3 +386,22 @@ proc formatProse*(key: string; occs: seq[Occurrence]; homeDir = ""): string =
     var f = o.file
     if homeDir.len > 0 and f.startsWith(homeDir): f = "~" & f[homeDir.len .. ^1]
     result.add "\n" & f & ":" & $o.line & "\n  " & shorten(o.para, 500) & "\n"
+
+proc formatNotes*(key: string; notes: seq[string]): string =
+  ## Rendering of Zotero notes for a key.
+  if notes.len == 0: return "(no Zotero notes on @" & key & ")"
+  result = "@" & key & " — " & $notes.len &
+           " Zotero note" & (if notes.len == 1: "" else: "s") & ":\n"
+  for n in notes:
+    result.add "\n  " & n.replace("\n", "\n  ") & "\n"
+
+proc formatContext*(key: string; occs: seq[Occurrence]; notes: seq[string];
+                    homeDir = ""): string =
+  ## The dossier: your notes, then your prose. (Paper text joins later.)
+  result = "═══ @" & key & " ═══\n\n"
+  result.add "── Notes (Zotero) ──\n"
+  result.add (if notes.len == 0: "(none)\n"
+              else: formatNotes(key, notes).split('\n', 1)[1] & "\n")
+  result.add "\n── You've written about this ──\n"
+  result.add (if occs.len == 0: "(none in your corpus)\n"
+              else: formatProse(key, occs, homeDir).split('\n', 1)[1])

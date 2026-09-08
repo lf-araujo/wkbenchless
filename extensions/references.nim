@@ -16,12 +16,13 @@ proc citeContextCmd(app: var App) =
   let key = keyAtPoint(line, app.ed.currentCol)
   if key.len == 0:
     app.msg = "cite-context: put the cursor on a [cite:@key] citation"; return
-  app.msg = "cite-context: searching your corpus for @" & key & " …"
+  app.msg = "cite-context: gathering notes + prose for @" & key & " …"
   let occs = citeProse(app.filePath, key)
-  showInfoBuffer(app, "cite-context", formatProse(key, occs, getHomeDir()))
-  app.msg = "cite-context @" & key & " — " & $occs.len &
-            " paragraph" & (if occs.len == 1: "" else: "s") &
-            "  (C-c C-o on a file:line to open it)"
+  let notes = citeNotes(key)
+  showInfoBuffer(app, "cite-context", formatContext(key, occs, notes, getHomeDir()))
+  app.msg = "cite-context @" & key & " — " & $notes.len & " note" &
+            (if notes.len == 1: "" else: "s") & ", " & $occs.len & " paragraph" &
+            (if occs.len == 1: "" else: "s") & "  (C-c C-o on a file:line to open)"
 
 proc citeReindexCmd(app: var App) =
   app.msg = "cite-context: reindexing corpus …"
