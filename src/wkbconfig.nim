@@ -118,6 +118,14 @@ proc configure*(app: var App) =
   # [x] to close). Off by default -- set true to enable.
   # gBufferTabs = true
 
+  # Reference management (M-x cite-context / cite-prose / zotero-search, C-c ?):
+  # which folders hold your manuscripts, indexed for "paragraphs you've written
+  # citing @key". Add archive dirs too -- a folder listed here keeps being
+  # indexed even after you move a finished project into it. Empty = fall back to
+  # $WKB_CORPUS, else the open file's own directory. (Zotero notes/paper come
+  # from ~/Zotero automatically; override with gZoteroDir if it lives elsewhere.)
+  gCorpusRoots = @["~/Documents/OneDrive/Projetos"]
+
   # PATH for sessions & terminals. Launched from a GUI, wkbenchless may inherit a
   # stripped PATH, so at startup it seeds PATH from your login shell ($SHELL -lc)
   # -- that alone usually locates R, python, etc. Add extra dirs here (prepended,

@@ -605,8 +605,12 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
   let q = app.paletteQuery.toLowerAscii
   case app.paletteMode
   of pmCommands:
+    # Match the command NAME as well as its description, and show the name -- so
+    # typing e.g. "cite" finds `cite-context` even when its label doesn't contain
+    # that word.
     for name, c in gCommands:
-      if q.len == 0 or q in c.label.toLowerAscii: result.add (name, c.label)
+      if q.len == 0 or q in name.toLowerAscii or q in c.label.toLowerAscii:
+        result.add (name, name & "  —  " & c.label)
   of pmBuffers:
     for i, b in app.buffers:
       let nm = bufName(b)
