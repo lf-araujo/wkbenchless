@@ -238,12 +238,21 @@ Verbs to add (control socket + `wkbctl`/`wkbenchless ctl`):
       against the one real Mktero note in the library.
       *Note:* the current Mktero item has a malformed BBT citekey
       (`…undefined/ed`), so it's reachable only once that key is fixed in Zotero.
-- [ ] `zotero-search <query>` — general library search over Zotero's SQLite
-      (titles / authors / notes, and Mktero `source.md` full text when
-      indexed), returning `citekey — Author (year). Title` + flags for what
-      each hit has (notes / paper-md / cited-in-my-prose). Broader than the
-      existing `bib` verb, which only searches the `.bib` files; this finds a
-      paper you read but have not cited yet. Reuses the same offline SQLite.
+- [x] `zotero-search <query>` — general library search over Zotero's SQLite.
+      **Done** (`src/wkbref.nim` `zoteroSearch`): AND-matches every term against
+      citekey / authors / title / note text (Mktero `source.md` is in the blob
+      via its snapshot note, so this is also paper full-text search), returning
+      `@citekey — Author (year). Title` + flags `✎notes ▤paper ✍cited`
+      (`✍cited` = you have cited it in your corpus, via the prose index).
+      Broader than `bib` (which only reads the `.bib` files) — finds a paper you
+      read but have not cited yet. Verified live: title/author/note-text matches
+      and all three flags. *Observed:* real citekey drift between the manuscript
+      corpus and Zotero (e.g. `reynoldsQuantitativeGeneticAnalysis2005` isn't in
+      the library) — a future DOI/title-unify pass could bridge it.
+
+**All reference-management verbs are implemented, validated live, and pushed.**
+Next possible polish: an "open the paper `.md`" affordance from the pane; a
+DOI/title unify pass for citekey drift; automatic-on-cursor pane updates.
 - [ ] (editor) `M-x cite-context` — fill the help pane for the cite at point;
       on-demand first, automatic-on-cursor as a later toggle.
 

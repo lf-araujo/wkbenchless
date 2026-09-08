@@ -243,6 +243,12 @@ proc handle(app: var App; req: string): string =
     if key.len == 0: return "(usage: cite-context <key>)"
     result = formatContext(key, citeProse(app.filePath, key), citeNotes(key),
                            citePaper(key), getHomeDir())
+  of "zotero-search":                      # search the whole library, not the .bib
+    let q = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
+    if q.len == 0: return "(usage: zotero-search <query>)"
+    var hits = zoteroSearch(q)
+    markInProse(hits, app.filePath)
+    result = formatSearch(q, hits)
   of "open":                               # open a file into a buffer
     let p = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
     if p.len == 0: return "(usage: open <path>)"

@@ -62,6 +62,9 @@ proc buildRequest(args: seq[string]; req: var string): string =
   of "cite-paper":
     if args.len < 2: return "ctl cite-paper <key>"
     req = "cite-paper\t" & args[1]
+  of "zotero-search":
+    if args.len < 2: return "ctl zotero-search <query>"
+    req = "zotero-search\t" & args[1 .. ^1].join(" ")
   of "cite-context":
     if args.len < 2: return "ctl cite-context <key>"
     req = "cite-context\t" & args[1]

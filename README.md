@@ -143,7 +143,33 @@ wkbctl run-block 16                    # run the src block at line 16 (writes #+
 wkbctl diff old.txt new.txt "changes"  # show a side-by-side diff
 wkbctl command <name>                  # run any M-x command (echoes its status line)
 wkbctl bib maes 2022                   # search BibTeX -> "key — Author (year). Title"
+wkbctl cite-context <key>              # dossier for a citation: your notes + prose + paper
+wkbctl zotero-search <query>           # search the whole Zotero library (see below)
 ```
+
+### Reference context (a citation's memory)
+
+Land on a `[cite:@key]` and see everything *you* have ever associated with that
+reference — the notes you wrote, the manuscript paragraphs you wrote citing it,
+and (via [Mktero](https://github.com/)) the paper's own reflowed Markdown. In
+the editor, **`M-x cite-context` (`C-c ?`)** on the citation at point fills a
+`*cite-context*` buffer with all three sections. The same is scriptable:
+
+```sh
+wkbctl cite-context <key>   # notes (Zotero) + your prose paragraphs + paper full text
+wkbctl cite-prose <key>     # just your manuscript paragraphs citing @key (file:line each)
+wkbctl cite-notes <key>     # just your Zotero notes on the item
+wkbctl cite-paper <key>     # just the paper's own Markdown (Mktero source), path + preview
+wkbctl cite-reindex         # rebuild the manuscript prose index
+wkbctl zotero-search <q>    # @key — Author (year). Title  [✎notes ▤paper ✍cited]
+```
+
+Notes and the citekey→item link come from Zotero's own SQLite (`~/Zotero`, read
+`immutable` — no copy, no lock, safe while Zotero runs). Your manuscripts are
+indexed from `gCorpusRoots` (config), `$WKB_CORPUS`, or the open file's
+directory — `.org`/`.Rmd`, split into paragraphs with CriticMarkup resolved and
+near-duplicate drafts collapsed. `zotero-search` finds a paper you've *read* but
+not yet cited; `✍cited` marks the ones already in your prose.
 
 `bib` searches the buffer's own `#+bibliography:` paths plus an optional master
 set via `$WKB_BIB`, matching all query terms against key/author/title/year — so

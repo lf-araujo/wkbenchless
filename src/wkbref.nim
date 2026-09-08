@@ -418,6 +418,71 @@ proc citePaper*(key: string): seq[tuple[path, preview: string]] =
     except CatchableError: discard
     result.add (path, shorten(preview.strip, 800))
 
+# ---- Zotero: general library search ----------------------------------------
+
+type
+  SearchHit* = object
+    citekey*, author*, year*, title*: string
+    hasNotes*, hasPaper*: bool     ## your notes / an attached Markdown full text
+    inProse*: bool                 ## you have cited it in your manuscript corpus
+
+proc sqlLit(s: string): string =
+  ## A single-quoted SQL string literal with quotes doubled (the only escape
+  ## SQLite needs); other bytes are data, not syntax.
+  "'" & s.replace("'", "''") & "'"
+
+proc zoteroSearch*(query: string; limit = 40): seq[SearchHit] =
+  ## Search the whole Zotero library (citekey / authors / title / note text) for
+  ## items matching ALL whitespace-separated terms. Broader than `bib` (which
+  ## only reads the .bib files): finds a paper you have read but not yet cited.
+  let terms = query.toLowerAscii.splitWhitespace
+  if terms.len == 0: return
+  let sqlite = findExe("sqlite3")
+  if sqlite.len == 0: return
+  let (zt, bbt) = zoteroDbs()
+  if zt.len == 0 or bbt.len == 0: return
+  const fs = "@@WKB_FLD@@"
+  const rs = "@@WKB_ROW@@"
+  # A per-item searchable blob (citekey + authors + title + note text), matched
+  # against each term with AND. Flags come from EXISTS subqueries.
+  let sql = "ATTACH 'file:" & bbt & "?immutable=1' AS bbt;" & """
+WITH meta AS (
+  SELECT b.citekey AS ck, i.itemID AS iid,
+    (SELECT c.lastName FROM itemCreators ic JOIN creators c ON c.creatorID=ic.creatorID
+       WHERE ic.itemID=i.itemID ORDER BY ic.orderIndex LIMIT 1) AS author1,
+    (SELECT substr(idv.value,1,4) FROM itemData d JOIN itemDataValues idv ON idv.valueID=d.valueID
+       JOIN fields f ON f.fieldID=d.fieldID WHERE d.itemID=i.itemID AND f.fieldName='date') AS yr,
+    (SELECT idv.value FROM itemData d JOIN itemDataValues idv ON idv.valueID=d.valueID
+       JOIN fields f ON f.fieldID=d.fieldID WHERE d.itemID=i.itemID AND f.fieldName='title') AS title,
+    (SELECT group_concat(c.lastName,' ') FROM itemCreators ic JOIN creators c ON c.creatorID=ic.creatorID
+       WHERE ic.itemID=i.itemID) AS authors,
+    (SELECT group_concat(n.note,' ') FROM itemNotes n WHERE n.parentItemID=i.itemID) AS notetext
+  FROM bbt.citekeys b JOIN items i ON i.itemID=b.itemID)
+SELECT ck || '""" & fs & """' || coalesce(author1,'') || '""" & fs & """' ||
+       coalesce(yr,'') || '""" & fs & """' || coalesce(title,'') || '""" & fs & """' ||
+       (SELECT CASE WHEN EXISTS(SELECT 1 FROM itemNotes n WHERE n.parentItemID=meta.iid
+          AND n.note NOT LIKE '%zotero://mktero%') THEN '1' ELSE '0' END) || '""" & fs & """' ||
+       (SELECT CASE WHEN EXISTS(SELECT 1 FROM itemAttachments a WHERE a.parentItemID=meta.iid
+          AND a.contentType='text/markdown') THEN '1' ELSE '0' END) || '""" & rs & """'
+FROM meta
+WHERE ck IS NOT NULL AND (lower(coalesce(ck,'')||' '||coalesce(authors,'')||' '||
+      coalesce(title,'')||' '||coalesce(notetext,'')) LIKE '%%'""" &
+  (block:
+    var w = ""
+    for t in terms: w.add " AND lower(coalesce(ck,'')||' '||coalesce(authors,'')||' '||coalesce(title,'')||' '||coalesce(notetext,'')) LIKE " & sqlLit("%" & t & "%")
+    w) & ") LIMIT " & $limit & ";"
+  let (outp, code) = execCmdEx(quoteShell(sqlite) & " " &
+    quoteShell("file:" & zt & "?immutable=1") & " " & quoteShell(sql))
+  if code != 0: return
+  for row in outp.split(rs):
+    let p = row.split(fs)
+    if p.len != 6: continue
+    let ck = p[0].strip
+    if ck.len == 0: continue
+    result.add SearchHit(citekey: ck, author: p[1].strip, year: p[2].strip,
+      title: p[3].strip.replace("\n", " "),
+      hasNotes: p[4].strip == "1", hasPaper: p[5].strip == "1")
+
 # ---- formatting ------------------------------------------------------------
 
 proc formatProse*(key: string; occs: seq[Occurrence]; homeDir = ""): string =
@@ -447,6 +512,28 @@ proc formatPaper*(key: string; papers: seq[tuple[path, preview: string]];
     var f = p.path
     if homeDir.len > 0 and f.startsWith(homeDir): f = "~" & f[homeDir.len .. ^1]
     result.add "\n" & f & "\n  " & p.preview.replace("\n", "\n  ") & "\n"
+
+proc markInProse*(hits: var seq[SearchHit]; currentFile: string) =
+  ## Set `inProse` on each hit you have cited somewhere in your corpus (uses the
+  ## lazy prose index).
+  for h in hits.mitems:
+    h.inProse = citeProse(currentFile, h.citekey).len > 0
+
+proc formatSearch*(query: string; hits: seq[SearchHit]): string =
+  ## `citekey — Author (year). Title  [flags]` per hit. Flags: ✎ notes,
+  ## ▤ paper full text, ✍ cited in your prose.
+  if hits.len == 0: return "(no Zotero items match: " & query & ")"
+  result = $hits.len & " match" & (if hits.len == 1: "" else: "es") &
+           " for “" & query & "”:\n"
+  for h in hits:
+    var flags = ""
+    if h.hasNotes: flags.add " ✎notes"
+    if h.hasPaper: flags.add " ▤paper"
+    if h.inProse: flags.add " ✍cited"
+    let yr = if h.year.len > 0: " (" & h.year & ")" else: ""
+    let au = if h.author.len > 0: h.author else: "—"
+    result.add "\n@" & h.citekey & " — " & au & yr & ". " &
+               shorten(h.title, 100) & (if flags.len > 0: "   " & flags else: "")
 
 proc formatContext*(key: string; occs: seq[Occurrence]; notes: seq[string];
                     papers: seq[tuple[path, preview: string]] = @[];
