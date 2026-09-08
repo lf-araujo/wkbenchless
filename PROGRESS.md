@@ -215,8 +215,8 @@ Three sources, keyed on one `@key`:
 
 Verbs to add (control socket + `wkbctl`/`wkbenchless ctl`):
 
-- [~] `cite-context <key>` — all available sections for a key (the dossier).
-      **Notes + prose done** (unioned in `formatContext`); paper (Mktero) joins next.
+- [x] `cite-context <key>` — the full dossier: **notes + prose + paper**, unioned
+      in `formatContext` (three labelled sections). Also `M-x cite-context` (C-c ?).
 - [x] `cite-notes <key>` — Zotero notes only (SQLite join). **Done**
       (`src/wkbref.nim`): joins Better BibTeX `citekeys` → Zotero `itemNotes`,
       both opened `immutable=1` (no copy, no lock, Zotero-running-safe); note
@@ -228,8 +228,16 @@ Verbs to add (control socket + `wkbctl`/`wkbenchless ctl`):
       accepted to clean prose, near-duplicate drafts collapsed. Verified on the
       real corpus (26 deduped paragraphs for a real key, 0 residual markup,
       ~170 ms). Plus `cite-reindex` and editor `M-x cite-context` (C-c ?).
-- [ ] `cite-paper <key>` — path/preview of the attached Mktero `source.md`
-      full text (optional; only when present).
+- [x] `cite-paper <key>` — the paper's own Markdown full text. **Done**
+      (`src/wkbref.nim`): joins citekey → parent → `text/markdown` attachments →
+      `~/Zotero/storage/<attachKey>/<file>`, returns resolved path + preview.
+      Matches on `contentType` (Mktero stores `storage:mktero-source`, no `.md`
+      suffix). Verified live against a real `.md` attachment. **Mktero snapshot
+      notes are filtered out of `cite-notes`** (marker `zotero://mktero` /
+      `mktero-saved-markdown`) so they land here, not in "Notes" — confirmed
+      against the one real Mktero note in the library.
+      *Note:* the current Mktero item has a malformed BBT citekey
+      (`…undefined/ed`), so it's reachable only once that key is fixed in Zotero.
 - [ ] `zotero-search <query>` — general library search over Zotero's SQLite
       (titles / authors / notes, and Mktero `source.md` full text when
       indexed), returning `citekey — Author (year). Title` + flags for what

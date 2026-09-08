@@ -302,6 +302,9 @@ proc reindexProse*(currentFile: string): int =
   gIdx = buildProseIndex(roots); gIdxSig = rootsSignature(roots)
   gIdx.len
 
+proc shorten(s: string; n: int): string =
+  if s.len <= n: s else: s[0 ..< n-1] & "…"
+
 # ---- Zotero: notes on the cited item (offline SQLite read) ------------------
 # Read a citekey's Zotero notes by joining Better BibTeX's citekey table to
 # Zotero's itemNotes. The two SQLite files are opened `immutable=1` -- no copy,
@@ -369,13 +372,53 @@ proc citeNotes*(key: string): seq[string] =
     quoteShell("file:" & zt & "?immutable=1") & " " & quoteShell(sql))
   if code != 0: return
   for chunk in outp.split(sep):
+    # Mktero saves a PDF snapshot AS a Zotero note (marked with a
+    # `zotero://mktero/…` manifest link); that is the paper's text, not your
+    # thinking, so it belongs to `citePaper`, not the "Notes" section.
+    if "zotero://mktero" in chunk or "mktero-saved-markdown" in chunk: continue
     let t = htmlToText(chunk)
     if t.len > 0: result.add t
 
-# ---- formatting ------------------------------------------------------------
+# ---- Mktero / Markdown attachment: the paper's own reflowed full text -------
 
-proc shorten(s: string; n: int): string =
-  if s.len <= n: s else: s[0 ..< n-1] & "…"
+proc citePaper*(key: string): seq[tuple[path, preview: string]] =
+  ## Markdown full-text attachments on the item (Mktero `source.md`, or any
+  ## text/markdown attachment): resolved on-disk path + a short preview. Empty
+  ## when the item has no such attachment.
+  if not safeKey(key): return
+  let sqlite = findExe("sqlite3")
+  if sqlite.len == 0: return
+  let (zt, bbt) = zoteroDbs()
+  if zt.len == 0 or bbt.len == 0: return
+  const rs = "@@WKB_ROW@@"
+  const fs = "@@WKB_FLD@@"
+  # match on contentType, NOT a `.md` suffix -- Mktero stores `storage:mktero-source`
+  # (no extension) with contentType text/markdown.
+  let sql = "ATTACH 'file:" & bbt & "?immutable=1' AS bbt;" &
+    "SELECT DISTINCT i.key || '" & fs & "' || ia.path || '" & rs & "' " &
+    "FROM bbt.citekeys b " &
+    "JOIN itemAttachments ia ON ia.parentItemID = b.itemID " &
+    "JOIN items i ON i.itemID = ia.itemID " &
+    "WHERE ia.contentType = 'text/markdown' AND b.citekey = '" & key & "';"
+  let (outp, code) = execCmdEx(quoteShell(sqlite) & " " &
+    quoteShell("file:" & zt & "?immutable=1") & " " & quoteShell(sql))
+  if code != 0: return
+  let storageDir = zoteroDir() / "storage"
+  for row in outp.split(rs):
+    let parts = row.split(fs)
+    if parts.len != 2: continue
+    let attachKey = parts[0].strip
+    var rel = parts[1].strip
+    if attachKey.len == 0 or rel.len == 0: continue
+    if rel.startsWith("storage:"): rel = rel["storage:".len .. ^1]
+    let path = storageDir / attachKey / rel
+    if not fileExists(path): continue
+    var preview = ""
+    try: preview = readFile(path)
+    except CatchableError: discard
+    result.add (path, shorten(preview.strip, 800))
+
+# ---- formatting ------------------------------------------------------------
 
 proc formatProse*(key: string; occs: seq[Occurrence]; homeDir = ""): string =
   ## Human/agent-readable rendering of prose occurrences for a key.
@@ -395,13 +438,27 @@ proc formatNotes*(key: string; notes: seq[string]): string =
   for n in notes:
     result.add "\n  " & n.replace("\n", "\n  ") & "\n"
 
+proc formatPaper*(key: string; papers: seq[tuple[path, preview: string]];
+                  homeDir = ""): string =
+  ## Rendering of the paper's own Markdown full text (Mktero) for a key.
+  if papers.len == 0: return "(no Markdown full text attached to @" & key & ")"
+  result = "@" & key & " — paper full text:\n"
+  for p in papers:
+    var f = p.path
+    if homeDir.len > 0 and f.startsWith(homeDir): f = "~" & f[homeDir.len .. ^1]
+    result.add "\n" & f & "\n  " & p.preview.replace("\n", "\n  ") & "\n"
+
 proc formatContext*(key: string; occs: seq[Occurrence]; notes: seq[string];
+                    papers: seq[tuple[path, preview: string]] = @[];
                     homeDir = ""): string =
-  ## The dossier: your notes, then your prose. (Paper text joins later.)
+  ## The dossier: your notes, your prose, then the paper's own text.
   result = "═══ @" & key & " ═══\n\n"
   result.add "── Notes (Zotero) ──\n"
   result.add (if notes.len == 0: "(none)\n"
               else: formatNotes(key, notes).split('\n', 1)[1] & "\n")
   result.add "\n── You've written about this ──\n"
   result.add (if occs.len == 0: "(none in your corpus)\n"
-              else: formatProse(key, occs, homeDir).split('\n', 1)[1])
+              else: formatProse(key, occs, homeDir).split('\n', 1)[1] & "\n")
+  result.add "\n── From the paper (Mktero) ──\n"
+  result.add (if papers.len == 0: "(none)\n"
+              else: formatPaper(key, papers, homeDir).split('\n', 1)[1])
