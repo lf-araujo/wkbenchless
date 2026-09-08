@@ -114,6 +114,10 @@ proc configure*(app: var App) =
   # override, e.g.  gTerminalDir = "~/projects/analysis"
   gTerminalDir = ""
 
+  # Buffer tabs: show a tab per open buffer in the top toolbar (click to switch,
+  # [x] to close). Off by default -- set true to enable.
+  # gBufferTabs = true
+
   # PATH for sessions & terminals. Launched from a GUI, wkbenchless may inherit a
   # stripped PATH, so at startup it seeds PATH from your login shell ($SHELL -lc)
   # -- that alone usually locates R, python, etc. Add extra dirs here (prepended,

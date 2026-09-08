@@ -633,12 +633,21 @@ proc main() =
                     ("Clean DONE", "criticmarkup-clean-done"),
                     ("Increase font", "zoom-in"), ("Decrease font", "zoom-out")]
     var toolbarRects: seq[tuple[r: Rect; cmd, label: string]]
+    var bufferTabRects: seq[tuple[r: Rect; idx: int; xr: Rect]]  # tab body + its [x]
     block:
       var x = 6
       for (label, cmd) in tbBtns:
         let w = measureText(app.font, label).w + 16
         toolbarRects.add (rect(x, 4, w, toolbarH - 8), cmd, label)
         x += w + 4
+      # buffer tabs (optional): one per open buffer -- click to switch, [x] to close
+      if gBufferTabs:
+        for i, b in app.buffers:
+          let lw = measureText(app.font, " " & bufName(b) & " ").w + 4
+          let xw = toolbarH - 8
+          bufferTabRects.add (rect(x, 4, lw + xw, toolbarH - 8), i,
+                              rect(x + lw, 4, xw, toolbarH - 8))
+          x += lw + xw + 4
       const mw = 30      # the [☰] button (drawn as three bars, not a glyph)
       toolbarRects.add (rect(screen.width - mw - 6, 4, mw, toolbarH - 8), "__menu__", "")
     var menuRects: seq[tuple[r: Rect; cmd, label: string]]
@@ -662,14 +671,23 @@ proc main() =
             break
         toolbarMenuOpen = false
       elif e.y < toolbarH:
+        var hit = false
         for it in toolbarRects:
           if e.x >= it.r.x and e.x < it.r.x + it.r.w:
-            chromeHit = true
+            hit = true
             if it.cmd == "__menu__":
               toolbarMenuOpen = true; toolbarMenuX = it.r.x + it.r.w
             elif gCommands.hasKey(it.cmd): gCommands[it.cmd].run(app)
             else: app.msg = it.cmd & " unavailable"
             break
+        if not hit:
+          for bt in bufferTabRects:
+            if e.x >= bt.r.x and e.x < bt.r.x + bt.r.w:
+              hit = true
+              if e.x >= bt.xr.x: killBufferAt(app, bt.idx)   # the tab's [x]
+              else: switchToBuffer(app, bt.idx)
+              break
+        chromeHit = hit
       if chromeHit: consumed = true
 
     # --- Draggable panel dividers -------------------------------------------
@@ -712,18 +730,23 @@ proc main() =
           let r = cells[nm]
           if e.x >= r.x and e.x < r.x + r.w and e.y >= r.y and e.y < r.y + r.h:
             app.focus = nm
-      # click on the session tab bar: [x] to hide, or a chip to select
+      # click on the session tab bar: [_] to minimize, a chip to select, or the
+      # chip's [x] to close that one tab.
       if cells.hasKey("session"):
         let r = cells["session"]
         if e.y >= r.y and e.y < r.y + lineH:
-          if e.x >= r.x + r.w - lineH:          # [x] hide the panel
+          if e.x >= r.x + r.w - lineH:          # [_] minimize the panel
             app.sessionHidden = true; app.focus = "editor"
           else:
             var cx = r.x + 4
             for k in app.tabKeys():
-              let w = tabWidth(app, k, lineH)
-              if e.x >= cx and e.x < cx + w: selectTab(app, k); break
-              cx += w + 4
+              let lw = tabWidth(app, k, lineH)
+              let xw = lineH
+              if e.x >= cx and e.x < cx + lw + xw:
+                if e.x >= cx + lw: closeTab(app, k)   # the chip's [x]
+                else: selectTab(app, k)
+                break
+              cx += lw + xw + 4
     # Chrome colors from the active theme (re-read each frame so a palette
     # theme-switch takes effect immediately).
     let bg = app.theme.windowBg
@@ -824,7 +847,8 @@ proc main() =
       let r = cells["session"]
       fillRect(r, sessBg)
       let bh = lineH                       # top row = session tab bar
-      # tab bar: one chip per tab (sessions + the terminal), then an [x] to hide.
+      # tab bar: one chip per tab (sessions + the terminal), each with its own
+      # [x] to close it, then a [_] to minimize the whole panel.
       fillRect(rect(r.x, r.y, r.w, bh), app.theme.tabBarBg)
       var cx = r.x + 4
       let curKey = app.currentTabKey()
@@ -833,13 +857,19 @@ proc main() =
         let chipBg = if active: app.theme.chipActiveBg else: app.theme.chipBg
         let chipFg = if active: app.theme.chipActiveFg else: app.theme.chipFg
         let label = " " & tabLabel(app, k) & " "
-        let w = tabWidth(app, k, lineH)
-        fillRect(rect(cx, r.y, w, bh), chipBg)
+        let lw = tabWidth(app, k, lineH)
+        let xw = bh
+        fillRect(rect(cx, r.y, lw + xw, bh), chipBg)
         discard drawText(app.font, cx + 2, r.y, label, chipFg, chipBg)
-        cx += w + 4
-      let xr = rect(r.x + r.w - bh, r.y, bh, bh)   # [x] hide button
-      fillRect(xr, app.theme.closeBg)
-      discard drawText(app.font, xr.x + bh div 3, r.y, "x", app.theme.closeFg, app.theme.closeBg)
+        let xr = rect(cx + lw, r.y, xw, bh)   # per-tab [X] close button
+        fillRect(xr, app.theme.closeBg)
+        discard drawText(boldFont, xr.x + xw div 3, r.y, "X",
+                         color(255, 255, 255), app.theme.closeBg)
+        cx += lw + xw + 4
+      let mr = rect(r.x + r.w - bh, r.y, bh, bh)   # [_] minimize button
+      fillRect(mr, app.theme.minBg)
+      discard drawText(boldFont, mr.x + bh div 3, r.y, "_",
+                       color(0, 0, 0), app.theme.minBg)
       let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
       let rows = max(1, body.h div lineH)
       let charW = max(1, measureText(app.font, "0").w)
@@ -1013,6 +1043,18 @@ proc main() =
           let tw = measureText(app.font, it.label).w
           discard drawText(app.font, it.r.x + (it.r.w - tw) div 2, it.r.y,
                            it.label, cfg, cbg)
+      for bt in bufferTabRects:
+        let active = bt.idx == app.curBuf
+        let hover = lastMouse.y < toolbarH and
+                    lastMouse.x >= bt.r.x and lastMouse.x < bt.r.x + bt.r.w
+        let cbg = if active or hover: app.theme.chipActiveBg else: app.theme.chipBg
+        let cfg = if active or hover: app.theme.chipActiveFg else: app.theme.chipFg
+        fillRect(bt.r, cbg)
+        let nm = (if app.buffers[bt.idx].ed.changed: "*" else: "") & bufName(app.buffers[bt.idx])
+        discard drawText(app.font, bt.r.x + 2, bt.r.y, " " & nm & " ", cfg, cbg)
+        fillRect(bt.xr, app.theme.closeBg)
+        discard drawText(boldFont, bt.xr.x + bt.xr.w div 3, bt.r.y, "X",
+                         color(255, 255, 255), app.theme.closeBg)
       if toolbarMenuOpen and menuRects.len > 0:
         let m0 = menuRects[0].r
         let bh = (menuRects[^1].r.y + menuRects[^1].r.h) - m0.y

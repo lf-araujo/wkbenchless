@@ -109,7 +109,8 @@ type
     chipBg*, chipFg*, chipActiveBg*, chipActiveFg*: Color
     termFg*, dimFg*, dividerColor*: Color
     boxBg*, boxSelBg*, boxFg*: Color        ## palette / completion popups
-    closeBg*, closeFg*: Color               ## the [x] hide button
+    closeBg*, closeFg*: Color               ## the per-tab [X] close button
+    minBg*: Color                           ## the [_] minimize button
 
 var
   gCommands*: OrderedTable[string, Command]
@@ -130,6 +131,8 @@ var
   gSshPersist* = "600"                    ## seconds an ssh master connection persists
   gInlineImageWidth* = 0                   ## default inline image width in px
                                            ## (org #+ATTR_* :width overrides it);
+  gBufferTabs* = false                     ## show a tab per open buffer in the top
+                                           ## toolbar (click to switch, [x] to close)
                                            ## 0 = use each image's native size
   gLatexDpi* = 140                         ## dvipng resolution for M-x latex-preview
                                            ## math images (higher = larger/crisper)
@@ -242,6 +245,7 @@ proc base16Theme*(name: string; b: Base16): AppTheme =
   result.dividerColor = b[0x2]
   result.boxBg = b[0x1]; result.boxSelBg = b[0x2]; result.boxFg = b[0x5]
   result.closeBg = b[0x8]; result.closeFg = b[0x0]
+  result.minBg = b[0xA]
 
 proc registerTheme*(name: string; palette: Base16) =
   ## Register a base16 theme (the config surface). First registered = default.
@@ -1379,25 +1383,35 @@ proc diffBuffer*(app: var App) =
   showDiff(app, readFile(app.filePath), app.ed.fullText(),
            extractFilename(app.filePath) & " (disk -> buffer)")
 
-proc killBuffer*(app: var App) =
+proc killBufferAt*(app: var App; idx: int) =
+  ## Kill the buffer at `idx` (0-based), guarding unsaved work like killBuffer.
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
+  if idx < 0 or idx >= app.buffers.len: return
   if app.buffers.len <= 1: app.msg = "can't kill the last buffer"; return
   app.syncActive()
-  if app.ed.changed and not app.pendingKill:   # guard unsaved work
+  if app.buffers[idx].ed.changed and not app.pendingKill:   # guard unsaved work
     app.pendingKill = true
     app.msg = "unsaved -- kill-buffer again to discard, or C-s to save"
     return
   app.pendingKill = false
-  let killed = bufName(app.buffers[app.curBuf])
-  app.buffers.delete(app.curBuf)
-  app.activate(max(0, app.curBuf - 1))
+  let killed = bufName(app.buffers[idx])
+  app.buffers.delete(idx)
+  if idx == app.curBuf: app.activate(max(0, idx - 1))
+  elif idx < app.curBuf: dec app.curBuf
   app.msg = "killed " & killed
+
+proc killBuffer*(app: var App) = killBufferAt(app, app.curBuf)
 
 proc toggleSrcEdit*(app: var App) =
   ## Show/hide the objects+help right column (the "src-edit environment").
   app.srcEdit = not app.srcEdit
   if app.srcEdit: refreshObjects(app)
   app.msg = "src-edit: " & (if app.srcEdit: "on" else: "off")
+
+proc toggleBufferTabs*(app: var App) =
+  ## Show/hide a tab per open buffer in the top toolbar.
+  gBufferTabs = not gBufferTabs
+  app.msg = "buffer tabs: " & (if gBufferTabs: "on" else: "off")
 
 # -- src-edit: org-edit-special + session tangle ---------------------------
 proc commonIndent(lines: seq[string]): int =
@@ -1622,6 +1636,33 @@ proc selectTab*(app: var App; key: string) =
   app.msg = "session: " & key
 
 proc setSession*(app: var App; key: string) = selectTab(app, key)
+
+proc closeTab*(app: var App; key: string) =
+  ## Close a bottom-pane tab: kill a terminal, or shut down a REPL session. If
+  ## the closed tab was current, fall back to the first remaining tab (or clear
+  ## the pane when none are left).
+  let wasCurrent = key == app.currentTabKey()
+  if key.startsWith("·term:"):
+    let idx = (try: parseInt(key["·term:".len .. ^1]) except: -1)
+    if idx >= 0 and idx < app.terminals.len:
+      closePty(app.terminals[idx].pty)
+      app.terminals.delete(idx)
+      if app.termActive == idx: app.termActive = -1
+      elif app.termActive > idx: dec app.termActive
+      app.msg = "closed terminal"
+  elif app.sessions.hasKey(key):
+    closeSession(app.sessions[key])
+    app.sessions.del(key)
+    app.msg = "closed session: " & key
+  else:
+    return
+  if wasCurrent:
+    let keys = app.tabKeys()
+    if keys.len > 0: selectTab(app, keys[0])
+    else:
+      app.termActive = -1
+      app.curLang = ""; app.curSession = ""
+      app.focus = "editor"
 
 proc switchSession*(app: var App) =
   ## Cycle to the next bottom-pane tab (sessions and the terminals alike).
@@ -2228,6 +2269,7 @@ proc registerBuiltins*() =
   defcommand("ghost-accept", "Copilot: accept the ghost-text completion", ghostAccept)
   defcommand("ghost-dismiss", "Copilot: dismiss the ghost-text completion", ghostDismiss)
   defcommand("toggle-src-edit", "Toggle objects/help (src-edit)", toggleSrcEdit)
+  defcommand("toggle-buffer-tabs", "Show/hide buffer tabs in the toolbar", toggleBufferTabs)
   defcommand("src-edit-block", "Src-edit: this block (org-edit-special)", srcEditBlock)
   defcommand("src-edit-session", "Src-edit: tangle this session's blocks", srcEditSession)
   defcommand("focus-next", "Focus next pane", focusNext)
