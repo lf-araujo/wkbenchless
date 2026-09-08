@@ -322,6 +322,76 @@ proc embedOrgSource*(docx, orgContent: string): bool =
   except CatchableError:
     result = false
 
+proc propagateSectionChrome*(docx: string): bool =
+  ## pandoc's --reference-doc attaches the header/footer references (running
+  ## heads, the PAGE-field page numbers) only to the document's final <w:sectPr>,
+  ## the one it derives from the reference doc. Any *inline* <w:sectPr> the source
+  ## injected as raw OOXML (e.g. a landscape break around a figure, or a portrait
+  ## reset) is self-contained, so it silently drops those references and page
+  ## numbering vanishes from every section but the last. Copy the final section's
+  ## <w:headerReference>/<w:footerReference> tags into each earlier sectPr that
+  ## lacks them, reusing the relationships pandoc already created (they are
+  ## document-scoped, so sharing one footer part across sections is valid).
+  ## Returns true if the document was changed.
+  let docxAbs = absolutePath(docx)
+  if not fileExists(docxAbs): return false
+  try:
+    var entries: OrderedTable[string, string]
+    block:
+      let reader = openZipArchive(docxAbs)
+      defer: reader.close()
+      for path in reader.walkFiles: entries[path] = reader.extractFile(path)
+    if "word/document.xml" notin entries: return false
+    var doc = entries["word/document.xml"]
+
+    var sects: seq[Slice[int]]
+    var i = 0
+    while true:
+      let a = doc.find("<w:sectPr", i)
+      if a < 0: break
+      let b = doc.find("</w:sectPr>", a)
+      if b < 0: break
+      sects.add a .. (b + "</w:sectPr>".len - 1)
+      i = b + 1
+    if sects.len < 2: return false        # only the body section: nothing to fix
+
+    proc refTags(sect: string): string =
+      ## the self-closing <w:headerReference/>/<w:footerReference/> tags, headers
+      ## first (schema order within EG_HdrFtrReferences).
+      for tag in ["w:headerReference", "w:footerReference"]:
+        var j = 0
+        while true:
+          let p = sect.find("<" & tag, j)
+          if p < 0: break
+          let e = sect.find("/>", p)
+          if e < 0: break
+          result.add sect[p .. e + 1]
+          j = e + 2
+
+    let chrome = refTags(doc[sects[^1]])
+    if chrome.len == 0: return false      # reference doc carried no header/footer
+
+    var changed = false
+    for k in countdown(sects.len - 2, 0):  # last-first: keep earlier offsets valid
+      let s = doc[sects[k]]
+      if "w:headerReference" in s or "w:footerReference" in s: continue
+      let openEnd = doc.find(">", sects[k].a)   # end of the "<w:sectPr ...>" tag
+      if openEnd < 0 or openEnd >= sects[k].b: continue
+      doc = doc[0 .. openEnd] & chrome & doc[openEnd + 1 .. ^1]
+      changed = true
+    if not changed: return false
+
+    entries["word/document.xml"] = doc
+    # [Content_Types].xml must stay the first archive entry (see embedOrgSource).
+    if "[Content_Types].xml" in entries:
+      let ct = entries["[Content_Types].xml"]
+      entries.del("[Content_Types].xml")
+      entries["[Content_Types].xml"] = ct
+    writeFile(docxAbs, createZipArchive(entries))
+    result = true
+  except CatchableError:
+    result = false
+
 proc extractOrgSource*(docx: string): string =
   ## Recover the embedded canonical org from DOCX, or "" if absent. Identifies
   ## the part by its <orgTrackedSource> element (LibreOffice renames the item on
@@ -581,6 +651,16 @@ proc findBib(app: App): string =
     for f in walkFiles(parentDir(app.filePath) / "*.bib"): return f
   ""
 
+proc pandocOpts(app: App): seq[(string, string)] =
+  ## Parse `#+PANDOC_OPTIONS: key:value` headers (ox-pandoc style). The value
+  ## may itself contain ':' (e.g. an absolute path or a metadata pair), so split
+  ## on the first ':' only. Keys used below: reference-doc, csl, filter, metadata
+  ## (citeproc is always on; #+bibliography: is handled via findBib).
+  for v in orgHeaders(app, "PANDOC_OPTIONS"):
+    let c = v.find(':')
+    if c < 0: continue
+    result.add (strutils.strip(v[0 ..< c]).toLowerAscii, strutils.strip(v[c+1 .. ^1]))
+
 proc unescapeRefs(md: string): string =
   ## pandoc's org reader escapes cross-ref keys `@fig:x` as `\@fig:x`; unescape
   ## so pandoc-crossref (and citeproc for `[@cite]`) can see them.
@@ -702,15 +782,36 @@ proc otdExport(app: var App) =
   if gMediaDir.len > 0:                        # e.g. gMediaDir = "graphs"
     rpaths.add (if isAbsolute(gMediaDir): gMediaDir else: srcDir / gMediaDir)
   dargs.add "--resource-path=" & rpaths.join($PathSep)   # PathSep: ':' / ';'
-  if findExe("pandoc-crossref").len > 0: (dargs.add "--filter"; dargs.add "pandoc-crossref")
+  # Buffer #+PANDOC_OPTIONS: (ox-pandoc style) supplement the config globals;
+  # a set global (gCsl / gRefDoc) still wins, mirroring findBib's gBib-first rule.
+  let popts = pandocOpts(app)
+  proc optVal(k: string): string =
+    for (kk, vv) in popts:
+      if kk == k: return vv
+    ""
+  let haveCrossref = findExe("pandoc-crossref").len > 0
+  if haveCrossref: (dargs.add "--filter"; dargs.add "pandoc-crossref")
   dargs.add "--citeproc"
+  # Extra filters and metadata declared in #+PANDOC_OPTIONS (pandoc-crossref is
+  # already handled above, so skip it to avoid running the filter twice).
+  for (kk, vv) in popts:
+    if kk == "filter" and vv.len > 0 and not (vv == "pandoc-crossref" and haveCrossref):
+      if findExe(vv).len > 0: (dargs.add "--filter"; dargs.add vv)
+    elif kk == "metadata" and vv.len > 0:
+      (dargs.add "--metadata"; dargs.add vv)
   let bib = findBib(app)
   if bib.len > 0 and fileExists(bib): dargs.add "--bibliography=" & bib
-  if gCsl.len > 0: dargs.add "--csl=" & resolveRel(app, gCsl)
-  if gRefDoc.len > 0: dargs.add "--reference-doc=" & resolveRel(app, gRefDoc)
+  let csl = if gCsl.len > 0: gCsl else: optVal("csl")
+  if csl.len > 0: dargs.add "--csl=" & resolveRel(app, csl)
+  let refdoc = if gRefDoc.len > 0: gRefDoc else: optVal("reference-doc")
+  if refdoc.len > 0: dargs.add "--reference-doc=" & resolveRel(app, refdoc)
   dargs.add md; dargs.add "-o"; dargs.add docx
   (code, outp) = pandoc(dargs)
   if code != 0: (app.msg = "pandoc md->docx failed: " & outp.strip(); return)
+  # Give inline section breaks (raw-OOXML <w:sectPr> for a landscape figure etc.)
+  # the reference doc's running head / page numbers, which pandoc otherwise leaves
+  # only on the final section.
+  if refdoc.len > 0: discard propagateSectionChrome(docx)
   # Embed the canonical org so re-import can recover cite keys / cross-refs / headers.
   let embedded = gEmbedSource and embedOrgSource(docx, app.ed.fullText())
   if doneIds.len > 0: discard resolveDoneComments(docx, doneIds)
