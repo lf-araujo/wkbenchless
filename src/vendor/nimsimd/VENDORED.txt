@@ -1,0 +1,1 @@
+nimsimd 1.3.2 (vendored from treeform/guzba)

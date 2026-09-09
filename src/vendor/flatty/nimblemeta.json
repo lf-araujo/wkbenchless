@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "metaData": {
+    "url": "https://github.com/treeform/flatty",
+    "downloadMethod": "git",
+    "vcsRevision": "c7091b096bcf275f47b666ef74bce73eda187ee3",
+    "files": [
+      "/flatty/memoryused.nim",
+      "/flatty.nim",
+      "/flatty/binlisting.nim",
+      "/flatty/encode.nim",
+      "/flatty/hashy2.nim",
+      "/flatty/jsbinny.nim",
+      "/flatty/binny.nim",
+      "/flatty/hashy.nim",
+      "/flatty.nimble",
+      "/flatty/objvar.nim",
+      "/flatty/hexprint.nim"
+    ],
+    "binaries": [],
+    "specialVersions": [
+      "0.4.0"
+    ]
+  }
+}

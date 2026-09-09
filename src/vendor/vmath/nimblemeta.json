@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "metaData": {
+    "url": "https://github.com/treeform/vmath",
+    "downloadMethod": "git",
+    "vcsRevision": "7bd9f6e6b23ca3b751be42f20c8025d320881a00",
+    "files": [
+      "/vmath/macroswizzle.nim",
+      "/vmath/swizzle.nim",
+      "/vmath.nimble",
+      "/vmath.nim"
+    ],
+    "binaries": [],
+    "specialVersions": [
+      "3.0.0"
+    ]
+  }
+}

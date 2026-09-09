@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "metaData": {
+    "url": "https://github.com/treeform/chroma",
+    "downloadMethod": "git",
+    "vcsRevision": "8bf4a0933ff405f83dc3a176199f528601e5b796",
+    "files": [
+      "/chroma.nimble",
+      "/chroma/names.nim",
+      "/chroma.nim",
+      "/chroma/temperature.nim",
+      "/chroma/transformations.nim",
+      "/chroma/distance.nim",
+      "/chroma/colortypes.nim",
+      "/chroma/blends.nim",
+      "/chroma/csstint.nim"
+    ],
+    "binaries": [],
+    "specialVersions": [
+      "1.0.0"
+    ]
+  }
+}

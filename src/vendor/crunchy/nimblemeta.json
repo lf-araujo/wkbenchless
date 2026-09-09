@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "metaData": {
+    "url": "https://github.com/guzba/crunchy",
+    "downloadMethod": "git",
+    "vcsRevision": "98eb6526982bb8aae8eec6e8781f4539fa19e049",
+    "files": [
+      "/crunchy/internal.nim",
+      "/crunchy.nimble",
+      "/crunchy/adler32.nim",
+      "/crunchy.nim",
+      "/crunchy/common.nim",
+      "/crunchy/crc32c_simd.nim",
+      "/crunchy/crc32_simd.nim",
+      "/crunchy/adler32_simd.nim",
+      "/crunchy/aes256.nim",
+      "/crunchy/sha256_simd.nim",
+      "/crunchy/sha1.nim",
+      "/crunchy/rsa.nim",
+      "/crunchy/sha256.nim",
+      "/crunchy/bigints.nim",
+      "/crunchy/crc32c.nim",
+      "/crunchy/crc32.nim",
+      "/crunchy/rc6.nim"
+    ],
+    "binaries": [],
+    "specialVersions": [
+      "0.1.11"
+    ]
+  }
+}

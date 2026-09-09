@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "metaData": {
+    "url": "https://github.com/treeform/bumpy",
+    "downloadMethod": "git",
+    "vcsRevision": "edc6e19ddbe6b9e46c3384e9a4131d7063a3f610",
+    "files": [
+      "/bumpy.nimble",
+      "/bumpy.nim"
+    ],
+    "binaries": [],
+    "specialVersions": [
+      "1.1.3"
+    ]
+  }
+}

@@ -401,6 +401,10 @@ proc main() =
     app.ed.loadFromFile(app.filePath)
     noteRecentFile(app.filePath)
     if app.ed.lang in {langOrg, langMarkdown}:
+      # Match openFile: inline figures on, base dir for relative image paths.
+      # (#+STARTUP: noinlineimages via applyOrgStartup below can still turn it off.)
+      app.ed.setRenderFlag(rfInlineImages)
+      app.ed.imageBaseDir = parentDir(absolutePath(app.filePath))
       app.ed.foldAllPending = true
   else:
     app.ed.lang = langOrg                  # before setText, so org highlights now
@@ -421,6 +425,7 @@ proc main() =
       except ValueError: discard
 
   configure(app)            # user config (wkbconfig.nim) -- full-typed, no ABI
+  app.ed.imageDefaultWidth = gInlineImageWidth   # config may set gInlineImageWidth
   loadExtensions(app)       # extensions/*.nim, each with proc extend*(app)
   setupExecPath()           # seed PATH from the login shell (+ config paths)
   app.applyOrgStartup()     # #+STARTUP: latexpreview/inlineimages -- AFTER PATH

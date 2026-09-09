@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "metaData": {
+    "url": "https://github.com/guzba/nimsimd",
+    "downloadMethod": "git",
+    "vcsRevision": "3f6b2668ffb0867d0bf786a658b817763e611350",
+    "files": [
+      "/nimsimd/bmi1.nim",
+      "/nimsimd.nim",
+      "/nimsimd/runtimecheck.nim",
+      "/nimsimd/fma.nim",
+      "/nimsimd/hassimd.nim",
+      "/nimsimd/neon.nim",
+      "/nimsimd/sse41.nim",
+      "/nimsimd/avx2.nim",
+      "/nimsimd/avx.nim",
+      "/nimsimd/movbe.nim",
+      "/nimsimd/sse42.nim",
+      "/nimsimd/popcnt.nim",
+      "/nimsimd/pclmulqdq.nim",
+      "/nimsimd.nimble",
+      "/nimsimd/ssse3.nim",
+      "/nimsimd/bmi2.nim",
+      "/nimsimd/sse2.nim",
+      "/nimsimd/sse3.nim",
+      "/nimsimd/f16c.nim"
+    ],
+    "binaries": [],
+    "specialVersions": [
+      "1.3.2"
+    ]
+  }
+}
