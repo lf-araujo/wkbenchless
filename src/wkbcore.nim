@@ -515,13 +515,14 @@ proc openFile*(app: var App; path: string) =
     if b.filePath == path: switchToBuffer(app, i); return   # already open
   var ed = createSynEdit(app.font)
   ed.theme = app.ed.theme      # inherit the active theme so new buffers match
-  ed.showLineNumbers = false   # off by default; toggle with C-c n
   ed.bigFont = app.bigFont
   ed.setEmphasisFonts(app.ed.boldFont, app.ed.italicFont,
                       app.ed.boldItalicFont, app.ed.captionFont)
   ed.theme.fg[TokenClass.Link] = color(96, 160, 255)
   let ext = splitFile(path).ext
   ed.lang = fileExtToLanguage(ext)
+  ed.showLineNumbers = ed.lang != langOrg   # on for code/prose; off for org
+                                            # notebooks (toggle with C-c n)
   try: ed.loadFromFile(path)
   except CatchableError:
     app.msg = "could not open " & path; return
@@ -1415,6 +1416,7 @@ proc toggleSrcEdit*(app: var App) =
 proc toggleBufferTabs*(app: var App) =
   ## Show/hide a tab per open buffer in the top toolbar.
   gBufferTabs = not gBufferTabs
+  setState("bufferTabs", $gBufferTabs)      # remember across restarts
   app.msg = "buffer tabs: " & (if gBufferTabs: "on" else: "off")
 
 # -- src-edit: org-edit-special + session tangle ---------------------------

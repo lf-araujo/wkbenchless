@@ -388,7 +388,6 @@ proc main() =
                 curLang: "r", curSession: "default", focus: "editor",
                 font: font, bigFont: bigFont, fontSize: fontSize,
                 termActive: -1, running: true, msg: "ready")
-  app.ed.showLineNumbers = false   # off by default; toggle with C-c n
   app.ed.bigFont = bigFont
   applyEmphasisFonts(app.ed)
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
@@ -414,6 +413,7 @@ proc main() =
     const exDir = currentSourcePath().parentDir.parentDir / "examples"
     if dirExists(exDir): app.ed.imageBaseDir = exDir   # so [[file:figure.bmp]] resolves
     app.ed.foldAllPending = true
+  app.ed.showLineNumbers = app.ed.lang != langOrg   # on for code/prose; off for org
   app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
   app.curBuf = 0
   app.sess.setText("session output\n")
@@ -437,6 +437,8 @@ proc main() =
   loadState()                               # persisted UI state (XDG config dir)
   if gState.hasKey("theme"):                # start in the last theme the user picked
     applyThemeByName(app, gState["theme"])
+  if gState.hasKey("bufferTabs"):           # restore whether buffer tabs were on
+    gBufferTabs = gState["bufferTabs"] == "true"
   app.runHooks("startup")
 
   # Resizable panels (the host owns the layout): pixel sizes for the draggable
