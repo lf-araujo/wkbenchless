@@ -346,6 +346,66 @@ proc termLines(outbuf: string): seq[string] =
     if "nimacs" in ln.toLowerAscii: continue
     result.add ln
 
+# --- hand-drawn toolbar icons ------------------------------------------------
+# The toolbar font is a monospace coding font (Hack/Consolas/Menlo) with no glyph
+# fallback, so folder/save/find pictographs and emoji don't exist there. Draw the
+# icons as vector shapes (fillRect/drawLine/drawPoint) -- the same approach as the
+# [☰] menu -- so they look identical on Linux, macOS and Windows.
+
+proc icoH(x, y, w: int; c: Color) = fillRect(rect(x, y, max(1, w), 1), c)
+proc icoV(x, y, h: int; c: Color) = fillRect(rect(x, y, 1, max(1, h)), c)
+proc icoBox(x, y, w, h: int; c: Color) =        # 1px rectangle outline
+  icoH(x, y, w, c); icoH(x, y + h - 1, w, c)
+  icoV(x, y, h, c); icoV(x + w - 1, y, h, c)
+proc icoRing(cx, cy, r: int; c: Color) =        # midpoint-circle outline
+  var x = r; var y = 0; var err = 1 - r
+  while x >= y:
+    for (px, py) in [(cx+x, cy+y), (cx+y, cy+x), (cx-y, cy+x), (cx-x, cy+y),
+                     (cx-x, cy-y), (cx-y, cy-x), (cx+y, cy-x), (cx+x, cy-y)]:
+      drawPoint(px, py, c)
+    inc y
+    if err < 0: err += 2 * y + 1
+    else: (dec x; err += 2 * (y - x) + 1)
+
+proc iconOrigin(r: Rect; s: int): (int, int) =
+  (r.x + (r.w - s) div 2, r.y + (r.h - s) div 2)
+
+proc drawOpenIcon(r: Rect; c: Color) =          # a folder with a tab
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  icoH(ix, iy + 1, 7, c)                         # tab top
+  icoV(ix + 7, iy + 1, 2, c)                     # tab right edge
+  icoBox(ix, iy + 3, s, s - 4, c)                # folder body
+
+proc drawSaveIcon(r: Rect; c: Color) =          # a floppy disk
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  icoBox(ix, iy, s, s, c)                         # disk body
+  icoH(ix, iy + 4, s, c)                          # shutter band
+  fillRect(rect(ix + s - 6, iy + 1, 3, 3), c)     # metal slider (top-right)
+  icoBox(ix + 3, iy + 7, s - 6, s - 8, c)         # label (bottom)
+
+proc drawExportIcon(r: Rect; c: Color) =        # an arrow rising out of a tray
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  let cx = ix + s div 2
+  icoV(cx, iy + 1, 7, c); icoV(cx - 1, iy + 1, 7, c)    # 2px shaft
+  drawLine(cx, iy, cx - 4, iy + 4, c)            # arrowhead left
+  drawLine(cx - 1, iy, cx - 5, iy + 4, c)
+  drawLine(cx - 1, iy, cx + 3, iy + 4, c)        # arrowhead right
+  drawLine(cx, iy, cx + 4, iy + 4, c)
+  icoH(ix + 1, iy + s - 1, s - 2, c)             # tray floor
+  icoV(ix + 1, iy + s - 5, 5, c)                 # tray left wall
+  icoV(ix + s - 2, iy + s - 5, 5, c)             # tray right wall
+
+proc drawFindIcon(r: Rect; c: Color) =          # a magnifier
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  let cx0 = ix + 5; let cy0 = iy + 5
+  icoRing(cx0, cy0, 4, c)                         # lens
+  drawLine(cx0 + 3, cy0 + 3, ix + s - 1, iy + s - 1, c)   # handle (2px)
+  drawLine(cx0 + 4, cy0 + 3, ix + s - 1, iy + s - 2, c)
+
 proc main() =
   # Multi-call binary: `wkbenchless ctl <verb...>` -- or the binary invoked as
   # `wkbctl` (e.g. via a symlink) -- runs the control client and exits, so
@@ -639,12 +699,14 @@ proc main() =
                     ("Mark DONE", "criticmarkup-mark-done"),
                     ("Clean DONE", "criticmarkup-clean-done"),
                     ("Increase font", "zoom-in"), ("Decrease font", "zoom-out")]
+    const iconCmds = ["open-file", "save", "otd-export", "find"]  # hand-drawn icons
     var toolbarRects: seq[tuple[r: Rect; cmd, label: string]]
     var bufferTabRects: seq[tuple[r: Rect; idx: int; xr: Rect]]  # tab body + its [x]
     block:
       var x = 6
       for (label, cmd) in tbBtns:
-        let w = measureText(app.font, label).w + 16
+        let w = if cmd in iconCmds: toolbarH + 2           # square-ish icon button
+                else: measureText(app.font, label).w + 16
         toolbarRects.add (rect(x, 4, w, toolbarH - 8), cmd, label)
         x += w + 4
       # buffer tabs (optional): one per open buffer -- click to switch, [x] to close
@@ -1042,10 +1104,15 @@ proc main() =
         let cbg = if hover: app.theme.chipActiveBg else: app.theme.chipBg
         let cfg = if hover: app.theme.chipActiveFg else: app.theme.chipFg
         fillRect(it.r, cbg)
-        if it.cmd == "__menu__":                 # hamburger icon: three bars
+        case it.cmd
+        of "__menu__":                           # hamburger icon: three bars
           let bx = it.r.x + it.r.w div 2 - 7
           let by = it.r.y + it.r.h div 2 - 5
           for k in 0 .. 2: fillRect(rect(bx, by + k * 5, 14, 2), cfg)
+        of "open-file":   drawOpenIcon(it.r, cfg)
+        of "save":        drawSaveIcon(it.r, cfg)
+        of "otd-export":  drawExportIcon(it.r, cfg)
+        of "find":        drawFindIcon(it.r, cfg)
         else:
           let tw = measureText(app.font, it.label).w
           discard drawText(app.font, it.r.x + (it.r.w - tw) div 2, it.r.y,
