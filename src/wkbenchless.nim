@@ -406,6 +406,23 @@ proc drawFindIcon(r: Rect; c: Color) =          # a magnifier
   drawLine(cx0 + 3, cy0 + 3, ix + s - 1, iy + s - 1, c)   # handle (2px)
   drawLine(cx0 + 4, cy0 + 3, ix + s - 1, iy + s - 2, c)
 
+proc drawEditIcon(r: Rect; c: Color) =          # a pencil (tip lower-left, eraser upper-right)
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  # shaft: three parallel 45° strokes forming the pencil body
+  drawLine(ix + 1, iy + 10, ix + 8, iy + 3, c)
+  drawLine(ix + 2, iy + 11, ix + 9, iy + 4, c)
+  drawLine(ix + 3, iy + 12, ix + 10, iy + 5, c)
+  # tip: narrows to a point at the lower-left
+  drawLine(ix, iy + 13, ix + 1, iy + 10, c)
+  drawLine(ix, iy + 13, ix + 3, iy + 12, c)
+  drawPoint(ix, iy + 13, c)
+  # eraser: a short square cap at the upper-right end
+  drawLine(ix + 9, iy + 2, ix + 11, iy + 4, c)
+  drawLine(ix + 10, iy + 1, ix + 12, iy + 3, c)
+  drawLine(ix + 9, iy + 2, ix + 10, iy + 1, c)
+  drawLine(ix + 11, iy + 4, ix + 12, iy + 3, c)
+
 proc main() =
   # Multi-call binary: `wkbenchless ctl <verb...>` -- or the binary invoked as
   # `wkbctl` (e.g. via a symlink) -- runs the control client and exits, so
@@ -699,7 +716,8 @@ proc main() =
                     ("Mark DONE", "criticmarkup-mark-done"),
                     ("Clean DONE", "criticmarkup-clean-done"),
                     ("Increase font", "zoom-in"), ("Decrease font", "zoom-out")]
-    const iconCmds = ["open-file", "save", "otd-export", "find"]  # hand-drawn icons
+    const iconCmds = ["open-file", "save", "otd-export", "find",   # hand-drawn icons
+                      "src-edit-block"]
     var toolbarRects: seq[tuple[r: Rect; cmd, label: string]]
     var bufferTabRects: seq[tuple[r: Rect; idx: int; xr: Rect]]  # tab body + its [x]
     block:
@@ -1113,6 +1131,7 @@ proc main() =
         of "save":        drawSaveIcon(it.r, cfg)
         of "otd-export":  drawExportIcon(it.r, cfg)
         of "find":        drawFindIcon(it.r, cfg)
+        of "src-edit-block": drawEditIcon(it.r, cfg)
         else:
           let tw = measureText(app.font, it.label).w
           discard drawText(app.font, it.r.x + (it.r.w - tw) div 2, it.r.y,
