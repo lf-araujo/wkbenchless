@@ -516,6 +516,9 @@ proc main() =
     applyThemeByName(app, gState["theme"])
   if gState.hasKey("bufferTabs"):           # restore whether buffer tabs were on
     gBufferTabs = gState["bufferTabs"] == "true"
+  if gState.hasKey("fontSize"):            # restore the last font size
+    try: app.fontSize = max(8, min(48, parseInt(gState["fontSize"])))
+    except ValueError: discard
   app.runHooks("startup")
 
   # Resizable panels (the host owns the layout): pixel sizes for the draggable
@@ -680,6 +683,7 @@ proc main() =
 
     if app.fontSize != fontSize:                 # zoom: re-open the fonts
       fontSize = app.fontSize
+      setState("fontSize", $fontSize)            # remember across restarts
       font = openFont(fontPath, fontSize, metrics)
       bigFont = openFont(fontPath, fontSize * 3 div 2, bigMetrics)
       boldFont = openFont(facePath("Bold"), fontSize, emMetrics)
