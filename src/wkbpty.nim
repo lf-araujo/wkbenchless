@@ -327,27 +327,33 @@ proc alive*(t: Pty): bool = ptAlive(t)
 
 proc feed*(t: var Pty; s: string) = ptWrite(t, s)
 
-proc drain*(t: var Pty): bool =
+proc drain*(t: var Pty): int =
   ## Non-blocking: consume everything available. A screen-grid terminal (vt !=
   ## nil) feeds the emulator; a REPL session appends to the line-log `outbuf`.
+  ## Returns the number of bytes consumed this call, or -1 if the child is gone.
   var b {.noinit.}: array[8192, char]
+  var total = 0
   while true:
     let n = ptReadAvail(t, b)
     if n > 0:
+      total += n
       if t.vt != nil:
         var chunk = newString(n)
         copyMem(addr chunk[0], addr b[0], n)
         t.vt.write(chunk)
       else:
         for i in 0 ..< n: t.outbuf.add b[i]
-    elif n < 0: return false                    # dead
+    elif n < 0: return -1                        # dead
     else: break                                 # nothing more right now
-  true
+  total
 
-proc pump*(t: var Pty) =
-  discard drain(t)
+proc pump*(t: var Pty): bool =
+  ## Drain the pty; returns true if any new output was consumed (so the pane may
+  ## have changed on screen and the caller should redraw).
+  let n = drain(t)
   if t.vt == nil and t.outbuf.len > 200_000:
     t.outbuf = t.outbuf[^120_000 .. ^1]
+  n > 0
 
 proc readUntil*(t: var Pty; token: string; timeoutMs = 15_000; mirror = true): string =
   ## Block until `token` appears or we time out (poll, so it works on both the

@@ -300,7 +300,10 @@ proc startControl*(): ControlServer =
   except CatchableError:
     result = ControlServer()
 
-proc poll*(cs: var ControlServer; app: var App) =
+proc poll*(cs: var ControlServer; app: var App): bool =
+  ## Service any pending wkbctl / agent request. Returns true if a request was
+  ## handled (which may have changed the buffer or UI), so the caller can redraw.
+  result = false
   if cs.listener == nil: return
   if cs.client == nil:                  # accept a pending connection (non-blocking)
     var lfds = @[cs.listener.getFd]
@@ -327,6 +330,7 @@ proc poll*(cs: var ControlServer; app: var App) =
         try: cs.client.send(resp) except CatchableError: discard
         try: cs.client.close() except CatchableError: discard
         cs.client = nil
+        result = true                   # a request was serviced -> redraw
         break
       cs.inbuf.add chunk
       cfds = @[cs.client.getFd]

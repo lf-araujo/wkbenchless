@@ -457,32 +457,35 @@ proc switchToBuffer*(app: var App; idx: int) =
 
 var gLastRevertCheck: float = 0.0        ## epochTime of last autoRevert poll
 
-proc autoRevertActive*(app: var App) =
+proc autoRevertActive*(app: var App): bool =
   ## Poll the active file's mtime; if it changed on disk since we last
   ## loaded/saved it AND the buffer has no unsaved edits, reload it in place
   ## (cursor preserved). Never clobbers unsaved edits — a modified buffer just
   ## gets a one-shot status message. Throttled so it costs nothing per frame.
   ## This is what keeps the buffer in sync when an external tool (an agent, a
-  ## formatter, git) rewrites the file underneath the editor.
-  if app.filePath.len == 0 or not fileExists(app.filePath): return
+  ## formatter, git) rewrites the file underneath the editor. Returns true if it
+  ## changed anything visible (reloaded or set a status message), so the caller
+  ## can redraw.
+  if app.filePath.len == 0 or not fileExists(app.filePath): return false
   let now = epochTime()
-  if now - gLastRevertCheck < 0.7: return
+  if now - gLastRevertCheck < 0.7: return false
   gLastRevertCheck = now
   let t = getLastModificationTime(app.filePath)
-  if t <= app.activeDiskMtime: return
+  if t <= app.activeDiskMtime: return false
   if app.ed.changed:                     # unsaved edits — do not clobber
     app.activeDiskMtime = t              # (and don't nag again for this change)
     app.msg = extractFilename(app.filePath) &
               " changed on disk (buffer modified — not reverted)"
-    return
+    return true
   let pos = app.ed.cursor
   try: app.ed.loadFromFile(app.filePath)
   except CatchableError:
-    app.msg = "auto-revert: cannot read " & extractFilename(app.filePath); return
+    app.msg = "auto-revert: cannot read " & extractFilename(app.filePath); return true
   app.ed.markSaved()
   app.ed.gotoPos(min(pos, app.ed.len))
   app.activeDiskMtime = t
   app.msg = "reverted " & extractFilename(app.filePath) & " (disk changed)"
+  result = true
 
 proc recentFilesPath(): string = getCacheDir() / "wkbenchless" / "recent"
 

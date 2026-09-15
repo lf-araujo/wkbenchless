@@ -15,6 +15,7 @@ import wkbpty
 import wkbctrl
 import wkbctlclient       # so `wkbenchless ctl <verb>` == the wkbctl client
 import std/[os, tables, strutils]
+from std/times import epochTime   # blink pacing for the redraw gate
 
 const fontPath =
   when defined(windows): "C:/Windows/Fonts/consola.ttf"
@@ -584,6 +585,12 @@ proc main() =
   let noEvent = Event(kind: NoEvent)
 
   var e: Event
+  # Redraw gate: only re-render when something actually changed. A software
+  # renderer that repaints every frame pins a core; the driver keeps the last
+  # frame in a back buffer and re-blits it on Expose, so skipping idle frames is
+  # safe. needRedraw starts true so the first frame paints.
+  var needRedraw = true
+  var lastBlink = epochTime()
   while app.running:
     let livePane = not app.sessionHidden and
                    (app.termActive >= 0 or currentSession(app) != nil)
@@ -591,6 +598,7 @@ proc main() =
     if not waitEvent(e, if livePane: 30 else: 100):
       e = Event(kind: NoEvent)
     if e.kind in {WindowCloseEvent, QuitEvent}: break
+    if e.kind != NoEvent: needRedraw = true   # any real input/resize/focus event
 
     # Start a freshly opened terminal (one the host hasn't spawned yet).
     for i in 0 ..< app.terminals.len:
@@ -598,6 +606,7 @@ proc main() =
         app.terminals[i].pty = startPty(app.terminals[i].cmd, terminalDir(app),
                                         app.theme.termFg, app.theme.panelBg)
         app.terminals[i].started = true
+        needRedraw = true                     # a pane appeared
         if not app.terminals[i].pty.alive:
           app.msg = "could not start " & app.terminals[i].cmd
     # Retire a terminal tab once its process has ended and we've moved off it.
@@ -608,13 +617,24 @@ proc main() =
         closePty(app.terminals[i].pty)
         app.terminals.delete(i)
         if app.termActive > i: dec app.termActive
+        needRedraw = true                     # a pane vanished
       else:
         inc i
     block:                                    # drain the live pane's pty each frame
       let ap = activePtyPtr()
-      if ap != nil: pump(ap[])
-    poll(ctrl, app)                           # handle any wkbctl / agent request
-    autoRevertActive(app)                     # reload the buffer if the file changed on disk
+      if ap != nil and pump(ap[]): needRedraw = true   # new terminal/session output
+    if poll(ctrl, app): needRedraw = true     # a wkbctl / agent request touched state
+    if autoRevertActive(app): needRedraw = true  # buffer reloaded from disk
+
+    # Blink the editor caret without pinning the CPU: force a repaint ~2x/sec
+    # only while the editor is focused; every other idle frame is skipped.
+    if app.focus == "editor" and epochTime() - lastBlink >= 0.5:
+      needRedraw = true; lastBlink = epochTime()
+
+    # Skip the whole frame when nothing changed (idle CPU ~0). A pending reload
+    # must still run its re-exec, so never skip while it's queued.
+    if not needRedraw and not app.reloadPending: continue
+    needRedraw = false
 
     if app.reloadPending:                     # recompile finished -> snapshot & re-exec
       if app.termActive >= 0 and app.termActive < app.terminals.len and
