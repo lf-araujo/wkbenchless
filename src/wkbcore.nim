@@ -789,19 +789,77 @@ proc dedentBody(lines: seq[string]): string =
     outl.add (if ln.len >= minIndent: ln[minIndent .. ^1] else: ln)
   outl.join("\n")
 
+proc codeComplete(code: string): bool =
+  ## True when `code` is a complete statement to send: balanced (), [], {}
+  ## outside string literals / `# comments`, AND the last code line does not end
+  ## with a continuation operator (a trailing pipe / `+` / `,` / `<-` / …).
+  ## Used to gather a multi-line expression for run-line, RStudio-style.
+  var stack: seq[char]
+  var inStr = '\0'
+  var tail = ""                                  # last few non-space code chars
+  var i = 0
+  while i < code.len:
+    let c = code[i]
+    if inStr != '\0':
+      if c == '\\' and i + 1 < code.len: inc i   # skip escaped char
+      elif c == inStr: inStr = '\0'
+    else:
+      case c
+      of '"', '\'', '`': inStr = c               # ` = R backtick-quoted name
+      of '#':                                     # comment: skip to end of line,
+        while i < code.len and code[i] != '\n': inc i   # not the whole buffer
+        continue
+      of '(', '[', '{': stack.add c
+      of ')', ']', '}':
+        if stack.len == 0: return false
+        let open = stack.pop()
+        let expect = case c
+          of ')': '('
+          of ']': '['
+          else: '{'
+        if open != expect: return false
+      else: discard
+      if c notin {' ', '\t', '\n', '\r'}:        # remember the tail for the op check
+        tail.add c
+        if tail.len > 4: tail = tail[^4 .. ^1]
+    inc i
+  if inStr != '\0' or stack.len != 0: return false
+  # A trailing continuation operator means the expression isn't finished yet.
+  for op in ["%>%", "|>", "%in%", "<<-", "->>", "<-", "->", "&&", "||"]:
+    if tail.endsWith(op): return false
+  if tail.len > 0 and tail[^1] in {'+', '-', '*', '/', '^', '&', '|', ',', '~', '='}:
+    return false
+  true
+
 proc runLine*(app: var App) =
-  ## Send the current editor line to the CURRENT session (the one the bottom
-  ## pane tracks). Does NOT spin up a default R session on a stray Ctrl+Enter --
-  ## run a src block (C-c C-c) first to establish a session.
-  let line = app.ed.getLineText(app.ed.currentLine)
-  if strutils.strip(line).len == 0: return
-  let s = currentSession(app)
-  if s == nil:
-    app.msg = "no active session -- run a src block (C-c C-c) first"
-    return
-  discard s.runBlock(line)          # output scrolls live in the session terminal
-  app.msg = "ran line in " & app.curLang & "/" & app.curSession
-  refreshObjects(app)
+  ## Ctrl+Enter: send the current statement to the default R session (r/default),
+  ## creating it if needed, then advance to the next non-blank code line. A
+  ## multi-line expression -- unbalanced delimiters, OR a trailing continuation
+  ## operator like `%>%` / `+` -- is gathered across lines until complete.
+  var last = app.ed.currentLine
+  var code = app.ed.getLineText(last)
+  while not codeComplete(code) and last + 1 < app.ed.getLineCount():
+    inc last
+    code.add "\n"
+    code.add app.ed.getLineText(last)
+  if strutils.strip(code).len > 0:
+    app.curLang = "r"; app.curSession = "default"   # make r/default the current tab
+    let s = getSession(app, "r", "default")
+    if s == nil:
+      app.msg = "could not start R session"
+      return
+    discard s.runBlock(code)          # output scrolls live in the session terminal
+    app.msg = "ran line in r/default"
+    refreshObjects(app)
+  # Advance to the next non-blank line so repeated C-Enter flows through the code.
+  var nxt = last + 1
+  while nxt < app.ed.getLineCount() and
+        strutils.strip(app.ed.getLineText(nxt)).len == 0:
+    inc nxt
+  if nxt < app.ed.getLineCount():
+    app.ed.gotoLine(nxt + 1, 0)       # gotoLine is 1-based
+  elif last + 1 < app.ed.getLineCount():
+    app.ed.gotoLine(last + 2, 0)      # only blanks left: just step down one
 
 proc saveCmd*(app: var App) =
   if app.filePath.len > 0:
@@ -2223,7 +2281,7 @@ proc registerBuiltins*() =
   defcommand("save", "Save", saveCmd)
   defcommand("save-as", "Save the buffer to a new path", saveAsCmd)
   defcommand("quit", "Quit", quitCmd)
-  defcommand("run-line", "Run current line in session", runLine)
+  defcommand("run-line", "Run current line in R (default session), skip to next", runLine)
   defcommand("babel-execute", "Org-babel: run this src block", babelExecute)
   defcommand("toggle-line-numbers", "Show/hide line numbers", proc(a: var App) =
     a.ed.showLineNumbers = not a.ed.showLineNumbers
