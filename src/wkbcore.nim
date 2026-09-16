@@ -831,32 +831,63 @@ proc codeComplete(code: string): bool =
     return false
   true
 
+# Defined later in this module; forward-declared so runLine can resolve the
+# enclosing src block's language and :session.
+proc findBlockAt(app: App; cur: int): tuple[b, e: int; header: string]
+proc headerLangSession(header: string): (string, string)
+
+proc runTarget(app: var App): tuple[lang, session: string; stopAt: int; ok: bool] =
+  ## Where Ctrl+Enter sends, and how far a multi-line statement may be gathered:
+  ##   1. inside a `#+begin_src <lang> :session` block / Rmd chunk -> that block's
+  ##      language and session (gathering bounded to the block body);
+  ##   2. otherwise a plain file whose own language has a registered REPL
+  ##      (`.R` -> r, `.py` -> python, …) -> that language's default session;
+  ##   3. otherwise the current live session, if any.
+  ## `ok` is false when none apply (e.g. prose with no session).
+  result.stopAt = app.ed.getLineCount()
+  let blk = findBlockAt(app, app.ed.currentLine)
+  if blk.b >= 0:                                   # 1. in a src block
+    let (l, s) = headerLangSession(blk.header)
+    if l.len > 0 and gRepls.hasKey(l.toLowerAscii):
+      return (l.toLowerAscii, s, blk.e, true)      # stop at #+end_src / closing fence
+  if app.docLang.len > 0 and gRepls.hasKey(app.docLang.toLowerAscii):
+    return (app.docLang.toLowerAscii, "default", app.ed.getLineCount(), true)  # 2.
+  if currentSession(app) != nil and gRepls.hasKey(app.curLang.toLowerAscii):
+    return (app.curLang, app.curSession, app.ed.getLineCount(), true)          # 3.
+  result.ok = false
+
 proc runLine*(app: var App) =
-  ## Ctrl+Enter: send the current statement to the default R session (r/default),
-  ## creating it if needed, then advance to the next non-blank code line. A
-  ## multi-line expression -- unbalanced delimiters, OR a trailing continuation
-  ## operator like `%>%` / `+` -- is gathered across lines until complete.
+  ## Ctrl+Enter: send the current statement to the session for the language in
+  ## context -- the enclosing src block's `:session`, else the file's own
+  ## language (if it has a registered REPL), else the current session -- then
+  ## advance to the next non-blank code line. A multi-line expression (unbalanced
+  ## delimiters, or a trailing continuation operator like `%>%` / `+`) is
+  ## gathered across lines until complete, bounded to the block body.
+  let (lang, session, stopAt, ok) = runTarget(app)
+  if not ok:
+    app.msg = "Ctrl-Enter: no REPL in context -- open a code file or a src block"
+    return
   var last = app.ed.currentLine
   var code = app.ed.getLineText(last)
-  while not codeComplete(code) and last + 1 < app.ed.getLineCount():
+  while not codeComplete(code) and last + 1 < stopAt:
     inc last
     code.add "\n"
     code.add app.ed.getLineText(last)
   if strutils.strip(code).len > 0:
-    app.curLang = "r"; app.curSession = "default"   # make r/default the current tab
-    let s = getSession(app, "r", "default")
+    app.curLang = lang; app.curSession = session    # make this the current tab
+    let s = getSession(app, lang, session)
     if s == nil:
-      app.msg = "could not start R session"
+      app.msg = "could not start " & lang & " session"
       return
     discard s.runBlock(code)          # output scrolls live in the session terminal
-    app.msg = "ran line in r/default"
+    app.msg = "ran line in " & lang & "/" & session
     refreshObjects(app)
-  # Advance to the next non-blank line so repeated C-Enter flows through the code.
+  # Advance to the next non-blank line so repeated C-Enter flows through the code
+  # (bounded by stopAt, so inside a block we stop at #+end_src / the closing fence).
   var nxt = last + 1
-  while nxt < app.ed.getLineCount() and
-        strutils.strip(app.ed.getLineText(nxt)).len == 0:
+  while nxt < stopAt and strutils.strip(app.ed.getLineText(nxt)).len == 0:
     inc nxt
-  if nxt < app.ed.getLineCount():
+  if nxt < stopAt:
     app.ed.gotoLine(nxt + 1, 0)       # gotoLine is 1-based
   elif last + 1 < app.ed.getLineCount():
     app.ed.gotoLine(last + 2, 0)      # only blanks left: just step down one
