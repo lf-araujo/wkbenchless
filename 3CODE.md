@@ -51,7 +51,7 @@ git show HEAD:path/file > /tmp/old && wkbctl diff /tmp/old path/file "what chang
 ## Run any editor command / reload
 - `wkbctl command <name>` — run any `M-x` command; echoes `ok: <name> -- <status>`.
   Useful names: `save`, `babel-execute`, `run-line`, `undo`, `redo`,
-  `list-buffers`, `open-file`, `find`, `replace`, `next-chunk`, `prev-chunk`,
+  `list-buffers`, `open-file`, `find`, `replace`, `next-landmark`, `prev-landmark`,
   `diff-buffer`, `close-diff`, `toggle-vim`, `terminal`, `claude`,
   `show-panel`, `toggle-panel`, `recompile`, `refresh-objects`, `show-help`,
   `complete`, `src-edit-block`, `src-edit-session`, `focus-next`,

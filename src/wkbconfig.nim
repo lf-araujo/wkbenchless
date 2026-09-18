@@ -47,6 +47,7 @@ proc configure*(app: var App) =
   bindkey("F1", "show-help")            # help for word at cursor
   bindkey("C-Enter", "run-line")        # send the current line to the session
   bindkey("C-c C-c", "babel-execute")   # run the org src block
+  bindkey("C-c C-b", "run-all")         # run EVERY src block, top to bottom
   bindkey("C-c e", "src-edit-block")    # zoom into the block (org-edit-special)
   bindkey("C-c b", "src-edit-block")
   bindkey("C-c t", "src-edit-session")  # tangle all same-session blocks
@@ -132,6 +133,11 @@ proc configure*(app: var App) =
   # ~ expanded); set gLoadLoginPath = false to skip the login-shell probe.
   addExecPath("~/.local/bin")
   addExecPath("~/bin")
+  # ImageMagick (magick/convert), for inline-image conversion of non-BMP
+  # figures in org/markdown buffers (see toLoadableBmp in synedit.nim).
+  # Belt-and-suspenders: the login-shell PATH probe above already resolves
+  # this, but pin it explicitly in case that probe ever fails silently.
+  addExecPath("~/Documents/.brew/bin")
   # GitHub Copilot language server (installed by the Emacs copilot package).
   addExecPath("~/.emacs.d/.cache/copilot/bin")
   # gLoadLoginPath = false
@@ -142,6 +148,12 @@ proc configure*(app: var App) =
   # continue", exit 1) fall through to a fresh chat instead of exiting.
   gClaudeCmd = "claude --continue || claude"
   # gClaudeCmd = "claude"                # always start fresh instead
+
+  # When true (default), launching claude (C-c a) injects `--settings` hooks so
+  # its Edit/Write file changes pop into THIS editor's diff pane. Set false to
+  # launch claude with no injected hooks.
+  gClaudeDiffHooks = true
+  # gClaudeDiffHooks = false             # opt out of the diff-on-edit popups
 
   # CriticMarkup (tracked changes) is fontified in org buffers automatically:
   # {++ins++} green, {--del--} red, {~~old~>new~~} red->green, {>>comment<<}

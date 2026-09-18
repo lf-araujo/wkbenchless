@@ -79,6 +79,9 @@ languages, and themes are data, and ~C-c r~ recompiles and restarts /in place/,
 - *Find / replace*: ~C-f~ finds incrementally, ~C-h~ find-and-replace.
 - *Org navigator*: ~C-j~ — a palette of headings, named/captioned blocks, and
   figure/table captions; pick one to jump.
+- *Landmark arrows*: the toolbar's single ▼/▲ pair jumps between /sections,
+  src blocks and CriticMarkup comments/ in document order — works in org and
+  Rmd alike (~M-x next-landmark~ / ~prev-landmark~).
 - *Command palette*: ~M-x~ (or ~C-p~); ~C-x C-r~ opens a recent file.
 
 Src-edit (~C-c e~) zooms a block into an isolated code file with LSP, alongside

@@ -38,10 +38,12 @@ type
     running*: bool
     srcEdit*: bool                        ## 4-quadrant (objects+help) vs plain
     pendingPrefix*: string
+    lastBlockOutput*: string              ## captured output of the last babel run
     buffers*: seq[BufferState]            ## all open buffers (snapshots)
     curBuf*: int                          ## index of the active buffer
     pendingKill*: bool                    ## a kill-buffer of a dirty buffer awaits confirm
     pendingQuit*: bool                    ## a quit with unsaved buffer(s) awaits confirm
+    pendingRevert*: bool                  ## a revert-buffer of a dirty buffer awaits confirm
     paletteActive*: bool
     paletteMode*: PaletteMode
     paletteQuery*: string
@@ -128,6 +130,9 @@ var
   gExtraPaths*: seq[string]               ## dirs to prepend to PATH (config; ~ ok)
   gLoadLoginPath* = true                  ## seed PATH from the login shell at startup
   gClaudeCmd* = "claude --continue || claude"  ## command the `claude` action runs (config)
+  gClaudeDiffHooks* = true                 ## inject --settings diff-on-edit hooks when
+                                           ## launching claude, so its file edits pop into
+                                           ## this editor's diff pane (config; set false off)
   gSshPersist* = "600"                    ## seconds an ssh master connection persists
   gInlineImageWidth* = 0                   ## default inline image width in px
                                            ## (org #+ATTR_* :width overrides it);
@@ -605,16 +610,38 @@ proc orgOutline*(app: App): seq[tuple[line: int; label: string]] =
     elif s.len == 0:
       pendingName = ""; pendingCaption = ""; pendingLine = -1
 
+proc matchScore*(hay, needle: string): int =
+  ## Rank a candidate against the (already lowercased) query: lower is better.
+  ## Exact < prefix < word-boundary substring < plain substring; earlier hits
+  ## rank above later ones. Assumes `needle` is non-empty and occurs in `hay`.
+  let h = hay.toLowerAscii
+  if h == needle: return 0
+  if h.startsWith(needle): return 1
+  let idx = h.find(needle)
+  if idx < 0: return 100000
+  if h[idx - 1] in {' ', '-', '_', '.', '/'}: return 100 + idx
+  return 1000 + idx
+
 proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
   let q = app.paletteQuery.toLowerAscii
   case app.paletteMode
   of pmCommands:
     # Match the command NAME as well as its description, and show the name -- so
     # typing e.g. "cite" finds `cite-context` even when its label doesn't contain
-    # that word.
+    # that word. Rank so the best match is first (the selector starts at the top,
+    # so a search never needs scrolling to reach the obvious hit).
+    var scored: seq[tuple[score: int; id, label: string]]
     for name, c in gCommands:
-      if q.len == 0 or q in name.toLowerAscii or q in c.label.toLowerAscii:
-        result.add (name, name & "  —  " & c.label)
+      let nlow = name.toLowerAscii
+      if q.len == 0 or q in nlow or q in c.label.toLowerAscii:
+        let sc = if q.len == 0: 0
+                 elif q in nlow: matchScore(name, q)
+                 else: 100000 + matchScore(c.label, q)   # label-only hits rank last
+        scored.add (sc, name, name & "  —  " & c.label)
+    scored.sort(proc(a, b: (int, string, string)): int =
+      result = cmp(a[0], b[0])
+      if result == 0: result = cmp(a[1], b[1]))          # stable: then by name
+    for s in scored: result.add (s.id, s.label)
   of pmBuffers:
     for i, b in app.buffers:
       let nm = bufName(b)
@@ -1288,6 +1315,75 @@ proc isChunkStart(line: string): bool =
   let low = line.strip.toLowerAscii
   low.startsWith("#+begin_src") or low.startsWith("```{r")
 
+# Defined later in this module; forward-declared so isLandmark can test fences.
+proc rmdChunkOpen(line: string): bool
+proc rmdChunkClose(line: string): bool
+
+proc isLandmark(line: string; star, hash: bool): tuple[hit: bool; label: string] =
+  ## True if `line` starts a navigable unit: a section heading, a runnable
+  ## chunk, or a CriticMarkup comment. One scanner backs the unified ▼/▲
+  ## toolbar pair and its commands, so all three kinds interleave in true
+  ## document order (a comment between two headings is not skipped over).
+  ## `star` = detect org `*` headings; `hash` = markdown `#` headings.
+  let s = strutils.strip(line)
+  if s.len == 0: return (false, "")
+  if star and s[0] == '*':
+    var lvl = 0
+    while lvl < s.len and s[lvl] == '*': inc lvl
+    if lvl == s.len or s[lvl] == ' ':    # stars then a space: a heading, not *bold*
+      return (true, "section: " & strutils.strip(s[lvl .. ^1]))
+  if hash and s[0] == '#':
+    var lvl = 0
+    while lvl < s.len and s[lvl] == '#': inc lvl
+    if lvl == s.len or s[lvl] == ' ':    # ATX heading; #+begin_src has no space after #
+      return (true, "section: " & strutils.strip(s[lvl .. ^1]))
+  let low = s.toLowerAscii
+  if low.startsWith("#+begin_src") or rmdChunkOpen(low):
+    return (true, "src block")
+  if "{>>" in s:
+    return (true, "comment")
+  (false, "")
+
+proc jumpLandmark*(app: var App; forward: bool) =
+  ## Core of next/prev-landmark: jump to the nearest landmark strictly
+  ## after (or before) the cursor. Landmark = section heading / src chunk /
+  ## CriticMarkup comment; works in both org and Rmd/markdown files.
+  ## Plain-text buffers (e.g. the scratch file) get BOTH heading syntaxes;
+  ## code files get neither, so an R `# comment` is never mistaken for one.
+  ## Lines INSIDE a chunk body are skipped (they are code, not structure):
+  ## a `# comment` or a `*` bullet inside an R block must not stop the scan.
+  ## Chunk fences are tracked in one forward pass, so the skip is correct in
+  ## both directions (a backward walk cannot see the opening fence).
+  let star = app.ed.lang in {langOrg, langNone}
+  let hash = app.ed.lang in {langMarkdown, langNone}
+  let n = app.ed.getLineCount()
+  var marks: seq[tuple[line: int; label: string]]
+  var inChunk = false            # set on #+begin_src / ```{...}, cleared on the closer
+  for i in 0 ..< n:
+    let raw = strutils.strip(app.ed.getLineText(i))
+    let low = raw.toLowerAscii
+    let opens = low.startsWith("#+begin_src") or rmdChunkOpen(low)
+    if opens: inChunk = true
+    elif inChunk and (low.startsWith("#+end_src") or rmdChunkClose(low)):
+      inChunk = false
+    if not inChunk or opens:
+      let (hit, label) = isLandmark(raw, star, hash)
+      if hit: marks.add (i, label)
+  # pick the first mark strictly after (or before) the cursor
+  let cur = app.ed.currentLine
+  if forward:
+    for m in marks:
+      if m.line > cur:
+        app.ed.gotoLine(m.line + 1, 0); app.msg = "next " & m.label; return  # gotoLine is 1-based
+  else:
+    for m in reversed(marks):
+      if m.line < cur:
+        app.ed.gotoLine(m.line + 1, 0); app.msg = "previous " & m.label; return
+  app.msg = if forward: "no next section / block / comment" else: "no previous section / block / comment"
+
+proc nextLandmark*(app: var App) = jumpLandmark(app, forward = true)
+proc prevLandmark*(app: var App) = jumpLandmark(app, forward = false)
+
 proc nextChunk*(app: var App) =
   ## Jump to the next src block / Rmd chunk after the cursor.
   let n = app.ed.getLineCount()
@@ -1498,6 +1594,29 @@ proc killBufferAt*(app: var App; idx: int) =
   app.msg = "killed " & killed
 
 proc killBuffer*(app: var App) = killBufferAt(app, app.curBuf)
+
+proc revertBuffer*(app: var App) =
+  ## Revert the current buffer to its file on disk, discarding unsaved edits.
+  ## Guards unsaved work like killBuffer: on a modified buffer the first call
+  ## only warns; invoke revert-buffer again to discard and reload. Mirrors the
+  ## auto-revert path (loadFromFile + markSaved + preserve cursor), but is the
+  ## explicit user-driven counterpart that *does* overwrite local edits.
+  if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
+  if app.filePath.len == 0 or not fileExists(app.filePath):
+    app.msg = "no file on disk to revert to"; return
+  if app.ed.changed and not app.pendingRevert:      # guard unsaved work
+    app.pendingRevert = true
+    app.msg = "unsaved -- revert-buffer again to discard and reload from disk"
+    return
+  app.pendingRevert = false
+  let pos = app.ed.cursor
+  try: app.ed.loadFromFile(app.filePath)
+  except CatchableError:
+    app.msg = "revert: cannot read " & extractFilename(app.filePath); return
+  app.ed.markSaved()
+  app.ed.gotoPos(min(pos, app.ed.len))
+  app.activeDiskMtime = getLastModificationTime(app.filePath)
+  app.msg = "reverted " & extractFilename(app.filePath) & " from disk"
 
 proc toggleSrcEdit*(app: var App) =
   ## Show/hide the objects+help right column (the "src-edit environment").
@@ -1834,6 +1953,7 @@ proc babelExecute*(app: var App) =
   var sessName, host, dir, fileOut = ""
   var gW, gH, gRes = 0
   var gType = ""
+  var rawResults = false
   # Parse :session / :ssh / :dir / :file / :width / :height / :res / :type from
   # a token list; only fill unset fields (so the BLOCK header wins over document
   # #+PROPERTY defaults, applied after).
@@ -1858,8 +1978,28 @@ proc babelExecute*(app: var App) =
         gRes = (try: parseInt(toks[k + 1]) except: 0)
       elif toks[k] == ":type" and k + 1 < toks.len and gType.len == 0:
         gType = toks[k + 1]
+      elif toks[k] == ":results":
+        # `:results output raw` (or `org`) means org splices the output verbatim
+        # instead of `: `-prefixing it, so emitted org tables render as tables.
+        var j = k + 1
+        while j < toks.len and not toks[j].startsWith(":"):
+          if toks[j] == "raw" or toks[j] == "org": rawResults = true
+          inc j
       inc k
+  # Per-block `#+header:` lines directly above `#+begin_src` carry args too --
+  # org conventionally puts :width/:height/:res/:type there, not on the
+  # begin_src line, so gather them (nearest line first) and apply them.
+  var headerLineArgs: seq[string]
+  if not isRmd:
+    var h = b - 1
+    while h >= 0:
+      let hl = strutils.strip(app.ed.getLineText(h))
+      if hl.toLowerAscii.startsWith("#+header:"):
+        for t in strutils.splitWhitespace(hl)[1 .. ^1]: headerLineArgs.add t
+        dec h
+      else: break
   apply(strutils.splitWhitespace(header)[2 .. ^1])   # the block header first
+  apply(headerLineArgs)                              # then #+header: lines
   apply(headerArgTokens(app, lang))                  # then document defaults
   if sessName.len == 0: sessName = "default"
   if host.len > 0 and '@' notin sessName: sessName = sessName & "@" & host
@@ -1894,7 +2034,11 @@ proc babelExecute*(app: var App) =
     if gType.len > 0: devArgs.add ", type=\"" & gType & "\""
     body = dev & "(" & devArgs & ")\n" & body & "\ntry(dev.off(), silent=TRUE)\n"
 
-  let outp = s.runBlock(body)
+  # User blocks can fit models that stay silent for a while (Hessian, CIs);
+  # tolerate long silences before the reader gives up (the nonce makes even a
+  # timed-out run safe for the next one).
+  let outp = s.runBlock(body, timeoutMs = 600_000)
+  app.lastBlockOutput = outp
   app.sess.appendOutput("# " & (if lang.len > 0: lang else: "?") &
                         " [" & sessName & "]\n" & outp & "\n")
 
@@ -1903,7 +2047,13 @@ proc babelExecute*(app: var App) =
   var removeTo = e + 1
   if p < total and strutils.strip(app.ed.getLineText(p)).toLowerAscii.startsWith("#+results:"):
     inc p
-    while p < total and strutils.strip(app.ed.getLineText(p)).startsWith(":"): inc p
+    # Remove the whole previous results element, not just `:`-prefixed lines, so
+    # `[[file:...]]` links and raw org tables are replaced instead of stacking.
+    # Stop at a blank line, the next block/heading, or EOF.
+    while p < total:
+      let t = strutils.strip(app.ed.getLineText(p))
+      if t.len == 0 or t.startsWith("#+") or t.startsWith("*"): break
+      inc p
     removeTo = p
 
   var outLines: seq[string]
@@ -1913,16 +2063,62 @@ proc babelExecute*(app: var App) =
   if fileOut.len > 0:
     outLines.add "[[file:" & fileOut & "]]"
   elif strutils.strip(outp).len == 0:
-    outLines.add ": "
+    if not rawResults: outLines.add ": "
+  elif rawResults:
+    for ln in outp.split('\n'): outLines.add ln          # verbatim: org tables render as tables
   else:
     for ln in outp.split('\n'): outLines.add ": " & ln
   for i in removeTo ..< total: outLines.add app.ed.getLineText(i)
 
   app.ed.setText(outLines.join("\n"))
   app.ed.gotoLine(min(cur, app.ed.getLineCount() - 1), 0)
+  if fileOut.len == 0:                  # textual output: surface the session pane
+    app.sessionHidden = false           # (graphics blocks keep editor focus for the figure)
+    app.focus = "session"
   app.msg = "babel: ran " & (if lang.len > 0: lang else: "?") & " block"
   refreshObjects(app)
   app.runHooks("after-babel")
+
+proc srcBlockHeaderLines(app: App): seq[int] =
+  ## 0-based line indices of every `#+begin_src` / ```{r} header in the buffer.
+  let total = app.ed.getLineCount()
+  for i in 0 ..< total:
+    let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
+    if low.startsWith("#+begin_src") or low.startsWith("```{r"):
+      result.add i
+
+proc babelExecuteBuffer*(app: var App): string {.discardable.} =
+  ## Run every src block in the buffer, top to bottom, each in its own
+  ## `:session` -- the buffer-wide `C-c C-c`. Blocks are re-scanned each
+  ## iteration because inserting a block's `#+RESULTS` shifts the lines below
+  ## it. Returns a per-block report (also usable as the ctl `run-all` reply, so
+  ## a single call both runs the notebook and reports errors -- no external
+  ## watcher needed). Detected R/Python errors are flagged but do not stop the
+  ## run (later blocks may be independent).
+  let n = srcBlockHeaderLines(app).len
+  var okCount, errCount = 0
+  var report = "run-all: " & $n & " blocks\n"
+  for idx in 0 ..< n:
+    let headers = srcBlockHeaderLines(app)   # re-scan: earlier results shifted lines
+    if idx >= headers.len: break
+    let hdrLine = headers[idx]
+    app.ed.gotoLine(min(hdrLine + 2, app.ed.getLineCount()), 0)  # a body line
+    app.lastBlockOutput = ""
+    babelExecute(app)
+    let bad = "\nError" in ("\n" & app.lastBlockOutput) or
+              app.lastBlockOutput.startsWith("Error")
+    if bad: inc errCount else: inc okCount
+    report.add "  [" & (if bad: "ERR" else: "ok ") & "] block " & $(idx + 1) &
+               "/" & $n & " @line " & $(hdrLine + 1) & "\n"
+  app.msg = "run-all: " & $okCount & " ok, " & $errCount & " with errors (" &
+            $n & " blocks)"
+  report.add app.msg & "\n"
+  report
+
+proc babelExecuteBufferCmd*(app: var App) =
+  ## Command wrapper (M-x run-all / keybinding): run all blocks, leave the
+  ## summary in the status line.
+  discard babelExecuteBuffer(app)
 
 proc detectRebuildCmd*(): string =
   ## The command C-c r runs to rebuild wkbenchless. Prefer a toolchain bundled under
@@ -2137,6 +2333,41 @@ proc openTerminal*(app: var App; cmd: string) =
   app.focus = "session"
   app.msg = "terminal: " & label
 
+proc claudeSettingsPath*(): string = getCacheDir() / "wkbenchless" / "claude-settings.json"
+
+proc writeClaudeSettings*(): bool =
+  ## Write a `--settings` JSON whose Pre/PostToolUse hooks pop Claude's file
+  ## edits into THIS editor's diff pane by shelling `<self> edit-diff pre|post`.
+  ## Targeting is via the WKB_CTL_* env this instance exports, so the diff lands
+  ## in the launching editor. The self path is single-quoted for the shell and
+  ## JSON-escaped for the file (posix-focused).
+  let selfEsc = getAppFilename().multiReplace(("\\", "\\\\"), ("\"", "\\\""))
+  let pre  = "'" & selfEsc & "' edit-diff pre"
+  let post = "'" & selfEsc & "' edit-diff post"
+  let js =
+    "{\"hooks\":{" &
+    "\"PreToolUse\":[{\"matcher\":\"Edit|Write|MultiEdit\",\"hooks\":[" &
+      "{\"type\":\"command\",\"command\":\"" & pre & "\",\"timeout\":8}]}]," &
+    "\"PostToolUse\":[{\"matcher\":\"Edit|Write|MultiEdit\",\"hooks\":[" &
+      "{\"type\":\"command\",\"command\":\"" & post & "\",\"async\":true,\"timeout\":12}]}]" &
+    "}}"
+  try:
+    createDir(claudeSettingsPath().parentDir)
+    writeFile(claudeSettingsPath(), js)
+    result = true
+  except CatchableError: result = false
+
+proc withClaudeSettings*(cmd, settingsPath: string): string =
+  ## Insert `--settings <path>` after each leading `claude` in the (possibly
+  ## `||`-joined) launch command, leaving the rest of each segment intact.
+  var parts: seq[string]
+  for seg in cmd.split("||"):
+    var s = seg.strip()
+    if s.startsWith("claude"):
+      s = "claude --settings " & quoteShell(settingsPath) & s[len("claude") .. ^1]
+    parts.add s
+  parts.join(" || ")
+
 proc showPanel*(app: var App) =
   app.sessionHidden = false; app.focus = "session"; app.msg = "panel shown"
 
@@ -2314,6 +2545,7 @@ proc registerBuiltins*() =
   defcommand("quit", "Quit", quitCmd)
   defcommand("run-line", "Run current line in R (default session), skip to next", runLine)
   defcommand("babel-execute", "Org-babel: run this src block", babelExecute)
+  defcommand("run-all", "Org-babel: run every src block in the buffer, top to bottom", babelExecuteBufferCmd)
   defcommand("toggle-line-numbers", "Show/hide line numbers", proc(a: var App) =
     a.ed.showLineNumbers = not a.ed.showLineNumbers
     a.msg = (if a.ed.showLineNumbers: "line numbers on" else: "line numbers off"))
@@ -2334,6 +2566,7 @@ proc registerBuiltins*() =
   defcommand("scroll-right", "Scroll the view right (wide tables)", scrollRight)
   defcommand("scroll-left", "Scroll the view left", scrollLeft)
   defcommand("kill-buffer", "Kill the current buffer", killBuffer)
+  defcommand("revert-buffer", "Revert buffer to file on disk (discard unsaved edits)", revertBuffer)
   defcommand("zoom-in", "Increase font size", zoomIn)
   defcommand("zoom-out", "Decrease font size", zoomOut)
   defcommand("zoom-reset", "Reset font size", zoomReset)
@@ -2341,6 +2574,8 @@ proc registerBuiltins*() =
   defcommand("toggle-inline-images", "Images: toggle inline [[file:x.png]] rendering", toggleInlineImages)
   defcommand("latex-preview", "LaTeX: toggle inline previews of display math", latexPreview)
   defcommand("cancel", "Cancel / dismiss the palette or find overlay (C-g)", cancelOverlays)
+  defcommand("next-landmark", "Go to next section / src block / comment (org or Rmd)", nextLandmark)
+  defcommand("prev-landmark", "Go to previous section / src block / comment (org or Rmd)", prevLandmark)
   defcommand("next-chunk", "Go to the next src block", nextChunk)
   defcommand("prev-chunk", "Go to the previous src block", prevChunk)
   defcommand("criticmarkup-accept-all", "CriticMarkup: accept all tracked changes", criticAcceptAll)
@@ -2357,7 +2592,13 @@ proc registerBuiltins*() =
   defcommand("terminal", "Open a bash terminal in the bottom panel",
              proc(app: var App) = openTerminal(app, "bash --norc"))
   defcommand("claude", "Open claude in the bottom panel (continues last chat)",
-             proc(app: var App) = openTerminal(app, gClaudeCmd))
+             proc(app: var App) =
+               var cmd = gClaudeCmd
+               # Only inject --settings if the hooks file was actually written,
+               # so a failed write can never break the claude launch.
+               if gClaudeDiffHooks and writeClaudeSettings():
+                 cmd = withClaudeSettings(gClaudeCmd, claudeSettingsPath())
+               openTerminal(app, cmd))
   defcommand("show-panel", "Show the bottom panel", showPanel)
   defcommand("toggle-panel", "Show/hide the bottom panel", togglePanel)
   defcommand("recompile", "Recompile config & restart", recompileConfig)

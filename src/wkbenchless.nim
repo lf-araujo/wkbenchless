@@ -81,7 +81,7 @@ proc fitText(app: App; s: string; maxPx: int): string =
   ell
 
 proc drawPalette(app: App; area: Rect; lineH: int) =
-  let boxW = min(area.w - 80, 620)
+  let boxW = min(area.w - 60, 900)
   let bx = area.x + (area.w - boxW) div 2
   let by = area.y + 36
   let items = paletteEntries(app)
@@ -432,6 +432,8 @@ proc main() =
     let params = commandLineParams()
     let asCtl = params.len > 0 and params[0] == "ctl"
     let invoked = extractFilename(paramStr(0)).changeFileExt("")
+    if params.len > 0 and params[0] == "edit-diff":   # Claude Code hook entry point
+      quit(editDiff(params[1 .. ^1]))
     if asCtl or invoked == "wkbctl":
       when defined(windows):
         # A GUI-subsystem exe has no console; attach the parent terminal's so
@@ -729,8 +731,7 @@ proc main() =
     # --- header toolbar: chips that run commands, plus a [☰] menu -----------
     const tbBtns = [("Open", "open-file"), ("Save", "save"),
                     ("Export", "otd-export"), ("Find", "find"),
-                    ("▲", "prev-chunk"), ("▼", "next-chunk"),
-                    ("△", "prev-comment"), ("▽", "next-comment"),
+                    ("▲", "prev-landmark"), ("▼", "next-landmark"),
                     ("Edit", "src-edit-block")]
     const tbMenu = [("Save As\u2026", "save-as"),
                     ("Accept change", "criticmarkup-accept"),

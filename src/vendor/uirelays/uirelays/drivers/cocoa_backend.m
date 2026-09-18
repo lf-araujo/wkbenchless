@@ -477,6 +477,13 @@ int cocoa_loadImage(const char *path) {
   return idx + 1; /* 1-based handle */
 }
 
+void cocoa_getImageSize(int handle, int *outW, int *outH) {
+  int idx = handle - 1;
+  if (idx < 0 || idx >= imageCount || !imageSlots[idx]) { *outW = 0; *outH = 0; return; }
+  *outW = (int)CGImageGetWidth(imageSlots[idx]);
+  *outH = (int)CGImageGetHeight(imageSlots[idx]);
+}
+
 void cocoa_drawImage(int handle, int srcX, int srcY, int srcW, int srcH,
                      int dstX, int dstY, int dstW, int dstH) {
   int idx = handle - 1;
@@ -894,6 +901,18 @@ void cocoa_createWindow(int w, int h, int *outW, int *outH,
     /* Set up NSApplication */
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+    /* This backend creates exactly one NSWindow per process (see the static
+       mainWindow/mainView globals below) and has no concept of an in-process
+       "tab" -- so a window's close event just ends its process (NE_WINDOW_CLOSE
+       -> break in the Nim run loop). If the user opens more than one
+       wkbenchless window, macOS's automatic window tabbing (System Settings ->
+       Desktop & Dock -> "Prefer tabs when opening documents") will merge them
+       into one titlebar purely as OS chrome, even across separate process
+       launches. Each "tab" is then really a different process's window, and
+       closing one can take the tab group's UI down with it. Opt out globally
+       so every wkbenchless window is always a fully independent OS window. */
+    [NSWindow setAllowsAutomaticWindowTabbing:NO];
 
     /* Create menu bar (minimal: just app menu with Quit) */
     NSMenu *menubar = [[NSMenu alloc] init];

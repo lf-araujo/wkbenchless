@@ -1154,6 +1154,32 @@ proc foldAllBlocks*(s: var SynEdit) =
 
 proc unfoldAll*(s: var SynEdit) = s.foldedBlocks.setLen 0
 
+proc lineStartOf(s: SynEdit; offset: int): int =
+  ## Buffer offset of the start of the line containing `offset`.
+  var i = clamp(offset, 0, s.len)
+  while i > 0 and s[i-1] != '\L': dec i
+  i
+
+proc foldedRangeContaining(s: SynEdit; offset: int): Slice[int] =
+  ## The *folded* src-block range whose collapsed body contains `offset`,
+  ## or (-1 .. -1). Folds are display-only -- the text stays in the buffer --
+  ## so cursor motion and selection must hop over the hidden rows; this is how
+  ## up/down notice they have wandered inside a collapsed block. `r.a` is the
+  ## line-start of the #+begin_src line, which is the one row still drawn.
+  for r in s.srcBlockRanges:
+    if r.a in s.foldedBlocks and offset in r: return r
+  -1 .. -1
+
+proc offsetAtColumn(s: SynEdit; lineStart, col: int): int =
+  ## Offset `col` graphemes into the line beginning at `lineStart`, stopping
+  ## at end of line (mirrors the column walk in up/down).
+  var i = clamp(lineStart, 0, s.len)
+  var c = col
+  while i < s.len and c > 0 and s[i] != '\L':
+    i += s.graphemeLen(i)
+    dec c
+  i
+
 proc highlightOrg(s: var SynEdit; first, last: int) =
   ## Org-mode, fontified natively: #+directives / * headings / # and : lines
   ## get their own colour, and the body of a #+begin_src <lang> ... #+end_src
@@ -1422,6 +1448,11 @@ proc getLineFromOffset(s: SynEdit; pos: int): Natural =
 # start each time is O(n^2) on large files. Remembering the last resolved line
 # makes a forward pass O(n). Keyed by cacheId so edits invalidate it.
 var gLastLine, gLastLineOffset, gLastLineVersion: int
+var gCacheIdNext = 1        # globally unique: a fresh SynEdit must never alias
+                           # another object's cacheId (both start at 0), or the
+                           # sequential cache below would misread line offsets
+                           # across buffers (reproduced: opening buffer B right
+                           # after scrolling buffer A spliced A's text into B).
 
 proc getLineOffset(s: SynEdit; lines: Natural): int =
   var y = lines.int
@@ -1438,13 +1469,16 @@ proc getLineOffset(s: SynEdit; lines: Natural): int =
     y = lines.int - gLastLine
     if y == 0: return start   # the requested line is the cached one
   var result = start
-  while true:
+  while result < s.len:
     if s[result] == '\L':
       dec y
       if y == 0:
         inc result
         break
     inc result
+  # `lines` == the line AFTER a terminated buffer (the virtual empty line) or
+  # an unterminated final line: its offset is the end of the buffer.
+  if result > s.len: result = s.len
   gLastLine = lines.int
   gLastLineOffset = result
   gLastLineVersion = s.cacheId
@@ -1807,6 +1841,12 @@ proc up(s: var SynEdit; jump: bool) =
       s.scroll(-1)
       if not jump or notEmpty: break
   s.cursor = max(0, i).Natural
+  # Rising into a collapsed src block from below lands on a hidden body row;
+  # hop up to the one row still drawn -- its #+begin_src header line.
+  block:
+    let fr = s.foldedRangeContaining(s.cursor.int)
+    if fr.a >= 0 and s.lineStartOf(s.cursor.int) != fr.a:
+      s.cursor = s.offsetAtColumn(fr.a, col).Natural
   s.cursorMoved()
 
 proc down(s: var SynEdit; jump: bool) =
@@ -1824,6 +1864,12 @@ proc down(s: var SynEdit; jump: bool) =
     dec c
     s.cursor += 1
   if s.cursor > L: s.cursor = L.Natural
+  # Skip a collapsed src block: if we descended onto one of its hidden body
+  # rows, continue to the first visible line below the block.
+  block:
+    let fr = s.foldedRangeContaining(s.cursor.int)
+    if fr.a >= 0 and s.lineStartOf(s.cursor.int) != fr.a:
+      s.cursor = s.offsetAtColumn(min(fr.b + 1, s.len), col).Natural
   s.cursorMoved()
 
 proc home(s: var SynEdit) =
@@ -2073,7 +2119,11 @@ proc dedent(s: var SynEdit) =
       else: break
 
 proc gotoLine*(s: var SynEdit; line, col: int) =
-  let line = clamp(line - 1, 0, max(0, s.numberOfLines.int - 1))
+  # `numberOfLines` counts \L chars, not lines: an UNTERMINATED final line has
+  # index numberOfLines (in a terminated buffer that index is the virtual empty
+  # line). Clamping to numberOfLines - 1 made that line unreachable -- jumping to
+  # the last heading of a buffer without a trailing newline landed one short.
+  let line = clamp(line - 1, 0, max(0, s.numberOfLines.int))
   s.cursor = s.getLineOffset(line).Natural
   s.currentLine = line.Natural
   let span = if s.span > 0: s.span else: 30
@@ -2338,7 +2388,7 @@ proc clear*(s: var SynEdit) =
     if entry.img != Image(0):
       freeImage(entry.img)
   s.imageCache.setLen 0
-  inc s.cacheId
+  s.cacheId = gCacheIdNext; inc gCacheIdNext   # unique across SynEdit objects
   s.front.setLen 0
   s.back.setLen 0
   s.actions.setLen 0
@@ -3561,6 +3611,11 @@ proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
           if text.len > 0:
             putClipboardText(text)
             s.removeSelectedText()
+          else:
+            # Nothing selected: cut the whole current line (with its trailing
+            # newline), the CUA/Sublime reflex -- so C-x always cuts something.
+            putClipboardText(s.getLineText(s.currentLine.int) & "\n")
+            s.deleteLine()
       of KeyV:
         if ctrl:
           let text = getClipboardText()

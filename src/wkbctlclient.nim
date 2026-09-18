@@ -5,7 +5,7 @@
 ## Reads <cache>/wkbenchless/control.port ("port\ntoken"), connects, and sends
 ## "token\n<request>"; the token authenticates to the running editor.
 
-import std/[net, os, strutils, nativesockets]
+import std/[net, os, strutils, nativesockets, json, md5]
 
 when defined(windows):
   # winsock's shutdown(SD_SEND) to half-close the write side after the request.
@@ -21,11 +21,11 @@ proc buildRequest(args: seq[string]; req: var string): string =
   if args.len == 0:
     return "usage: ctl buffer|blocks|command <name>|eval [lang] [session]|\n" &
            "           set-buffer|insert <line>|replace <from> <to>|goto <line>|\n" &
-           "           run-block [line]|diff <old> <new> [title]|bib <query>\n" &
+           "           run-block [line]|run-all|diff <old> <new> [title]|bib <query>\n" &
            "           cite-goto <key>|open <path>|where|selection\n" &
            "  (verbs that take text read it from stdin)"
   case args[0]
-  of "buffer", "blocks":
+  of "buffer", "blocks", "run-all":
     req = args[0]
   of "command":
     if args.len < 2: return "ctl command <name>"
@@ -89,19 +89,28 @@ proc ctlClient*(args: seq[string]): int =
   if err.len > 0:
     stderr.writeLine err
     return 1
-  let pf = portPath()
-  if not fileExists(pf):
-    stderr.writeLine "wkbenchless is not running (no control port at " & pf & ")"
-    return 1
   var port = 0
   var token = ""
-  try:
-    let lines = readFile(pf).splitLines()
-    port = parseInt(lines[0].strip())
-    if lines.len > 1: token = lines[1].strip()
-  except CatchableError:
-    stderr.writeLine "bad control port file: " & pf
-    return 1
+  # Prefer this-instance coordinates from the env (exported by the launching
+  # editor), so a hook targets the editor Claude was launched from; otherwise
+  # fall back to the shared control.port file.
+  let envPort = getEnv("WKB_CTL_PORT")
+  let envTok  = getEnv("WKB_CTL_TOKEN")
+  if envPort.len > 0 and envTok.len > 0:
+    port = try: parseInt(envPort) except CatchableError: 0
+    token = envTok
+  else:
+    let pf = portPath()
+    if not fileExists(pf):
+      stderr.writeLine "wkbenchless is not running (no control port at " & pf & ")"
+      return 1
+    try:
+      let lines = readFile(pf).splitLines()
+      port = parseInt(lines[0].strip())
+      if lines.len > 1: token = lines[1].strip()
+    except CatchableError:
+      stderr.writeLine "bad control port file: " & pf
+      return 1
   var s = newSocket()
   try:
     s.connect("127.0.0.1", Port(port))
@@ -119,4 +128,34 @@ proc ctlClient*(args: seq[string]): int =
   s.close()
   stdout.write(resp)
   if resp.len > 0 and resp[^1] != '\n': stdout.write("\n")
+  return 0
+
+proc prediffDir(): string = getCacheDir() / "wkbenchless" / "prediff"
+
+proc editDiff*(args: seq[string]): int =
+  ## Hook entry point: `wkbenchless edit-diff pre|post`, fed a Claude Code hook
+  ## JSON payload on stdin. `pre` snapshots the file about to be edited; `post`
+  ## pops old->new into this instance's diff pane (targeted via WKB_CTL_*).
+  ## Always exits 0 -- a diff popup must never block or fail an edit.
+  let mode = if args.len > 0: args[0] else: ""
+  var fp = ""
+  try:
+    let j = parseJson(stdin.readAll())
+    fp = j{"tool_input", "file_path"}.getStr("")
+  except CatchableError: discard
+  if fp.len == 0: return 0
+  let snap = prediffDir() / getMD5(fp)
+  case mode
+  of "pre":
+    try:
+      createDir(prediffDir())
+      if fileExists(fp): copyFile(fp, snap)
+    except CatchableError: discard
+  of "post":
+    if not fileExists(fp): return 0
+    var old = snap
+    if not fileExists(old):                    # brand-new file: diff against empty
+      try: (createDir(prediffDir()); writeFile(snap, "")) except CatchableError: discard
+    discard ctlClient(@["diff", old, fp, "Claude edited " & extractFilename(fp)])
+  else: discard
   return 0

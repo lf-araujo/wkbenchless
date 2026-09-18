@@ -206,6 +206,10 @@ proc handle(app: var App; req: string): string =
     app.ed.gotoLine(ln + 1, 0)           # `ln` is 0-based; gotoLine is 1-based
     babelExecute(app)
     result = "ok: " & app.msg
+  of "run-all":                          # run EVERY src block, blocking, with a report
+    # Blocks until the whole notebook has run and returns a per-block summary,
+    # so one call both drives the run and reports errors -- no separate watcher.
+    result = babelExecuteBuffer(app)
   of "blocks":
     let total = app.ed.getLineCount()
     var i = 0
@@ -294,6 +298,12 @@ proc startControl*(): ControlServer =
     result.token = genToken()
     try: createDir(portPath().parentDir) except CatchableError: discard
     writeFile(portPath(), $port.int & "\n" & result.token & "\n")
+    # Export THIS instance's control coordinates into the process env so child
+    # terminals (notably the claude PTY) inherit them and target this editor's
+    # diff pane, rather than the shared control.port file that the newest
+    # instance overwrites.
+    putEnv("WKB_CTL_PORT", $port.int)
+    putEnv("WKB_CTL_TOKEN", result.token)
     when defined(posix):
       try: setFilePermissions(portPath(), {fpUserRead, fpUserWrite})
       except CatchableError: discard
