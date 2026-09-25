@@ -25,6 +25,39 @@ executes in the block's `:session`, respects its language, and **writes
 ```sh
 wkbctl run-block <line>     # <line> = the block's #+begin_src line (from `blocks`)
 ```
+Runs are **asynchronous** in the editor: `C-c C-c` / `run-block` queue the block
+in its session, `#+RESULTS:` shows `: [running: job N]` until it finishes, and
+the editor (and this socket) stay responsive however long it takes — there is no
+timeout. The CLI still *waits* for you by polling (`run-block`, `run-all` and
+`eval` return when their jobs finish); add `--async` to get the job id(s) at once.
+```sh
+wkbctl run-block 120 --async        # -> queued: job 7
+wkbctl jobs                         # id, state, label, elapsed for each job
+wkbctl status 7                     # state line, then the output once done
+wkbctl wait 7 8                     # block until those jobs finish, with a report
+wkbctl interrupt 7                  # Ctrl-C a running job / drop a queued one
+```
+Runs in one session execute in order (FIFO); different sessions run in parallel.
+While a run started over `wkbctl` is going, the bottom pane shows its session
+tab (output streams there live); it switches back to the terminal tab when the
+runs finish.
+
+### Dependencies, staleness and caching
+- Name blocks with `#+name:` and list what they need with `:depends a b` (org's
+  `:var x=a` also counts). A name with spaces is referenced with `_` for spaces.
+- Results carry a content hash, `#+RESULTS[<hash>]:`, over the code, header args
+  and the dependencies' hashes: editing a block makes everything downstream stale.
+- `wkbctl run-block <line> --deps` runs the block after its stale dependencies;
+  `wkbctl run-stale` runs every stale block (changed, or not yet run in the live
+  session -- e.g. after a restart); `--force` ignores `:cache`.
+- `:cache yes`: an unchanged block is not re-run. For R, the objects it assigns
+  are saved to `.wkb-cache/<hash>.RData` next to the file and restored when a
+  new session needs them, instead of refitting.
+- `wkbctl infer-deps` (palette: `infer-block-deps`) infers R dependencies from
+  the code (names read vs. assigned by earlier blocks) and rewrites the
+  `:depends` / `#+name:` headers; the change is shown in the diff pane. NSE
+  column names can add a spurious edge -- edit the header if so.
+
 Do **not** grep code out of a block and pipe it to `wkbctl eval` — that ignores
 the block's session/language and doesn't write results. Reserve `eval` for
 ad-hoc, throwaway code:

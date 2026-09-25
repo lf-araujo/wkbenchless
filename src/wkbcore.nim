@@ -10,10 +10,11 @@ import widgets/synedit          # our patched SynEdit (langR/langOrg, inline ima
 import wkbsession
 import wkblsp                    # pure std/json LSP client -- portable, no GTK
 import wkbref                    # reference context: prose/notes/paper by citekey
-import std/[tables, strutils, os, osproc, algorithm, times]
+import wkbblocks                 # src blocks as a dependency graph (hashes, :depends)
+import std/[tables, strutils, os, osproc, algorithm, times, sets, sequtils]
 when defined(posix): import std/posix
 
-export uirelays, synedit, wkbsession, wkblsp, wkbref   # config sees Event/SynEdit/ReplSpec/LspClient/gCorpusRoots/...
+export uirelays, synedit, wkbsession, wkblsp, wkbref, wkbblocks   # config sees Event/SynEdit/ReplSpec/LspClient/gCorpusRoots/...
   # uirelays + `synedit` above come from the vendored tree in src/vendor/uirelays
 
 type
@@ -23,9 +24,31 @@ type
     cmd*: string                         ## the shell command it runs
     started*: bool                       ## host has spawned the PTY at least once
 
+  JobKind* = enum jkBlock, jkEval, jkCacheLoad
+  AppJob* = object
+    ## An async run the editor tracks: a babel block (its results replace
+    ## `placeholder` in the buffer `filePath` when it finishes) or an ad-hoc eval.
+    kind*: JobKind
+    job*: RunJob
+    sessKey*: string                      ## app.sessions key that runs it
+    label*: string                        ## "r block @line 42" / "r eval"
+    filePath*: string                     ## target buffer (jkBlock)
+    placeholder*: string                  ## unique `#+RESULTS` line to replace
+    fileOut*: string                      ## `:file` graphics output, if any
+    rawResults*: bool
+    hash*: string                         ## block content hash ("" if none)
+    fromCtl*: bool                        ## started over the control socket (Claude)
+    applied*: bool                        ## results written back (or given up)
+
   App* = object
     ed*, sess*, objects*, help*: SynEdit
     sessions*: Table[string, Session]     ## key: langId & "/" & sessionName
+    jobs*: seq[AppJob]                    ## async runs: in flight + recent history
+    lastJobIds*: seq[int]                 ## ids queued by the last babel command
+    ranIn*: Table[string, HashSet[string]] ## session key -> block hashes run OK in it
+    ctlOrigin*: bool                      ## a control-socket request is being handled
+    ctlReturnTab*: int                    ## terminal tab to return to after ctl runs
+    ctlReturnSet*: bool                   ## ctlReturnTab is pending
     curLang*, curSession*: string         ## the session objects/help track
     docLang*: string                      ## the buffer's LSP languageId ("" = none)
     lsp*: Table[string, LspClient]        ## langId -> language server
@@ -91,7 +114,9 @@ type
     run*: proc(app: var App)
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
-  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent, pmSaveAs
+  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent,
+                   pmSaveAs, pmExport
+  ExportTarget* = tuple[id, label, cmd: string]   ## palette entry: id -> command
   SearchMode* = enum smFind, smReplace
   SearchField* = enum sfQuery, sfReplace
   VimMode* = enum vmNormal, vmInsert
@@ -146,6 +171,12 @@ var
 proc defcommand*(name, label: string; run: proc(app: var App)) =
   gCommands[name] = Command(label: label, run: run)
 proc bindkey*(chord, name: string) = gKeymap[chord] = name
+proc openPalette(app: var App; mode: PaletteMode)   # defined below; fwd for openExportPalette
+var gExportTargets*: seq[ExportTarget]   ## registered Export-button targets
+proc registerExport*(id, label, cmd: string) =
+  ## Add a target to the Export button's palette ("Export…" opens it).
+  gExportTargets.add (id, label, cmd)
+proc openExportPalette*(app: var App) = openPalette(app, pmExport)
 proc setReadingMargin*(ext: string; px: int) =
   ## Side margin (px) for files with this extension (no dot), e.g. "org", "rmd".
   gReadingMargins[ext.toLowerAscii] = px
@@ -347,7 +378,9 @@ proc getSession*(app: var App; lang, name: string; dir = ""): Session =
   let spec = if at >= 0 and at < name.len - 1: remoteSpec(base, name[at + 1 .. ^1], dir)
              else: base
   let s = startSession(spec)
-  if s != nil: app.sessions[key] = s
+  if s != nil:
+    app.sessions[key] = s
+    app.ranIn.del(key)            # a fresh REPL has none of the earlier blocks' state
   s
 
 const headerArgKeys = ["session", "dir", "results", "exports", "tangle", "eval",
@@ -675,6 +708,12 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
       let nm = extractFilename(p)
       if q.len == 0 or q in p.toLowerAscii:
         result.add (p, nm & "    " & p.parentDir)
+  of pmExport:
+    # registered export targets (docx, notebook-html, ...): id -> command.
+    # No match -> still show the list (the query is not a filter here), so the
+    # palette works like a menu.
+    for t in gExportTargets:
+      result.add (t.id, t.label)
 
 # -- objects / help panes --------------------------------------------------
 proc isWordChar(c: char): bool = c in {'a'..'z', 'A'..'Z', '0'..'9', '_', '.'}
@@ -705,6 +744,9 @@ proc refreshObjects*(app: var App) =
     app.objects.setText("(no objects query for " & lang & ")"); return
   let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
   if s == nil: app.objects.setText("(no session)"); return
+  if s.busy:                     # a synchronous query would eat the job's output
+    app.objects.setText("Objects [" & lang & "/" & app.curSession & "]\n(session busy)")
+    return
   let outp = s.runBlock(gObjectsQuery[lang], quiet = true)   # keep off the terminal
   app.objects.setText("Objects [" & lang & "/" & app.curSession & "]\n" &
                       (if strutils.strip(outp).len > 0: outp else: "(none)"))
@@ -717,6 +759,7 @@ proc showHelp*(app: var App) =
     app.help.setText("(no help query for " & lang & ")"); return
   let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
   if s == nil: app.help.setText("(no session)"); return
+  if s.busy: app.help.setText("Help: " & w & "\n\n(session busy -- try again when the run finishes)"); return
   let outp = cleanOverstrike(s.runBlock(gHelpQuery[lang].replace("{word}", w), quiet = true))
   app.help.setText("Help: " & w & "\n\n" & outp)
   app.msg = "help: " & w
@@ -883,6 +926,8 @@ proc runTarget(app: var App): tuple[lang, session: string; stopAt: int; ok: bool
     return (app.curLang, app.curSession, app.ed.getLineCount(), true)          # 3.
   result.ok = false
 
+proc submitEval*(app: var App; lang, name, code: string): int   # fwd: async queue, below
+
 proc runLine*(app: var App) =
   ## Ctrl+Enter: send the current statement to the session for the language in
   ## context -- the enclosing src block's `:session`, else the file's own
@@ -902,13 +947,11 @@ proc runLine*(app: var App) =
     code.add app.ed.getLineText(last)
   if strutils.strip(code).len > 0:
     app.curLang = lang; app.curSession = session    # make this the current tab
-    let s = getSession(app, lang, session)
-    if s == nil:
+    let id = submitEval(app, lang, session, code)   # queued: never blocks the editor
+    if id == 0:
       app.msg = "could not start " & lang & " session"
       return
-    discard s.runBlock(code)          # output scrolls live in the session terminal
-    app.msg = "ran line in " & lang & "/" & session
-    refreshObjects(app)
+    app.msg = "sent line to " & lang & "/" & session & " (job " & $id & ")"
   # Advance to the next non-blank line so repeated C-Enter flows through the code
   # (bounded by stopAt, so inside a block we stop at #+end_src / the closing fence).
   var nxt = last + 1
@@ -1918,7 +1961,248 @@ proc ensureSshMaster(app: var App; host: string): bool =
   app.msg = "log in to " & host & " in the terminal, then run the block again"
   false
 
-proc babelExecute*(app: var App) =
+const runningPrefix* = ": [running: job "   ## placeholder line while a block runs
+
+proc resultLines(outp, fileOut: string; rawResults: bool): seq[string] =
+  ## The body of a `#+RESULTS:` element for this output.
+  if fileOut.len > 0:
+    result.add "[[file:" & fileOut & "]]"
+  elif strutils.strip(outp).len == 0:
+    if not rawResults: result.add ": "
+  elif rawResults:
+    for ln in outp.split('\n'): result.add ln          # verbatim: org tables render as tables
+  else:
+    for ln in outp.split('\n'): result.add ": " & ln
+
+proc replacePlaceholder(ed: var SynEdit; placeholder: string;
+                        repl: seq[string]): bool =
+  ## Swap the unique placeholder line for `repl`, keeping the cursor on the same
+  ## text (lines below the placeholder shift by the size difference).
+  let total = ed.getLineCount()
+  var idx = -1
+  for i in 0 ..< total:
+    if ed.getLineText(i) == placeholder: idx = i; break
+  if idx < 0: return false
+  let curLine = ed.currentLine
+  let curCol = ed.currentCol
+  var lines: seq[string]
+  for i in 0 ..< idx: lines.add ed.getLineText(i)
+  lines.add repl
+  for i in idx + 1 ..< total: lines.add ed.getLineText(i)
+  ed.setText(lines.join("\n"))
+  let line = if curLine > idx: curLine + repl.len - 1 else: curLine
+  ed.gotoLine(min(line, ed.getLineCount() - 1) + 1, curCol)
+  ed.markChanged()
+  true
+
+proc blockTable*(app: App): seq[BlockInfo] =
+  ## The buffer's org src blocks with names, dependencies and current hashes
+  ## (document `header-args` defaults included, as babel applies them).
+  var lines: seq[string]
+  var defaults: Table[string, seq[string]]
+  for i in 0 ..< app.ed.getLineCount():
+    let ln = app.ed.getLineText(i)
+    lines.add ln
+    let low = strutils.strip(ln).toLowerAscii
+    if low.startsWith("#+begin_src"):
+      let t = strutils.splitWhitespace(low)
+      if t.len >= 2 and not defaults.hasKey(t[1]): defaults[t[1]] = headerArgTokens(app, t[1])
+  result = parseBlocks(lines, defaults)
+  discard computeHashes(result)
+
+proc blockAtLine*(blocks: seq[BlockInfo]; line: int): int =
+  ## Index of the block whose begin_src..end_src span holds 0-based `line`, or -1.
+  for b in blocks:
+    if line >= b.header and line <= b.endLine: return b.idx
+  -1
+
+proc isFresh*(app: App; b: BlockInfo): bool =
+  ## Up to date: its results came from this exact code (and dependencies) AND it
+  ## has run successfully in the live session, so its objects exist there.
+  b.storedHash.len > 0 and b.storedHash == b.hash and
+    b.hash in app.ranIn.getOrDefault(b.lang & "/" & b.session)
+
+proc hasErrorOutput*(outp: string): bool = "\nError" in ("\n" & outp)
+
+proc cacheDir*(app: App): string =
+  ## Where `:cache yes` R blocks keep their objects: .wkb-cache/ next to the file.
+  if app.filePath.len > 0: parentDir(absolutePath(app.filePath)) / ".wkb-cache"
+  else: getTempDir() / "wkb-cache"
+
+proc rStr(s: string): string =
+  ## An R string literal.
+  "\"" & s.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
+
+proc rSaveSnippet(srcFile, rdata: string): string =
+  ## Appended to a `:cache yes` R block: save every object the block assigns
+  ## (found from its parse tree, as the dependency inference does) so a later
+  ## cache hit can restore them instead of re-running -- e.g. after a crash.
+  "local({\n" & rAssignedFn & "\n  .wkb_nm <- intersect(assigned(parse(" & rStr(srcFile) &
+    ", keep.source = FALSE)), ls(globalenv(), all.names = TRUE))\n" &
+    "  save(list = .wkb_nm, envir = globalenv(), file = " & rStr(rdata) & ")\n})\n"
+
+proc noteCtlJob(app: var App; sessKey: string) =
+  ## A run started over the control socket (Claude in a terminal tab): show its
+  ## session so the output is visible, and remember the tab to return to.
+  if not app.ctlOrigin: return
+  if not app.ctlReturnSet and app.termActive >= 0:
+    app.ctlReturnTab = app.termActive
+    app.ctlReturnSet = true
+  let parts = sessKey.split('/')
+  app.termActive = -1
+  app.curLang = parts[0]
+  app.curSession = if parts.len > 1: parts[1] else: "default"
+  app.sessionHidden = false
+  app.termScroll = 0
+
+proc maybeReturnTab(app: var App): bool =
+  ## Back to the terminal (Claude) once every control-socket run has finished.
+  if not app.ctlReturnSet: return false
+  for aj in app.jobs:
+    if aj.fromCtl and not aj.applied: return false
+  app.ctlReturnSet = false
+  if app.ctlReturnTab >= 0 and app.ctlReturnTab < app.terminals.len:
+    app.termActive = app.ctlReturnTab
+  true
+
+proc noteRan(app: var App; aj: AppJob) =
+  ## A block's code ran without errors in this session: it is fresh there.
+  if aj.hash.len == 0 or aj.job.state != jsDone or hasErrorOutput(aj.job.output): return
+  app.ranIn.mgetOrPut(aj.sessKey, initHashSet[string]()).incl aj.hash
+
+proc finishBabelJob(app: var App; aj: var AppJob) =
+  ## Write a finished block's results into its buffer -- the active one or a
+  ## background buffer (the user may have switched files while it ran).
+  let outp = aj.job.output
+  let repl = resultLines(outp, aj.fileOut, aj.rawResults)
+  var placed = false
+  if app.filePath == aj.filePath:
+    placed = replacePlaceholder(app.ed, aj.placeholder, repl)
+  else:
+    for i in 0 ..< app.buffers.len:
+      if app.buffers[i].filePath == aj.filePath:
+        placed = replacePlaceholder(app.buffers[i].ed, aj.placeholder, repl)
+        break
+  aj.applied = true
+  app.lastBlockOutput = outp
+  let what = "job " & $aj.job.id & " (" & aj.label & ")"
+  app.msg =
+    if not placed: what & " finished, but its results placeholder is gone"
+    elif aj.job.state == jsInterrupted: what & " interrupted"
+    else: "babel: ran " & what
+  app.runHooks("after-babel")
+
+proc pollJobs*(app: var App): bool =
+  ## Host loop, every frame: advance every session's runs without blocking and
+  ## deliver finished ones. Returns true if anything finished (redraw).
+  var done: seq[RunJob]
+  for s in app.sessions.values:           # collect first: finishing runs hooks
+    done.add pollSession(s)
+  if done.len == 0: return maybeReturnTab(app)
+  for j in done:
+    for i in 0 ..< app.jobs.len:
+      if app.jobs[i].job == j and not app.jobs[i].applied:
+        app.sess.appendOutput("# " & app.jobs[i].label & " [job " & $j.id & "]\n" &
+                              j.output & "\n")
+        noteRan(app, app.jobs[i])
+        if app.jobs[i].kind == jkBlock:
+          var aj = app.jobs[i]
+          finishBabelJob(app, aj)
+          app.jobs[i] = aj
+        else:
+          app.jobs[i].applied = true
+          if app.jobs[i].kind == jkCacheLoad:
+            app.msg = "job " & $j.id & " (" & app.jobs[i].label & ") " &
+                      (if hasErrorOutput(j.output): "failed" else: "restored cached objects")
+        break
+  # Keep a bounded history of finished jobs for `ctl status`.
+  var keep: seq[AppJob]
+  var finished = 0
+  for i in countdown(app.jobs.high, 0):
+    if app.jobs[i].applied:
+      inc finished
+      if finished > 200: continue
+    keep.insert(app.jobs[i], 0)
+  app.jobs = keep
+  let cs = currentSession(app)
+  if cs != nil and not cs.busy: refreshObjects(app)
+  discard maybeReturnTab(app)
+  true
+
+proc findJob(app: var App; id: int): int =
+  for i, aj in app.jobs:
+    if aj.job.id == id: return i
+  -1
+
+proc submitEval*(app: var App; lang, name, code: string): int =
+  ## Queue ad-hoc code in a session (ctl eval / Ctrl-Enter); returns the job id,
+  ## or 0 if no session could be started.
+  let s = getSession(app, lang, name)
+  if s == nil: return 0
+  let j = s.submit(code)
+  app.jobs.add AppJob(kind: jkEval, job: j, sessKey: lang.toLowerAscii & "/" & name,
+                      label: lang.toLowerAscii & " eval [" & name & "]",
+                      fromCtl: app.ctlOrigin)
+  noteCtlJob(app, lang.toLowerAscii & "/" & name)
+  j.id
+
+proc jobStateName(st: JobState): string =
+  case st
+  of jsQueued: "queued"
+  of jsRunning: "running"
+  of jsDone: "done"
+  of jsInterrupted: "interrupted"
+
+proc jobLine(aj: AppJob): string =
+  let j = aj.job
+  let t = if j.started == 0: 0.0
+          elif j.finished > 0: j.finished - j.started
+          else: epochTime() - j.started
+  $j.id & "\t" & jobStateName(j.state) & "\t" & aj.label & "\t" &
+    formatFloat(t, ffDecimal, 1) & "s"
+
+proc jobStatus*(app: var App; id: int): string =
+  ## `ctl status <id>`: "<id>\t<state>\t<label>\t<secs>", then the output once
+  ## the job has finished.
+  let i = findJob(app, id)
+  if i < 0: return $id & "\tunknown"
+  result = jobLine(app.jobs[i])
+  if app.jobs[i].job.state in {jsDone, jsInterrupted}:
+    result.add "\n" & app.jobs[i].job.output
+
+proc jobsSummary*(app: App): string =
+  ## `ctl jobs`: one line per tracked job, oldest first.
+  for aj in app.jobs: result.add jobLine(aj) & "\n"
+  if result.len == 0: result = "(no jobs)"
+
+proc runningJobsLabel*(app: App): string =
+  ## Short status-bar text while anything is queued or running, else "".
+  var running, queued = 0
+  for aj in app.jobs:
+    case aj.job.state
+    of jsRunning: inc running
+    of jsQueued: inc queued
+    else: discard
+  if running + queued == 0: return ""
+  $running & " running" & (if queued > 0: ", " & $queued & " queued" else: "")
+
+proc interruptJob*(app: var App; id: int): string =
+  ## Stop a queued or running job; a block's placeholder becomes the partial
+  ## output plus "(interrupted)".
+  let i = findJob(app, id)
+  if i < 0: return "unknown job " & $id
+  if app.jobs[i].job.state in {jsDone, jsInterrupted}: return "job " & $id & " already finished"
+  let s = if app.sessions.hasKey(app.jobs[i].sessKey): app.sessions[app.jobs[i].sessKey] else: nil
+  if s == nil or s.interrupt(id) == nil: return "job " & $id & " not found in its session"
+  if app.jobs[i].kind == jkBlock:
+    var aj = app.jobs[i]
+    finishBabelJob(app, aj)
+    app.jobs[i] = aj
+  else: app.jobs[i].applied = true
+  "ok: interrupted job " & $id
+
+proc babelExecuteImpl(app: var App; force: bool) =
+  ## C-c C-c: queue the src block at the cursor. `force` ignores `:cache yes`.
   let total = app.ed.getLineCount()
   let cur = app.ed.currentLine
   var b = -1
@@ -2034,18 +2318,62 @@ proc babelExecute*(app: var App) =
     if gType.len > 0: devArgs.add ", type=\"" & gType & "\""
     body = dev & "(" & devArgs & ")\n" & body & "\ntry(dev.off(), silent=TRUE)\n"
 
-  # User blocks can fit models that stay silent for a while (Hessian, CIs);
-  # tolerate long silences before the reader gives up (the nonce makes even a
-  # timed-out run safe for the next one).
-  let outp = s.runBlock(body, timeoutMs = 600_000)
-  app.lastBlockOutput = outp
-  app.sess.appendOutput("# " & (if lang.len > 0: lang else: "?") &
-                        " [" & sessName & "]\n" & outp & "\n")
-
+  # A block whose previous run is still going keeps its placeholder: queuing it
+  # again would overwrite that line and leave the first run nowhere to land.
   var p = e + 1
   while p < total and strutils.strip(app.ed.getLineText(p)).len == 0: inc p
+  let hasResults = p < total and
+    strutils.strip(app.ed.getLineText(p)).toLowerAscii.startsWith("#+results")   # also #+RESULTS[hash]:
+  if hasResults and p + 1 < total and app.ed.getLineText(p + 1).startsWith(runningPrefix):
+    app.msg = "block already running (" &
+              strutils.strip(app.ed.getLineText(p + 1)).strip(chars = {':', ' ', '[', ']'}) & ")"
+    return
+
+  # Content hash (org blocks; Rmd chunks keep plain results): code + header args
+  # + the hashes of its :depends/:var dependencies, stored in #+RESULTS[hash].
+  let sessKey = lang.toLowerAscii & "/" & sessName
+  var bi: BlockInfo
+  var haveInfo = false
+  if not isRmd:
+    for x in blockTable(app):
+      if x.header == b: bi = x; haveInfo = true; break
+  let isR = lang.toLowerAscii == "r"
+  let rdata = if haveInfo: cacheDir(app) / (bi.hash & ".RData") else: ""
+  # `:cache yes` and unchanged since its results were made: don't re-run it.
+  # If the session lacks its objects (restarted, crashed), an R block reloads
+  # them from its cache file instead; one never saved there simply runs.
+  if haveInfo and bi.cache and not force and hasResults and bi.storedHash == bi.hash:
+    if bi.hash in app.ranIn.getOrDefault(sessKey) or not isR:
+      app.msg = "cache hit: results up to date (babel-execute-force re-runs it)"
+      return
+    if fileExists(rdata):
+      let lj = s.submit("load(" & rStr(rdata) & ", envir = globalenv())\n")
+      app.jobs.add AppJob(kind: jkCacheLoad, job: lj, sessKey: sessKey,
+                          label: "r cache load @line " & $(b + 1), hash: bi.hash,
+                          filePath: app.filePath, fromCtl: app.ctlOrigin)
+      app.lastJobIds.add lj.id
+      noteCtlJob(app, sessKey)
+      app.msg = "cache hit: restoring the block's objects (job " & $lj.id & ")"
+      return
+  if haveInfo and bi.cache and isR:
+    # Keep the block's code next to its objects: the save snippet parses it to
+    # find what the block assigns.
+    try:
+      createDir(cacheDir(app))
+      let src = cacheDir(app) / (bi.hash & ".R")
+      writeFile(src, dedentBody(bodyLines))
+      body.add "\n" & rSaveSnippet(src, rdata)
+    except CatchableError:
+      app.msg = "cache: cannot write " & cacheDir(app)
+
+  # Queue the run and return at once: the results land when the job finishes
+  # (pollJobs, from the host loop), so long model fits no longer freeze the
+  # editor and there is no silence timeout. Until then #+RESULTS holds a unique
+  # placeholder line that finishBabelJob replaces.
+  let job = s.submit(body)
+  let placeholder = runningPrefix & $job.id & "]"
   var removeTo = e + 1
-  if p < total and strutils.strip(app.ed.getLineText(p)).toLowerAscii.startsWith("#+results:"):
+  if hasResults:
     inc p
     # Remove the whole previous results element, not just `:`-prefixed lines, so
     # `[[file:...]]` links and raw org tables are replaced instead of stacking.
@@ -2059,25 +2387,155 @@ proc babelExecute*(app: var App) =
   var outLines: seq[string]
   for i in 0 .. e: outLines.add app.ed.getLineText(i)
   outLines.add ""
-  outLines.add "#+RESULTS:"
-  if fileOut.len > 0:
-    outLines.add "[[file:" & fileOut & "]]"
-  elif strutils.strip(outp).len == 0:
-    if not rawResults: outLines.add ": "
-  elif rawResults:
-    for ln in outp.split('\n'): outLines.add ln          # verbatim: org tables render as tables
-  else:
-    for ln in outp.split('\n'): outLines.add ": " & ln
+  outLines.add(if haveInfo: "#+RESULTS[" & bi.hash & "]:" else: "#+RESULTS:")
+  outLines.add placeholder
   for i in removeTo ..< total: outLines.add app.ed.getLineText(i)
 
   app.ed.setText(outLines.join("\n"))
-  app.ed.gotoLine(min(cur, app.ed.getLineCount() - 1), 0)
-  if fileOut.len == 0:                  # textual output: surface the session pane
-    app.sessionHidden = false           # (graphics blocks keep editor focus for the figure)
-    app.focus = "session"
-  app.msg = "babel: ran " & (if lang.len > 0: lang else: "?") & " block"
-  refreshObjects(app)
-  app.runHooks("after-babel")
+  app.ed.gotoLine(min(cur, app.ed.getLineCount() - 1) + 1, 0)   # gotoLine is 1-based
+  app.jobs.add AppJob(kind: jkBlock, job: job,
+                      sessKey: lang.toLowerAscii & "/" & sessName,
+                      label: (if lang.len > 0: lang else: "?") & " block @line " & $(b + 1),
+                      filePath: app.filePath, placeholder: placeholder,
+                      fileOut: fileOut, rawResults: rawResults,
+                      hash: (if haveInfo: bi.hash else: ""), fromCtl: app.ctlOrigin)
+  app.lastJobIds.add job.id
+  noteCtlJob(app, sessKey)
+  if fileOut.len == 0:                  # textual output: show the live session pane,
+    app.sessionHidden = false           # but keep typing in the editor while it runs
+  app.msg = "babel: queued " & (if lang.len > 0: lang else: "?") & " block (job " &
+            $job.id & ")"
+
+proc babelExecute*(app: var App) = babelExecuteImpl(app, false)
+proc babelExecuteForce*(app: var App) = babelExecuteImpl(app, true)
+
+proc queueBlockAt(app: var App; idx: int; force: bool) =
+  ## Queue block `idx` (re-located: earlier placeholders shift lines).
+  let blocks = blockTable(app)
+  if idx < 0 or idx >= blocks.len: return
+  app.ed.gotoLine(blocks[idx].header + 2, 0)   # 1-based: the first body line
+  babelExecuteImpl(app, force)
+
+proc queuedReply(app: App): string = "queued: jobs " & app.lastJobIds.mapIt($it).join(" ")
+
+proc babelExecuteDeps*(app: var App): string {.discardable.} =
+  ## Run the block at the cursor after its transitive dependencies (`:depends`,
+  ## `:var`), dependencies first; dependencies already fresh in the session are
+  ## skipped (make-style). Returns the ctl reply.
+  let cur = app.ed.currentLine
+  let blocks = blockTable(app)
+  let target = blockAtLine(blocks, cur)
+  if target < 0:
+    app.msg = "not in a src block"; return "error: not in a src block"
+  var problems: seq[string]
+  let order = dependencyOrder(blocks, target, problems)
+  if problems.len > 0:
+    app.msg = "deps: " & problems[0]; return "error: " & problems.join("; ")
+  app.lastJobIds.setLen(0)
+  var skipped = 0
+  for idx in order:
+    let bs = blockTable(app)
+    if idx != target and isFresh(app, bs[idx]): inc skipped; continue
+    queueBlockAt(app, idx, false)
+  let bs = blockTable(app)
+  app.ed.gotoLine(bs[target].header + 2, 0)
+  app.msg = "deps: queued " & $app.lastJobIds.len & " job(s); " & $skipped &
+            " dependenc" & (if skipped == 1: "y" else: "ies") & " already up to date"
+  queuedReply(app)
+
+proc babelExecuteDepsCmd(app: var App) = discard babelExecuteDeps(app)
+
+proc runStale*(app: var App): string {.discardable.} =
+  ## Queue every block that is not fresh -- its code or a dependency changed
+  ## since its results were made, or it has not run in the live session (e.g.
+  ## after a restart) -- top to bottom. Cached R blocks restore from disk.
+  let cur = app.ed.currentLine
+  app.lastJobIds.setLen(0)
+  let n = blockTable(app).len
+  var stale = 0
+  for idx in 0 ..< n:
+    let bs = blockTable(app)
+    if idx >= bs.len: break
+    if not gRepls.hasKey(bs[idx].lang) or isFresh(app, bs[idx]): continue
+    inc stale
+    queueBlockAt(app, idx, false)
+  app.ed.gotoLine(min(cur, app.ed.getLineCount() - 1) + 1, 0)
+  app.msg = "run-stale: " & $stale & " of " & $n & " blocks stale, " &
+            $app.lastJobIds.len & " job(s) queued"
+  queuedReply(app)
+
+proc runStaleCmd(app: var App) = discard runStale(app)
+
+proc inferBlockDeps*(app: var App): string {.discardable.} =
+  ## Infer each R block's dependencies from what it reads and what earlier
+  ## blocks (same session) assign, then rewrite the `:depends` header args --
+  ## naming the blocks that are depended on (`#+name:`) where needed. The change
+  ## is shown in the diff pane; undo by editing (or reverting) as usual.
+  let blocks = blockTable(app)
+  var rIdx: seq[int]
+  var bodies: seq[string]
+  for b in blocks:
+    if b.lang == "r":
+      rIdx.add b.idx; bodies.add b.body
+  if rIdx.len == 0:
+    app.msg = "infer-block-deps: no R blocks"; return app.msg
+  var err = ""
+  let found = rSymbols(bodies, err)
+  if err.len > 0:
+    app.msg = "infer-block-deps: " & err; return app.msg
+  var syms = newSeq[SymInfo](blocks.len)
+  for k, i in rIdx: syms[i] = found[k]
+  let inferred = inferDepends(blocks, syms, ["r"])
+  var names = newSeq[string](blocks.len)
+  var taken: HashSet[string]
+  for b in blocks:
+    names[b.idx] = b.name
+    if b.name.len > 0: taken.incl b.name
+  for deps in inferred:
+    for j in deps:
+      if names[j].len == 0:
+        names[j] = suggestName(blocks[j], syms[j], taken)
+        taken.incl names[j]
+  var lines: seq[string]
+  for i in 0 ..< app.ed.getLineCount(): lines.add app.ed.getLineText(i)
+  let old = lines.join("\n")
+  var headers, named = 0
+  for i in countdown(blocks.high, 0):           # bottom-up: insertions keep indices valid
+    let b = blocks[i]
+    if b.lang != "r" or not syms[i].ok: continue
+    let ln = lines[b.header]
+    let indent = ln[0 ..< ln.len - ln.strip(trailing = false).len]
+    let toks = strutils.splitWhitespace(ln)
+    var keep: seq[string]
+    var k = 0
+    while k < toks.len:
+      if toks[k] == ":depends":
+        inc k
+        while k < toks.len and not toks[k].startsWith(":"): inc k
+      else:
+        keep.add toks[k]; inc k
+    if inferred[i].len > 0:
+      keep.add ":depends"
+      for j in inferred[i]: keep.add refName(names[j])
+    let newLn = indent & keep.join(" ")
+    if newLn != ln:
+      lines[b.header] = newLn; inc headers
+    if b.name.len == 0 and names[i].len > 0:
+      lines.insert(indent & "#+name: " & names[i], b.header); inc named
+  let newText = lines.join("\n")
+  if newText == old:
+    app.msg = "infer-block-deps: headers already match (" & $rIdx.len & " R blocks)"
+    return app.msg
+  let curLine = app.ed.currentLine
+  app.ed.setText(newText)
+  app.ed.markChanged()
+  app.ed.gotoLine(min(curLine, app.ed.getLineCount() - 1) + 1, 0)
+  showDiff(app, old, newText, "infer-block-deps")
+  app.msg = "infer-block-deps: " & $headers & " header(s) updated, " & $named &
+            " block(s) named (" & $rIdx.len & " R blocks)"
+  app.msg
+
+proc inferBlockDepsCmd(app: var App) = discard inferBlockDeps(app)
 
 proc srcBlockHeaderLines(app: App): seq[int] =
   ## 0-based line indices of every `#+begin_src` / ```{r} header in the buffer.
@@ -2088,32 +2546,24 @@ proc srcBlockHeaderLines(app: App): seq[int] =
       result.add i
 
 proc babelExecuteBuffer*(app: var App): string {.discardable.} =
-  ## Run every src block in the buffer, top to bottom, each in its own
+  ## Queue every src block in the buffer, top to bottom, each in its own
   ## `:session` -- the buffer-wide `C-c C-c`. Blocks are re-scanned each
-  ## iteration because inserting a block's `#+RESULTS` shifts the lines below
-  ## it. Returns a per-block report (also usable as the ctl `run-all` reply, so
-  ## a single call both runs the notebook and reports errors -- no external
-  ## watcher needed). Detected R/Python errors are flagged but do not stop the
-  ## run (later blocks may be independent).
+  ## iteration because each block's `#+RESULTS` placeholder shifts the lines
+  ## below it. Runs in the same session execute in buffer order (the session
+  ## queue is FIFO); different sessions run in parallel. Returns
+  ## "queued: jobs <id> <id> ..." (the ctl `run-all` reply: the client waits on
+  ## those ids and reports errors per block).
   let n = srcBlockHeaderLines(app).len
-  var okCount, errCount = 0
-  var report = "run-all: " & $n & " blocks\n"
+  var ids: seq[string]
   for idx in 0 ..< n:
-    let headers = srcBlockHeaderLines(app)   # re-scan: earlier results shifted lines
+    let headers = srcBlockHeaderLines(app)   # re-scan: placeholders shifted lines
     if idx >= headers.len: break
-    let hdrLine = headers[idx]
-    app.ed.gotoLine(min(hdrLine + 2, app.ed.getLineCount()), 0)  # a body line
-    app.lastBlockOutput = ""
+    app.ed.gotoLine(min(headers[idx] + 2, app.ed.getLineCount()), 0)  # a body line
+    app.lastJobIds.setLen(0)
     babelExecute(app)
-    let bad = "\nError" in ("\n" & app.lastBlockOutput) or
-              app.lastBlockOutput.startsWith("Error")
-    if bad: inc errCount else: inc okCount
-    report.add "  [" & (if bad: "ERR" else: "ok ") & "] block " & $(idx + 1) &
-               "/" & $n & " @line " & $(hdrLine + 1) & "\n"
-  app.msg = "run-all: " & $okCount & " ok, " & $errCount & " with errors (" &
-            $n & " blocks)"
-  report.add app.msg & "\n"
-  report
+    for id in app.lastJobIds: ids.add $id
+  app.msg = "run-all: queued " & $ids.len & " of " & $n & " blocks"
+  "queued: jobs " & ids.join(" ")
 
 proc babelExecuteBufferCmd*(app: var App) =
   ## Command wrapper (M-x run-all / keybinding): run all blocks, leave the
@@ -2151,6 +2601,8 @@ proc writeHandoff(app: var App): string =
         let parts = key.split('/')
         blob.add "S\t" & $s.pty.master & "\t" & $s.pty.pid & "\t" &
                  parts[0] & "\t" & (if parts.len > 1: parts[1] else: "default") & "\n"
+        for h in app.ranIn.getOrDefault(key):   # what already ran there stays fresh
+          blob.add "H\t" & key & "\t" & h & "\n"
     for i, t in app.terminals:
       if t.pty.alive:
         discard fcntl(t.pty.master, F_SETFD, 0.cint)
@@ -2176,13 +2628,19 @@ proc adoptHandoff*(app: var App): tuple[terminals: seq[Terminal]; active: int] =
     removeFile(path); delEnv("WKB_HANDOFF")
     for line in blob.splitLines():
       let f = line.split('\t')
+      if f.len == 3 and f[0] == "H":
+        app.ranIn.mgetOrPut(f[1], initHashSet[string]()).incl f[2]
+        continue
       if f.len < 5: continue
       let fd = cint(parseInt(f[1]))
       discard fcntl(fd, F_SETFL, O_NONBLOCK)
       discard fcntl(fd, F_SETFD, FD_CLOEXEC)             # re-arm for the next reload
       if f[0] == "S" and gRepls.hasKey(f[3]):
-        app.sessions[f[3] & "/" & f[4]] =
-          Session(pty: Pty(master: fd, pid: Pid(parseInt(f[2]))), spec: gRepls[f[3]])
+        let sess = Session(pty: Pty(master: fd, pid: Pid(parseInt(f[2]))), spec: gRepls[f[3]])
+        # Re-define the run driver so a reload also upgrades it in live sessions
+        # (the REPL reads it once it is idle; its echo is filtered from the pane).
+        sess.pty.feed(sess.spec.prime)
+        app.sessions[f[3] & "/" & f[4]] = sess
       elif f[0] == "T":
         let idx = (if f.len > 4: (try: parseInt(f[4]) except: -1) else: -1)
         result.terminals.add Terminal(
@@ -2230,6 +2688,10 @@ proc recompileConfig*(app: var App) =
     app.msg = "recompile: only implemented on POSIX so far"
     return
   else:
+    let busy = runningJobsLabel(app)
+    if busy.len > 0:              # jobs are not handed off: their results would be lost
+      app.msg = "recompile: jobs in progress (" & busy & ") -- wait, or interrupt them first"
+      return
     app.msg = "recompiling..."
     # Rebuild from a directory that actually has the source (see resolveBuildDir).
     # When the binary was `nimble install`ed, getAppDir() can be a binary-only
@@ -2541,10 +3003,15 @@ proc registerBuiltins*() =
     "except Exception as _e:\n    print('no help for {word}:', _e)\n"
 
   defcommand("save", "Save", saveCmd)
+  defcommand("export", "Export this buffer (choose target: docx, html, ...)", openExportPalette)
   defcommand("save-as", "Save the buffer to a new path", saveAsCmd)
   defcommand("quit", "Quit", quitCmd)
   defcommand("run-line", "Run current line in R (default session), skip to next", runLine)
   defcommand("babel-execute", "Org-babel: run this src block", babelExecute)
+  defcommand("babel-execute-force", "Org-babel: run this src block, ignoring :cache", babelExecuteForce)
+  defcommand("babel-execute-deps", "Org-babel: run this block after its (stale) dependencies", babelExecuteDepsCmd)
+  defcommand("run-stale", "Org-babel: run every stale block (code/deps changed, or not run in this session)", runStaleCmd)
+  defcommand("infer-block-deps", "Org-babel: infer R block dependencies, update :depends / #+name headers", inferBlockDepsCmd)
   defcommand("run-all", "Org-babel: run every src block in the buffer, top to bottom", babelExecuteBufferCmd)
   defcommand("toggle-line-numbers", "Show/hide line numbers", proc(a: var App) =
     a.ed.showLineNumbers = not a.ed.showLineNumbers

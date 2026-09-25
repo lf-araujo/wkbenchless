@@ -16,7 +16,7 @@
 ## 127.0.0.1:<port> and sends "token\n<request>". The token keeps another local
 ## user from port-scanning the socket (parity with the old unix-socket perms).
 
-import std/[strutils, tables, net, nativesockets, os, random]
+import std/[sequtils, strutils, tables, net, nativesockets, os, random]
 when defined(posix): import std/posix
 import wkbcore
 
@@ -137,7 +137,7 @@ proc citeGoto(app: var App; key: string): string =
       inc i
   "cite-goto: key not found: " & key
 
-proc handle(app: var App; req: string): string =
+proc handleImpl(app: var App; req: string): string =
   let nl = req.find('\n')
   let header = (if nl >= 0: req[0 ..< nl] else: req).strip()
   let body = if nl >= 0: req[nl + 1 .. ^1] else: ""
@@ -150,9 +150,11 @@ proc handle(app: var App; req: string): string =
     let sess = if parts.len > 2 and parts[2].len > 0: parts[2] else: "default"
     let code = if body.len > 0: body elif parts.len > 3: parts[3] else: ""
     if strutils.strip(code).len == 0: return "(no code)"
-    let s = getSession(app, lang, sess)
-    if s == nil: return "(no session for '" & lang & "')"
-    result = s.runBlock(code)
+    # Queued, never blocking: the client polls `status <id>` for the output, so
+    # the editor (and this socket) stay live while the code runs.
+    let id = submitEval(app, lang, sess, code)
+    if id == 0: return "(no session for '" & lang & "')"
+    result = "queued: job " & $id
   of "command":
     if parts.len > 1 and gCommands.hasKey(parts[1]):
       app.msg = ""
@@ -196,20 +198,40 @@ proc handle(app: var App; req: string): string =
   of "run-block":                        # run the src block at/containing 1-based <line>
     # Position + run in ONE request (so the cursor is right when babel runs), the
     # editor's own C-c C-c: executes in the block's :session and writes #+RESULTS.
-    var ln = (if parts.len > 1: (try: parseInt(parts[1]) except: 1) else:
-                app.ed.currentLine + 1) - 1
+    var ln = (if parts.len > 1 and parts[1].len > 0: (try: parseInt(parts[1]) except: 1)
+              else: app.ed.currentLine + 1) - 1
     ln = clamp(ln, 0, app.ed.getLineCount() - 1)
     # `blocks` reports the header line; babel wants a body line.
     let low = strutils.strip(app.ed.getLineText(ln)).toLowerAscii
     if low.startsWith("#+begin_src") or low.startsWith("```"):
       ln = min(ln + 1, app.ed.getLineCount() - 1)
     app.ed.gotoLine(ln + 1, 0)           # `ln` is 0-based; gotoLine is 1-based
-    babelExecute(app)
-    result = "ok: " & app.msg
-  of "run-all":                          # run EVERY src block, blocking, with a report
-    # Blocks until the whole notebook has run and returns a per-block summary,
-    # so one call both drives the run and reports errors -- no separate watcher.
+    let flags = if parts.len > 2: parts[2] else: ""
+    app.lastJobIds.setLen(0)
+    if "--deps" in flags:                # the block after its stale dependencies
+      result = babelExecuteDeps(app)
+      if result.startsWith("queued") and app.lastJobIds.len == 0:
+        result = "error: " & app.msg     # e.g. a :cache hit with nothing to do
+    else:
+      if "--force" in flags: babelExecuteForce(app) else: babelExecute(app)
+      # Queued, not run: reply with the job id(s) at once (the client waits on them).
+      result = if app.lastJobIds.len > 0: "queued: jobs " & app.lastJobIds.mapIt($it).join(" ")
+               else: "ok: " & app.msg      # nothing to run (cache hit) or an error
+  of "run-all":                          # queue EVERY src block; reply with the job ids
     result = babelExecuteBuffer(app)
+  of "run-stale":                        # queue the stale blocks only (make-style)
+    result = runStale(app)
+    if app.lastJobIds.len == 0: result = "ok: " & app.msg
+  of "infer-deps":                       # infer R :depends headers from the code
+    result = "ok: " & inferBlockDeps(app)
+  of "status":                           # status\t<id>: state line, then output once done
+    let id = if parts.len > 1: (try: parseInt(parts[1]) except: 0) else: 0
+    result = jobStatus(app, id)
+  of "jobs":                             # every tracked job, one line each
+    result = jobsSummary(app)
+  of "interrupt":                        # interrupt\t<id>: Ctrl-C a running job / drop a queued one
+    let id = if parts.len > 1: (try: parseInt(parts[1]) except: 0) else: 0
+    result = interruptJob(app, id)
   of "blocks":
     let total = app.ed.getLineCount()
     var i = 0
@@ -273,6 +295,13 @@ proc handle(app: var App; req: string): string =
     result = if sel.len > 0: sel else: "(no selection)"
   else:
     result = "unknown verb: " & parts[0]
+
+proc handle(app: var App; req: string): string =
+  ## Requests arrive from agents/scripts (Claude in a terminal tab): runs they
+  ## start show their session tab and return to the terminal when done.
+  app.ctlOrigin = true
+  try: result = handleImpl(app, req)
+  finally: app.ctlOrigin = false
 
 proc portPath*(): string = getCacheDir() / "wkbenchless" / "control.port"
 

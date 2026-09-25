@@ -97,6 +97,7 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     of pmThemes: "theme: "
     of pmOrg: "org: "
     of pmRecent: "recent: "
+    of pmExport: "export: "
   # Scroll the visible window so the selection stays in view.
   var top = 0
   if app.paletteSel >= maxRows: top = app.paletteSel - maxRows + 1
@@ -195,6 +196,11 @@ proc paletteAccept(app: var App) =
   of pmRecent:
     app.paletteActive = false
     openFile(app, id)
+  of pmExport:
+    app.paletteActive = false
+    for t in gExportTargets:
+      if t.id == id and gCommands.hasKey(t.cmd):
+        gCommands[t.cmd].run(app); break
   of pmSaveAs:
     if app.paletteQuery.len > 0 and not dirExists(app.paletteDir / app.paletteQuery):
       app.paletteActive = false
@@ -625,6 +631,7 @@ proc main() =
     block:                                    # drain the live pane's pty each frame
       let ap = activePtyPtr()
       if ap != nil and pump(ap[]): needRedraw = true   # new terminal/session output
+    if pollJobs(app): needRedraw = true       # async babel/eval runs finished
     if poll(ctrl, app): needRedraw = true     # a wkbctl / agent request touched state
     if autoRevertActive(app): needRedraw = true  # buffer reloaded from disk
 
@@ -730,7 +737,7 @@ proc main() =
 
     # --- header toolbar: chips that run commands, plus a [☰] menu -----------
     const tbBtns = [("Open", "open-file"), ("Save", "save"),
-                    ("Export", "otd-export"), ("Find", "find"),
+                    ("Export", "export"), ("Find", "find"),
                     ("▲", "prev-landmark"), ("▼", "next-landmark"),
                     ("Edit", "src-edit-block")]
     const tbMenu = [("Save As\u2026", "save-as"),
@@ -741,7 +748,7 @@ proc main() =
                     ("Mark DONE", "criticmarkup-mark-done"),
                     ("Clean DONE", "criticmarkup-clean-done"),
                     ("Increase font", "zoom-in"), ("Decrease font", "zoom-out")]
-    const iconCmds = ["open-file", "save", "otd-export", "find",   # hand-drawn icons
+    const iconCmds = ["open-file", "save", "export", "find",   # hand-drawn icons
                       "src-edit-block"]
     var toolbarRects: seq[tuple[r: Rect; cmd, label: string]]
     var bufferTabRects: seq[tuple[r: Rect; idx: int; xr: Rect]]  # tab body + its [x]
@@ -1126,9 +1133,11 @@ proc main() =
         if not app.vimEnabled: ""
         elif app.vimMode == vmInsert: "-- INSERT --   "
         else: "-- NORMAL --   "
+      let jobsTag = runningJobsLabel(app)
       discard drawText(app.font, sr.x + 6, sr.y,
         "  wkbenchless   " & vimTag & name & dirty & "   " &
         $(app.ed.currentLine + 1) & ":" & $(app.ed.currentCol + 1) &
+        (if jobsTag.len > 0: "   [jobs: " & jobsTag & "]" else: "") &
         "   " & app.msg,
         statusFg, statusBg)
 
@@ -1154,7 +1163,7 @@ proc main() =
           for k in 0 .. 2: fillRect(rect(bx, by + k * 5, 14, 2), cfg)
         of "open-file":   drawOpenIcon(it.r, cfg)
         of "save":        drawSaveIcon(it.r, cfg)
-        of "otd-export":  drawExportIcon(it.r, cfg)
+        of "export":      drawExportIcon(it.r, cfg)
         of "find":        drawFindIcon(it.r, cfg)
         of "src-edit-block": drawEditIcon(it.r, cfg)
         else:

@@ -24,6 +24,8 @@ type
   Pty* = object
     outbuf*: string       ## line-log (REPL sessions; ANSI-stripped at draw)
     vt*: VTerm            ## screen-grid emulator (standalone terminal); nil for sessions
+    tapping*: bool        ## an async session job is in flight: `drain` also feeds `tap`
+    tap*: string          ## raw output since the in-flight job started (wkbsession)
     when defined(windows):
       hpc: Handle         ## pseudo-console
       hproc: Handle       ## child process
@@ -343,6 +345,10 @@ proc drain*(t: var Pty): int =
         t.vt.write(chunk)
       else:
         for i in 0 ..< n: t.outbuf.add b[i]
+        # Whoever drains (the live pane's pump or the job poller), the in-flight
+        # async job sees every byte -- a single reader, no race for the output.
+        if t.tapping:
+          for i in 0 ..< n: t.tap.add b[i]
     elif n < 0: return -1                        # dead
     else: break                                 # nothing more right now
   total

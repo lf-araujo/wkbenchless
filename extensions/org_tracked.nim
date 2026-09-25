@@ -822,3 +822,4 @@ proc otdExport(app: var App) =
 proc extend*(app: var App) =
   defcommand("otd-import", "Tracked: import .docx -> org (CriticMarkup)", otdImport)
   defcommand("otd-export", "Tracked: export org (CriticMarkup) -> .docx", otdExport)
+  registerExport("docx", "Word document (.docx, tracked changes)", "otd-export")
