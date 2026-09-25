@@ -103,12 +103,25 @@ type
     diffL*, diffR*: seq[string]           ## aligned old / new lines
     diffLK*, diffRK*: seq[char]           ## per row: ' ' same, '-' removed, '+' added
     diffScroll*: int
+    diffPath*: string                     ## file the diff is about ("" if unknown)
+    diffJumpLine*: int                    ## 0-based line of the first change in it
+    diffTokens*: bool                     ## word-level inline view (prose) vs side-by-side
+    diffInline*: seq[InlineRow]           ## the word-level view's content
+    diffSerial*: int                      ## bumps on every showDiff (layout cache key)
+    diffShownAt*: float                   ## epochTime the diff appeared
+    diffPinned*: bool                     ## user interacted: no auto-close
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
     orgSaved*: seq[string]                ## the org document, by line
     orgFilePath*: string
     editRanges*: seq[tuple[a, b, indent: int]]  ## body ranges [a,b) in orgSaved
+  InlineRow* = object
+    ## One paragraph of the word-level diff: segments of (text, kind) with kind
+    ## '=' unchanged, '-' removed, '+' added ("\n" inside text breaks the line);
+    ## or a gap marker for `gap` unchanged lines that are not shown.
+    segs*: seq[tuple[text: string; kind: char]]
+    gap*: int
   Command* = object
     label*: string
     run*: proc(app: var App)
@@ -1594,13 +1607,104 @@ proc lineDiff(a, b: seq[string]): tuple[l, r: seq[string]; lk, rk: seq[char]] =
   while i < n: (result.l.add a[i]; result.r.add ""; result.lk.add '-'; result.rk.add ' '; inc i)
   while j < m: (result.l.add ""; result.r.add b[j]; result.lk.add ' '; result.rk.add '+'; inc j)
 
-proc showDiff*(app: var App; oldText, newText, title: string) =
-  ## Populate and open the side-by-side diff view.
+var gDiffAutoClose* = 20.0   ## seconds an untouched diff stays up (0 = until closed)
+
+proc diffTokenize*(s: string): seq[string] =
+  ## Words, whitespace runs, single punctuation, and "\n" as its own token.
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    var j = i + 1
+    if c == '\n': discard
+    elif c in {' ', '\t'}:
+      while j < s.len and s[j] in {' ', '\t'}: inc j
+    elif c.isAlphaNumeric or c == '_' or ord(c) >= 128:
+      while j < s.len and (s[j].isAlphaNumeric or s[j] == '_' or ord(s[j]) >= 128): inc j
+    result.add s[i ..< j]
+    i = j
+
+proc tokenDiff(a, b: string): seq[tuple[text: string; kind: char]] =
+  ## Word-level LCS of two texts, merged into runs of equal / removed / added.
+  let x = diffTokenize(a)
+  let y = diffTokenize(b)
+  proc push(r: var seq[tuple[text: string; kind: char]]; t: string; k: char) =
+    if r.len > 0 and r[^1].kind == k: r[^1].text.add t else: r.add (t, k)
+  if x.len * y.len > 4_000_000:                  # too big for LCS: whole-block change
+    if a.len > 0: result.push(a, '-')
+    if b.len > 0: result.push(b, '+')
+    return
+  let n = x.len
+  let m = y.len
+  var dp = newSeq[seq[int32]](n + 1)
+  for i in 0 .. n: dp[i] = newSeq[int32](m + 1)
+  for i in countdown(n - 1, 0):
+    for j in countdown(m - 1, 0):
+      dp[i][j] = if x[i] == y[j]: dp[i+1][j+1] + 1 else: max(dp[i+1][j], dp[i][j+1])
+  var i = 0
+  var j = 0
+  while i < n and j < m:
+    if x[i] == y[j]: (result.push(x[i], '='); inc i; inc j)
+    elif dp[i+1][j] >= dp[i][j+1]: (result.push(x[i], '-'); inc i)
+    else: (result.push(y[j], '+'); inc j)
+  while i < n: (result.push(x[i], '-'); inc i)
+  while j < m: (result.push(y[j], '+'); inc j)
+
+proc inlineRows(d: tuple[l, r: seq[string]; lk, rk: seq[char]]; context = 2): seq[InlineRow] =
+  ## Word-level view: each run of changed lines becomes one paragraph diffed by
+  ## token, with `context` unchanged lines around it; the rest collapse to gaps.
+  let n = d.l.len
+  var changed = newSeq[bool](n)
+  for k in 0 ..< n: changed[k] = d.lk[k] == '-' or d.rk[k] == '+'
+  var show = newSeq[bool](n)
+  for k in 0 ..< n:
+    if changed[k]:
+      for c in max(0, k - context) .. min(n - 1, k + context): show[c] = true
+  var k = 0
+  var gap = 0
+  while k < n:
+    if not show[k]:
+      inc gap; inc k; continue
+    if gap > 0: (result.add InlineRow(gap: gap); gap = 0)
+    if not changed[k]:
+      result.add InlineRow(segs: @[(d.l[k], '=')]); inc k; continue
+    var olds, news: seq[string]
+    while k < n and changed[k]:
+      if d.lk[k] == '-': olds.add d.l[k]
+      if d.rk[k] == '+': news.add d.r[k]
+      inc k
+    result.add InlineRow(segs: tokenDiff(olds.join("\n"), news.join("\n")))
+  if gap > 0: result.add InlineRow(gap: gap)
+
+proc isProsePath(p: string): bool =
+  p.toLowerAscii.splitFile.ext in [".org", ".md", ".markdown", ".txt", ".rmd", ".qmd", ".tex"]
+
+proc showDiff*(app: var App; oldText, newText, title: string; path = "") =
+  ## Populate and open the diff view: word-level for prose (org/markdown/text),
+  ## side-by-side for code (`t` toggles). It opens at the first change, and
+  ## unless the user touches it, closes itself after gDiffAutoClose seconds.
   let d = lineDiff(oldText.splitLines(), newText.splitLines())
   app.diffL = d.l; app.diffR = d.r; app.diffLK = d.lk; app.diffRK = d.rk
   app.diffTitle = if title.len > 0: title else: "diff"
-  app.diffScroll = 0
+  app.diffPath = path
+  app.diffTokens = isProsePath(if path.len > 0: path else: title) or
+                   (path.len == 0 and app.ed.lang == langOrg)
+  app.diffInline = inlineRows(d)
+  inc app.diffSerial
+  # First change: scroll the side-by-side view there, and remember its line in
+  # the NEW text so closing the diff puts the editor cursor on it.
+  var first = -1
+  var newLine = 0
+  app.diffJumpLine = -1
+  for k in 0 ..< d.l.len:
+    if d.lk[k] == '-' or d.rk[k] == '+':
+      if first < 0:
+        first = k
+        app.diffJumpLine = newLine
+    if d.lk[k] != '-': inc newLine               # the row has a line in the new text
+  app.diffScroll = if app.diffTokens: 0 else: max(0, first - 3)
   app.diffActive = true
+  app.diffPinned = false
+  app.diffShownAt = epochTime()
   app.focus = "diff"
   var adds, dels = 0
   for k in d.lk: (if k == '-': inc dels)
@@ -1608,16 +1712,36 @@ proc showDiff*(app: var App; oldText, newText, title: string) =
   app.msg = "diff: " & app.diffTitle & "  +" & $adds & " -" & $dels & "  (Esc to close)"
 
 proc closeDiff*(app: var App) =
+  ## Close the diff and, if it was about the active buffer, put the cursor on
+  ## the change.
+  let path = app.diffPath
+  let jump = app.diffJumpLine
   app.diffActive = false
   app.diffL = @[]; app.diffR = @[]; app.diffLK = @[]; app.diffRK = @[]
+  app.diffInline = @[]
   if app.focus == "diff": app.focus = "editor"
+  if path.len > 0 and jump >= 0 and app.filePath.len > 0 and
+     (try: absolutePath(app.filePath) == absolutePath(path) except CatchableError: false):
+    app.ed.gotoLine(min(jump, app.ed.getLineCount() - 1) + 1, 0)
+
+proc diffAutoClose*(app: var App): bool =
+  ## Host loop: close an untouched diff after gDiffAutoClose seconds.
+  if not app.diffActive or app.diffPinned or gDiffAutoClose <= 0: return false
+  if epochTime() - app.diffShownAt < gDiffAutoClose: return false
+  closeDiff(app)
+  app.msg = "diff closed (untouched for " & $int(gDiffAutoClose) & "s)"
+  true
+
+proc diffSecondsLeft*(app: App): int =
+  if app.diffPinned or gDiffAutoClose <= 0: -1
+  else: max(0, int(gDiffAutoClose - (epochTime() - app.diffShownAt) + 0.999))
 
 proc diffBuffer*(app: var App) =
   ## Diff the current buffer against its saved on-disk version.
   if app.filePath.len == 0 or not fileExists(app.filePath):
     app.msg = "no saved file to diff against"; return
   showDiff(app, readFile(app.filePath), app.ed.fullText(),
-           extractFilename(app.filePath) & " (disk -> buffer)")
+           extractFilename(app.filePath) & " (disk -> buffer)", app.filePath)
 
 proc killBufferAt*(app: var App; idx: int) =
   ## Kill the buffer at `idx` (0-based), guarding unsaved work like killBuffer.
@@ -2530,7 +2654,7 @@ proc inferBlockDeps*(app: var App): string {.discardable.} =
   app.ed.setText(newText)
   app.ed.markChanged()
   app.ed.gotoLine(min(curLine, app.ed.getLineCount() - 1) + 1, 0)
-  showDiff(app, old, newText, "infer-block-deps")
+  showDiff(app, old, newText, "infer-block-deps", app.filePath)
   app.msg = "infer-block-deps: " & $headers & " header(s) updated, " & $named &
             " block(s) named (" & $rIdx.len & " R blocks)"
   app.msg

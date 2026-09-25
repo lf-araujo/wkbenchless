@@ -430,6 +430,42 @@ proc drawEditIcon(r: Rect; c: Color) =          # a pencil (tip lower-left, eras
   drawLine(ix + 9, iy + 2, ix + 10, iy + 1, c)
   drawLine(ix + 11, iy + 4, ix + 12, iy + 3, c)
 
+type DiffPiece = tuple[x: int; text: string; kind: char]
+var gDiffLayoutKey = (-1, -1)            ## (diffSerial, width) the cache was built for
+var gDiffLayout: seq[seq[DiffPiece]]
+
+proc diffLayout(app: App; width: int): seq[seq[DiffPiece]] =
+  ## Wrap the word-level diff to `width` px: one entry per screen line, each a
+  ## run of pieces (x offset, text, kind '=' / '-' / '+' / 'g' for gaps).
+  if gDiffLayoutKey == (app.diffSerial, width): return gDiffLayout
+  var lines: seq[seq[DiffPiece]]
+  var cur: seq[DiffPiece]
+  var x = 0
+  proc flush() =
+    lines.add cur
+    cur = @[]
+    x = 0
+  for row in app.diffInline:
+    if row.gap > 0:
+      if cur.len > 0: flush()
+      lines.add @[(0, "\u22EF " & $row.gap & " unchanged line" &
+                      (if row.gap == 1: "" else: "s") & " \u22EF", 'g')]
+      continue
+    for seg in row.segs:
+      for tok in diffTokenize(seg.text):
+        if tok == "\n": flush(); continue
+        let w = measureText(app.font, tok).w
+        let blank = tok.strip().len == 0
+        if x > 0 and x + w > width and not blank: flush()
+        if x == 0 and blank and seg.kind == '=': continue   # no leading space after a wrap
+        if cur.len > 0 and cur[^1].kind == seg.kind: cur[^1].text.add tok
+        else: cur.add (x, tok, seg.kind)
+        x += w
+    flush()
+  gDiffLayoutKey = (app.diffSerial, width)
+  gDiffLayout = lines
+  lines
+
 proc main() =
   # Multi-call binary: `wkbenchless ctl <verb...>` -- or the binary invoked as
   # `wkbctl` (e.g. via a symlink) -- runs the control client and exits, so
@@ -599,6 +635,7 @@ proc main() =
   # safe. needRedraw starts true so the first frame paints.
   var needRedraw = true
   var lastBlink = epochTime()
+  var lastDiffTick = 0.0
   while app.running:
     let livePane = not app.sessionHidden and
                    (app.termActive >= 0 or currentSession(app) != nil)
@@ -632,6 +669,9 @@ proc main() =
       let ap = activePtyPtr()
       if ap != nil and pump(ap[]): needRedraw = true   # new terminal/session output
     if pollJobs(app): needRedraw = true       # async babel/eval runs finished
+    if diffAutoClose(app): needRedraw = true  # an untouched diff times out
+    if app.diffActive and not app.diffPinned and epochTime() - lastDiffTick >= 1.0:
+      needRedraw = true; lastDiffTick = epochTime()   # tick the countdown
     if poll(ctrl, app): needRedraw = true     # a wkbctl / agent request touched state
     if autoRevertActive(app): needRedraw = true  # buffer reloaded from disk
 
@@ -662,7 +702,13 @@ proc main() =
       # keys are swallowed so the hidden buffer isn't edited. Mouse events pass
       # through (so you can click the session pane), and once focus is the
       # session, this is skipped -- you keep talking to the terminal/Claude.
-      if e.kind == KeyDownEvent and e.key in {KeyEsc, KeyQ}: closeDiff(app)
+      if e.kind == KeyDownEvent:
+        if e.key in {KeyEsc, KeyQ}: closeDiff(app)
+        else:
+          app.diffPinned = true               # touched: it stays until Esc/q
+          if e.key == KeyT:                   # word-level <-> side-by-side
+            app.diffTokens = not app.diffTokens
+            app.diffScroll = 0
       if e.kind in {KeyDownEvent, TextInputEvent}: consumed = true
     if not consumed and suppressText:
       suppressText = false
@@ -901,39 +947,63 @@ proc main() =
       let charW = max(1, measureText(app.font, "0").w)
       fillRect(r, bg)
       fillRect(rect(r.x, r.y, r.w, lineH), app.theme.tabBarBg)
+      let left = diffSecondsLeft(app)
       discard drawText(app.font, r.x + 6, r.y,
-        "DIFF  " & app.diffTitle & "     Esc/q close · wheel scroll",
+        "DIFF  " & app.diffTitle & "     " &
+        (if app.diffTokens: "words" else: "side-by-side") & " (t) · Esc/q close · wheel scroll" &
+        (if left >= 0: " · closes in " & $left & "s unless touched" else: " · pinned"),
         app.theme.chipActiveFg, app.theme.tabBarBg)
       let bodyY = r.y + lineH
       let rows = max(1, (r.h - lineH) div lineH)
-      if e.kind == MouseWheelEvent and lastMouse.x >= r.x and lastMouse.x < r.x + r.w and
-         lastMouse.y >= r.y and lastMouse.y < r.y + r.h:
+      let overDiff = lastMouse.x >= r.x and lastMouse.x < r.x + r.w and
+                     lastMouse.y >= r.y and lastMouse.y < r.y + r.h
+      if overDiff and e.kind in {MouseWheelEvent, MouseDownEvent}:
+        app.diffPinned = true                 # touched: it stays until Esc/q
+      if e.kind == MouseWheelEvent and overDiff:
         app.diffScroll += e.y * 3
-      let total = app.diffL.len
-      app.diffScroll = max(0, min(app.diffScroll, max(0, total - rows)))
-      let colW = (r.w - 4) div 2
-      let leftX = r.x
-      let rightX = r.x + colW + 4
       let redFg = app.theme.ed.fg[TokenClass.Red]
       let greenFg = app.theme.ed.fg[TokenClass.Green]
       let removedBg = blend(bg, redFg, 22)
       let addedBg = blend(bg, greenFg, 22)
       let gapBg = blend(bg, app.theme.dimFg, 12)
-      fillRect(rect(r.x + colW + 1, bodyY, 2, r.h - lineH), app.theme.dividerColor)
-      var y = bodyY
-      for idx in app.diffScroll ..< min(total, app.diffScroll + rows):
-        let lk = app.diffLK[idx]; let rk = app.diffRK[idx]
-        let lbg = if lk == '-': removedBg elif rk == '+': gapBg else: bg
-        let rbg = if rk == '+': addedBg elif lk == '-': gapBg else: bg
-        let lfg = if lk == '-': redFg else: app.theme.ed.fg[TokenClass.None]
-        let rfg = if rk == '+': greenFg else: app.theme.ed.fg[TokenClass.None]
-        fillRect(rect(leftX, y, colW, lineH), lbg)
-        fillRect(rect(rightX, y, r.x + r.w - rightX, lineH), rbg)
-        discard drawText(app.font, leftX + 4, y,
-          (if lk == '-': "- " else: "  ") & app.diffL[idx], lfg, lbg)
-        discard drawText(app.font, rightX + 4, y,
-          (if rk == '+': "+ " else: "  ") & app.diffR[idx], rfg, rbg)
-        y += lineH
+      if app.diffTokens:
+        # Word-level: one column, paragraphs wrapped to the pane, removed words
+        # red and added words green in place; unchanged stretches collapse.
+        let layout = diffLayout(app, r.w - 16)
+        app.diffScroll = max(0, min(app.diffScroll, max(0, layout.len - rows)))
+        var y = bodyY
+        for li in app.diffScroll ..< min(layout.len, app.diffScroll + rows):
+          for piece in layout[li]:
+            let (fg, pbg) = case piece.kind
+              of '-': (redFg, removedBg)
+              of '+': (greenFg, addedBg)
+              of 'g': (app.theme.dimFg, gapBg)
+              else: (app.theme.ed.fg[TokenClass.None], bg)
+            if pbg != bg:
+              fillRect(rect(r.x + 8 + piece.x, y, measureText(app.font, piece.text).w, lineH), pbg)
+            discard drawText(app.font, r.x + 8 + piece.x, y, piece.text, fg, pbg)
+          y += lineH
+      else:
+        let total = app.diffL.len
+        app.diffScroll = max(0, min(app.diffScroll, max(0, total - rows)))
+        let colW = (r.w - 4) div 2
+        let leftX = r.x
+        let rightX = r.x + colW + 4
+        fillRect(rect(r.x + colW + 1, bodyY, 2, r.h - lineH), app.theme.dividerColor)
+        var y = bodyY
+        for idx in app.diffScroll ..< min(total, app.diffScroll + rows):
+          let lk = app.diffLK[idx]; let rk = app.diffRK[idx]
+          let lbg = if lk == '-': removedBg elif rk == '+': gapBg else: bg
+          let rbg = if rk == '+': addedBg elif lk == '-': gapBg else: bg
+          let lfg = if lk == '-': redFg else: app.theme.ed.fg[TokenClass.None]
+          let rfg = if rk == '+': greenFg else: app.theme.ed.fg[TokenClass.None]
+          fillRect(rect(leftX, y, colW, lineH), lbg)
+          fillRect(rect(rightX, y, r.x + r.w - rightX, lineH), rbg)
+          discard drawText(app.font, leftX + 4, y,
+            (if lk == '-': "- " else: "  ") & app.diffL[idx], lfg, lbg)
+          discard drawText(app.font, rightX + 4, y,
+            (if rk == '+': "+ " else: "  ") & app.diffR[idx], rfg, rbg)
+          y += lineH
     elif cells.hasKey("editor"):
       editorRect = cells["editor"]
       block:                           # per-extension reading margin: the editor

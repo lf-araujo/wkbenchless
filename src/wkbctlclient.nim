@@ -93,7 +93,9 @@ proc buildRequest(args: seq[string]; req: var string): string =
   of "diff":
     if args.len < 3: return "ctl diff <oldfile> <newfile> [title]"
     let title = if args.len > 3: args[3] else: extractFilename(args[2])
-    req = "diff\t" & title & "\n" & readFile(args[1]) & "\x1e" & readFile(args[2])
+    # the new file's path lets the editor jump to the change when the diff closes
+    req = "diff\t" & title & "\t" & absolutePath(args[2]) & "\n" &
+          readFile(args[1]) & "\x1e" & readFile(args[2])
   else:
     return "unknown verb: " & args[0]
 

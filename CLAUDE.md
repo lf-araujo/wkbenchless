@@ -77,6 +77,12 @@ editor area; the terminal stays live):
 ```sh
 git show HEAD:path/file > /tmp/old && wkbctl diff /tmp/old path/file "what changed"
 ```
+Prose files (.org/.md/.txt/.tex) open in a word-level view (removed words red,
+added green, unchanged stretches collapsed); code opens side-by-side at the
+first change (`t` toggles). An untouched diff closes itself after 20 s
+(`gDiffAutoClose`, 0 = never); any key, scroll or click pins it until Esc/q.
+Closing it puts the editor cursor on the change when the diff is about the
+active buffer (the client sends the new file's path).
 
 ## Run any editor command / reload
 - `wkbctl command <name>` — run any `M-x` command.

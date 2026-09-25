@@ -162,11 +162,12 @@ proc handleImpl(app: var App; req: string): string =
       # Echo the resulting status line so scripts/agents can read outcome/state.
       result = "ok: " & parts[1] & (if app.msg.len > 0: " -- " & app.msg else: "")
     else: result = "unknown command"
-  of "diff":                             # show a side-by-side diff: body = OLD \x1e NEW
+  of "diff":                             # diff\t<title>[\t<path>]: body = OLD \x1e NEW
     let title = if parts.len > 1: parts[1] else: "diff"
+    let path = if parts.len > 2: parts[2] else: ""   # the file it is about (cursor jump)
     let sep = body.find('\x1e')
     if sep < 0: return "diff: body must be OLD\\x1eNEW"
-    showDiff(app, body[0 ..< sep], body[sep + 1 .. ^1], title)
+    showDiff(app, body[0 ..< sep], body[sep + 1 .. ^1], title, path)
     result = "ok: diff (" & title & ")"
   of "set-buffer":                       # replace the whole buffer with <body>
     app.ed.setText(body)
