@@ -9,7 +9,13 @@
 import uirelays
 import uirelays/layout
 import wkbcore
-import wkbconfig
+import std/macros
+const wkbUserConfig {.strdefine.} = ""   ## set by config.nims: ~/.config/wkbenchless/wkbconfig.nim
+macro importConfig(path: static string): untyped =
+  ## `import "<path>"` -- the user config by absolute path (import needs a literal).
+  nnkImportStmt.newTree(newLit(path))
+when wkbUserConfig.len > 0: importConfig(wkbUserConfig)
+else: import wkbconfig
 import wkbextensions
 import wkbpty
 import wkbctrl

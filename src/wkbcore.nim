@@ -2867,16 +2867,37 @@ proc execReload*(app: var App) =
     app.msg = "recompile: exec failed (" & app.reloadBin & ")"   # only if execv failed
     app.reloadPending = false
 
+const defaultConfigSrc = staticRead("wkbconfig.nim")   ## seeds the user config
+
+proc userConfigPath*(): string =
+  ## The user's config, compiled in place of src/wkbconfig.nim when it exists
+  ## (config.nims): ~/.config/wkbenchless/wkbconfig.nim, or WKB_USER_CONFIG.
+  let env = getEnv("WKB_USER_CONFIG")
+  if env.len > 0: expandTilde(env)
+  else: getConfigDir() / "wkbenchless" / "wkbconfig.nim"
+
 proc editConfig*(app: var App) =
-  ## Open src/wkbconfig.nim in the editor (edit, then reload-config / C-c r).
+  ## Open the config in the editor (edit, then reload-config / C-c r). Looks in
+  ## ~/.config/wkbenchless first, seeding it on first use from the source tree's
+  ## src/wkbconfig.nim (else the default built into this binary); falls back to
+  ## the source tree's own file if the config dir can't be written.
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
-  let p = getAppDir() / "src" / "wkbconfig.nim"
-  if not fileExists(p): app.msg = "config not found: " & p; return
+  var p = userConfigPath()
+  var note = ""
+  if not fileExists(p):
+    let srcCfg = resolveBuildDir() / "src" / "wkbconfig.nim"
+    try:
+      createDir(p.parentDir)
+      writeFile(p, if fileExists(srcCfg): readFile(srcCfg) else: defaultConfigSrc)
+      note = "created " & p & " -- "
+    except OSError, IOError:
+      p = srcCfg
+  if not fileExists(p): app.msg = "config not found: " & userConfigPath(); return
   app.filePath = p
   app.ed.lang = fileExtToLanguage(".nim")
   app.ed.loadFromFile(p)
   app.docLang = "nim"
-  app.msg = "editing config -- reload with C-c r (or M-x reload-config)"
+  app.msg = note & "editing config -- reload with C-c r (or M-x reload-config)"
 
 proc reloadConfig*(app: var App) =
   ## Rebuild (recompiling wkbconfig.nim into the binary) and restart.

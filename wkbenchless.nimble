@@ -16,6 +16,7 @@ task run, "Build and run wkbenchless":
 
 task release, "Build an optimized, stripped single binary to share":
   # Runs standalone -- only needs system libX11/libXft at runtime, no compiler.
+  putEnv("WKB_NO_USER_CONFIG", "1")   # ship the default config, not ~/.config's
   exec "nim c -d:release -d:danger --opt:size --passL:-s -o:wkbenchless src/wkbenchless.nim"
 
 task bundle, "Bundle a self-contained toolchain (Nim + zig) so C-c r needs no system compiler":

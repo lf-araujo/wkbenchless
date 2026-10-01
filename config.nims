@@ -9,6 +9,23 @@ switch("path", "src")
 ## `import uirelays`, `import uirelays/…`, and `import widgets/…` resolve to it.
 switch("path", "src/vendor/uirelays")
 
+## User config: ~/.config/wkbenchless/wkbconfig.nim (XDG_CONFIG_HOME, or
+## %APPDATA% on Windows) is compiled in place of src/wkbconfig.nim when it exists,
+## so a nimble-installed build can be configured without touching its package
+## dir. M-x edit-config (C-c f) seeds it from the default; C-c r rebuilds with it.
+## WKB_USER_CONFIG=<file> overrides the location; WKB_NO_USER_CONFIG=1 skips it
+## (`nimble release` sets that, so a shared binary carries the default config).
+block:
+  var userCfg = getEnv("WKB_USER_CONFIG")
+  if userCfg.len == 0:
+    let base =
+      if defined(windows): getEnv("APPDATA")
+      elif getEnv("XDG_CONFIG_HOME").len > 0: getEnv("XDG_CONFIG_HOME")
+      else: getEnv("HOME") & "/.config"
+    if base.len > 0: userCfg = base & "/wkbenchless/wkbconfig.nim"
+  if getEnv("WKB_NO_USER_CONFIG").len == 0 and userCfg.len > 0 and fileExists(userCfg):
+    switch("define", "wkbUserConfig=" & userCfg)
+
 ## zippy (pure-Nim zip, dependency-free) vendored in-tree -- the org-tracked
 ## extension uses it to embed the canonical .org into the exported .docx as a
 ## conformant OPC package (no python / shell `zip` needed). Also used by pixie
