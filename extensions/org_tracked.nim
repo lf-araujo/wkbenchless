@@ -231,6 +231,81 @@ proc unstash(s: string; tokens: seq[string]): string =
   for idx, tok in tokens:
     result = result.replace("zZoTdZz" & $idx & "zZ", tok)
 
+proc isBlockSyntax(t: string): bool =
+  ## Text that org would read as a block on its own (headline, list item, table
+  ## row, keyword, fixed-width line, drawer) -- not an inline fragment.
+  if t.len == 0: return false
+  if t.startsWith("* ") or t.startsWith("- ") or t.startsWith("+ ") or
+     t.startsWith("|") or t.startsWith("#+") or t.startsWith(": ") or
+     (t.startsWith(":") and t.endsWith(":")) or t.startsWith("-----"):
+    return true
+  var i = 0
+  while i < t.len and t[i] in Digits: inc i
+  i > 0 and i + 1 < t.len and t[i] in {'.', ')'} and t[i + 1] == ' '
+
+proc convertCriticTokens(tokens: var seq[string]; options: seq[string]) =
+  ## The text INSIDE CriticMarkup skips the main org->md pass (it is stashed so
+  ## pandoc can't mangle the markup), so org syntax in it -- inline LaTeX \(..\),
+  ## sub/superscripts x_{1}, *bold*, /italic/, =code=, links -- would reach the
+  ## markdown->docx reader raw. Convert every insertion / deletion / substitution
+  ## side / highlight to markdown here, all in ONE pandoc call (fragments joined
+  ## by sentinel paragraphs). Comments are left alone (their "[Author]" prefix
+  ## must survive; Word comments are plain). Leading/trailing spaces are kept;
+  ## multi-paragraph or block-like fragments stay raw, as before.
+  type Frag = tuple[tok, part: int; lead, trail, text: string]
+  var frags: seq[Frag]
+  var parts = newSeq[seq[string]](tokens.len)
+  for ti, tok in tokens:
+    if tok.len < 6: continue
+    let kind = tok[0 .. 2]
+    let inner = tok[3 ..< tok.len - 3]
+    case kind
+    of "{++", "{--", "{==": parts[ti] = @[inner]
+    of "{~~":
+      let arrow = inner.find("~>")
+      parts[ti] = if arrow >= 0: @[inner[0 ..< arrow], inner[arrow + 2 .. ^1]] else: @[inner]
+    else: continue                                   # {>> comments <<}: untouched
+    for pi, p in parts[ti]:
+      let t = p.strip()
+      if t.len == 0 or "\n\n" in p or isBlockSyntax(t): continue
+      let lead = p[0 ..< p.len - p.strip(leading = true, trailing = false).len]
+      let trail = p[p.strip(leading = false, trailing = true).len .. ^1]
+      frags.add (ti, pi, lead, trail, t)
+  if frags.len == 0: return
+  let src = getTempDir() / "otd-fragments.org"
+  let dst = getTempDir() / "otd-fragments.md"
+  proc convert(lo, hi: int) =
+    ## Convert frags[lo ..< hi] in one pandoc call. pandoc's org reader can
+    ## reject a whole document over one odd fragment (e.g. a stray `\*`), so on
+    ## failure split the batch and retry the halves: a bad fragment only costs
+    ## itself (it stays raw, as before), at a few extra calls.
+    if hi <= lo: return
+    var doc = options.join("\n") & "\n\n"
+    for k in lo ..< hi: doc.add "WKBFRAG" & $k & "X\n\n" & frags[k].text & "\n\n"
+    doc.add "WKBFRAG" & $hi & "X\n"
+    writeFile(src, doc)
+    let (code, _) = pandoc(@["-f", "org", "-t", "markdown", "--wrap=none", src, "-o", dst])
+    if code != 0:
+      if hi - lo > 1:
+        let mid = (lo + hi) div 2
+        convert(lo, mid)
+        convert(mid, hi)
+      return
+    let md = readFile(dst)
+    for k in lo ..< hi:
+      let a = md.find("WKBFRAG" & $k & "X")
+      let b = md.find("WKBFRAG" & $(k + 1) & "X")
+      if a < 0 or b < 0 or b < a: continue
+      let conv = md[a + ("WKBFRAG" & $k & "X").len ..< b].strip()
+      if conv.len == 0 or "\n\n" in conv: continue  # not a single inline paragraph
+      parts[frags[k].tok][frags[k].part] = frags[k].lead & conv & frags[k].trail
+  convert(0, frags.len)
+  for ti, ps in parts:
+    if ps.len == 0: continue
+    let kind = tokens[ti][0 .. 2]
+    let close = tokens[ti][^3 .. ^1]
+    tokens[ti] = kind & (if ps.len == 2: ps[0] & "~>" & ps[1] else: ps[0]) & close
+
 # ---- embedded canonical org source (round-trip recovery) -------------------
 # Port of org-tracked-docx's customXml embed/extract: the .org that generated
 # the docx is stored inside it, so re-import can recover cite keys, cross-refs,
@@ -769,6 +844,10 @@ proc otdExport(app: var App) =
   var (code, outp) = pandoc(@["-f", "org", "-t", "markdown", "--wrap=none", "-s", orgTmp, "-o", md])
   if code != 0: (app.msg = "pandoc org->md failed: " & outp.strip(); return)
   var doneIds: seq[int]
+  var options: seq[string]                          # sub/superscript etc. settings apply
+  for ln in lines:                                  # to the fragments as to the body
+    if strutils.strip(ln).toLowerAscii.startsWith("#+options:"): options.add ln
+  convertCriticTokens(toks, options)                # org -> md inside CriticMarkup too
   writeFile(md, unescapeRefs(criticToSpans(unstash(readFile(md), toks), doneIds)))
   # md -> docx: standalone (title), citeproc + bibliography (references),
   # pandoc-crossref (fig:/tbl: cross-refs), optional CSL + reference-doc.
