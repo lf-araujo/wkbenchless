@@ -703,7 +703,12 @@ proc main() =
       # through (so you can click the session pane), and once focus is the
       # session, this is skipped -- you keep talking to the terminal/Claude.
       if e.kind == KeyDownEvent:
-        if e.key in {KeyEsc, KeyQ}: closeDiff(app)
+        if e.key in {KeyEsc, KeyQ}:
+          closeDiff(app)
+          # `q` also arrives as a TextInput; swallow it so it isn't typed into the
+          # buffer now that the diff (which was consuming keys) is gone. (Esc has
+          # no TextInput.)
+          if e.key == KeyQ: suppressText = true
         else:
           app.diffPinned = true               # touched: it stays until Esc/q
           if e.key == KeyT:                   # word-level <-> side-by-side
