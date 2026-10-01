@@ -1180,6 +1180,15 @@ proc offsetAtColumn(s: SynEdit; lineStart, col: int): int =
     dec c
   i
 
+proc isOrgHeadlineText*(line: string): bool =
+  ## True iff LINE is an org headline: column 0, a run of 1+ `*`, then a space
+  ## (`^\*+ `). A line like `*Response.*` or `*eTable 1.*` is bold emphasis, not a
+  ## headline -- so it must NOT get heading colour / big-font styling.
+  if line.len == 0 or line[0] != '*': return false
+  var k = 0
+  while k < line.len and line[k] == '*': inc k
+  k < line.len and line[k] == ' '
+
 proc highlightOrg(s: var SynEdit; first, last: int) =
   ## Org-mode, fontified natively: #+directives / * headings / # and : lines
   ## get their own colour, and the body of a #+begin_src <lang> ... #+end_src
@@ -1237,7 +1246,8 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
         case stripped[0]
         of '#': tc = if stripped.len > 1 and stripped[1] == '+': TokenClass.Directive
                      else: TokenClass.Comment
-        of '*': tc = TokenClass.Keyword
+        of '*': tc = if isOrgHeadlineText(lineText): TokenClass.Keyword  # `*+ ` only
+                     else: TokenClass.Text                              # `*bold*` is body
         of ':': tc = TokenClass.Comment
         else: discard
       for j in lineStart ..< min(lineEnd, last + 1): s.setCellStyle(j, tc)
@@ -3342,7 +3352,7 @@ proc isBigOrgLine(s: SynEdit; i: int): bool =
     # (```{r}), where R comments also start with '#'.
     return ls.len > 0 and ls[0] == '#' and not s.inSrcBlock(i)
   result = ls.startsWith("#+title") or ls.startsWith("#+author") or
-           (ls.len > 0 and ls[0] == '*')
+           isOrgHeadlineText(t)                 # `*+ ` headline, not `*bold*`
 
 proc isCaptionLine(s: SynEdit; i: int): bool =
   ## org #+caption: lines render a touch larger (captionFont).

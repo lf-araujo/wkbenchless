@@ -627,12 +627,13 @@ proc orgOutline*(app: App): seq[tuple[line: int; label: string]] =
     let raw = app.ed.getLineText(i)
     let s = strutils.strip(raw)
     let low = s.toLowerAscii
-    if s.startsWith("*"):
+    if s.len > 0 and s[0] == '*':
       var lvl = 0
       while lvl < s.len and s[lvl] == '*': inc lvl
-      let title = strutils.strip(s[lvl .. ^1])
-      result.add (i, repeat("  ", max(0, lvl - 1)) & "* " & title)
-      pendingName = ""; pendingCaption = ""; pendingLine = -1
+      if lvl == s.len or s[lvl] == ' ':        # `*+ ` headline, not a *bold* line
+        let title = strutils.strip(s[lvl .. ^1])
+        result.add (i, repeat("  ", max(0, lvl - 1)) & "* " & title)
+        pendingName = ""; pendingCaption = ""; pendingLine = -1
     elif low.startsWith("#+name:"):
       pendingName = strutils.strip(s["#+name:".len .. ^1])
       pendingLine = i
