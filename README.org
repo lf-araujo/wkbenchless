@@ -222,12 +222,15 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
 * Changelog (recent)
 
 - *Beamer PDF export*: Export → ~beamer~ (~M-x beamer-pdf-export~) builds
-  ~<file>.pdf~ from org-beamer slides — Emacs's own ox-beamer (~emacs -Q
-  --batch~) writes the ~.tex~, honoring the file's ~#+LATEX_*~ / ~#+BEAMER_*~ /
-  metropolis config, ~BEAMER_col~ columns and file-local variables, then the
-  ~#+LATEX_COMPILER~ (default ~lualatex~, ~-shell-escape~) runs twice. Nothing
-  is evaluated: stored ~#+RESULTS~ are exported per ~:exports~. Code defaults to
-  ~listings~ (~gBeamerSrcBackend~); extra setup via ~gBeamerElisp~.
+  ~<file>.pdf~ from org-beamer slides, no Emacs needed: pandoc (org → beamer)
+  writes the ~.tex~ — after the org-beamer bits it ignores are translated
+  (~BEAMER_col~ columns, ~BEAMER_opt~ frame options, ~ATTR_LATEX~ sizes,
+  ~#+BEAMER_*THEME~, ~H:~ as the slide level) and with ~#+PANDOC_OPTIONS~ /
+  ~#+PANDOC_VARIABLES~ passed through — then the ~#+LATEX_COMPILER~ (default
+  ~lualatex~; ~xelatex~, ~pdflatex~) runs on it directly, twice, in batchmode
+  with a per-pass timeout (~gBeamerLatexTimeout~). Nothing is evaluated: stored
+  ~#+RESULTS~ are exported per ~:exports~. Code goes to ~listings~, so a
+  ~\lstset~ in the header styles it (~gBeamerSrcBackend~).
 - *Config in ~~/.config/wkbenchless~*: ~edit-config~ (~C-c f~) no longer fails
   with "config not found" on a ~nimble install~ed binary — it opens (creating
   on first use) ~~/.config/wkbenchless/wkbconfig.nim~, which builds compile in

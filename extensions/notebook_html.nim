@@ -203,7 +203,7 @@ pre.src span.pp, pre.src span.at, pre.src span.im, pre.src span.bu, pre.src span
 pre.src span.wa { color: #60a0b0; font-weight: bold; font-style: italic; }
 </style>"""
 
-proc keywordValue(line, key: string): string =
+proc keywordValue*(line, key: string): string =
   ## "#+KEY: value" -> "value" (case-insensitive key), else "".
   let s = line.strip()
   if s.toLowerAscii.startsWith(key): s[key.len .. ^1].strip() else: ""
@@ -226,7 +226,7 @@ proc collectSetup(path: string; lines: seq[string]; heads, options: var seq[stri
     elif low.startsWith("#+options:"):
       options.add ln.strip()[len("#+options:") .. ^1].splitWhitespace()
 
-proc optionValue(options: seq[string]; key: string): string =
+proc optionValue*(options: seq[string]; key: string): string =
   ## The last `key:value` among #+OPTIONS tokens ("" if absent).
   for o in options:
     if o.startsWith(key & ":"): result = o[key.len + 1 .. ^1]
@@ -249,7 +249,7 @@ proc resultsEnd(lines: seq[string]; resultsLine: int): int =
     inc p
   p
 
-proc applyExports(app: App; lines: seq[string]; running: var int): seq[string] =
+proc applyExports*(app: App; lines: seq[string]; running: var int): seq[string] =
   ## Babel's `:exports` done the org way (document defaults included):
   ## none -> drop code and results; code -> drop results; results -> drop code;
   ## both -> keep both. `#+RESULTS...:` keywords go, so pandoc exports what is
