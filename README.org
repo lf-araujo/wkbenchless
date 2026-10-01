@@ -109,10 +109,15 @@ Prebuilt binaries for Linux/macOS are attached to each
 
 * Configuration
 
-Edit ~src/wkbconfig.nim~ (~M-x edit-config~ / ~C-c f~) — ordinary Nim with full
-access to the editor model. The complete default keymap, the languages, and the
-themes all live there, so everything is in one place. Apply changes with ~C-c r~
+Edit ~~/.config/wkbenchless/wkbconfig.nim~ (~M-x edit-config~ / ~C-c f~) —
+ordinary Nim with full access to the editor model. The complete default keymap,
+the languages, and the themes all live there, so everything is in one place.
+The first ~C-c f~ creates it from the default ~src/wkbconfig.nim~; whenever it
+exists, builds compile it /in place of/ the default (~config.nims~), so a
+~nimble install~ed binary is configurable too. Apply changes with ~C-c r~
 (recompile & restart — your open sessions and terminals survive the reload).
+~WKB_USER_CONFIG=<file>~ points elsewhere; ~nimble release~ ignores it
+(~WKB_NO_USER_CONFIG=1~) so a shared binary carries the default config.
 
 #+begin_src nim
 proc configure*(app: var App) =
@@ -213,14 +218,21 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
   ~refs.bib~ at export time.
 - [ ] ~ctl diagnostics~ — surface LSP errors/warnings (~wkblsp~ already speaks
   LSP); the last ~/ide~-parity gap (~open~/~where~/~selection~ now shipped).
-- [ ] ~beamer-pdf-export~ — a one-shot Beamer→PDF export option: run the
-  org-beamer LaTeX export (~lualatex~, honoring the file's ~#+LATEX_*~ /
-  ~#+BEAMER_*~ / metropolis config) straight to PDF, alongside the existing
-  ~#+PANDOC_OPTIONS~ export path — so slide decks build headlessly via ~wkbctl~
-  the way pandoc manuscripts already do.
 
 * Changelog (recent)
 
+- *Beamer PDF export*: Export → ~beamer~ (~M-x beamer-pdf-export~) builds
+  ~<file>.pdf~ from org-beamer slides — Emacs's own ox-beamer (~emacs -Q
+  --batch~) writes the ~.tex~, honoring the file's ~#+LATEX_*~ / ~#+BEAMER_*~ /
+  metropolis config, ~BEAMER_col~ columns and file-local variables, then the
+  ~#+LATEX_COMPILER~ (default ~lualatex~, ~-shell-escape~) runs twice. Nothing
+  is evaluated: stored ~#+RESULTS~ are exported per ~:exports~. Code defaults to
+  ~listings~ (~gBeamerSrcBackend~); extra setup via ~gBeamerElisp~.
+- *Config in ~~/.config/wkbenchless~*: ~edit-config~ (~C-c f~) no longer fails
+  with "config not found" on a ~nimble install~ed binary — it opens (creating
+  on first use) ~~/.config/wkbenchless/wkbconfig.nim~, which builds compile in
+  place of ~src/wkbconfig.nim~; it falls back to the source tree's copy
+  (~resolveBuildDir()~) if the config dir can't be written.
 - *Inline images via pixie*: PNG/JPG/GIF/… decode with the vendored, pure-Nim
   [[https://github.com/treeform/pixie][pixie]] instead of shelling out to
   ~magick~/~convert~, so figures render on machines without ImageMagick; the
