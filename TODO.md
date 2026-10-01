@@ -135,3 +135,15 @@ branching tree — deliberately the simpler path).
 - [ ] **Restore seeds the undo stack** — after jumping to an old version, C-z
   still nudges forward/back from there, so a time-jump is just another edit in
   Layer 1 and never a trap.
+
+## Org view: bold at line start rendered as a heading (src/vendor/uirelays/widgets/synedit.nim) — DONE 2026-09-30
+
+- [x] **A line starting with a bold word is drawn as a section title.** E.g.
+  `*Response.* We thank the reviewer…` or `*eTable 1. …* Fit indices…` gets
+  heading styling (big font / heading colour) instead of body text with a bold
+  span. Org only treats a line as a headline when the stars are followed by a
+  space (`^\*+ `); `*word*` at column 0 is emphasis. Fixed: new
+  `isOrgHeadlineText` (column 0, run of `*`, then a space) now gates the
+  highlighter and the big-font check (`isBigOrgLine`); `orgOutline` applies the
+  same rule; landmark nav (`isLandmark`) already did. `*bold*` lines render as
+  body text with a bold span.

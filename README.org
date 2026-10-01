@@ -213,6 +213,11 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
   ~refs.bib~ at export time.
 - [ ] ~ctl diagnostics~ — surface LSP errors/warnings (~wkblsp~ already speaks
   LSP); the last ~/ide~-parity gap (~open~/~where~/~selection~ now shipped).
+- [ ] ~beamer-pdf-export~ — a one-shot Beamer→PDF export option: run the
+  org-beamer LaTeX export (~lualatex~, honoring the file's ~#+LATEX_*~ /
+  ~#+BEAMER_*~ / metropolis config) straight to PDF, alongside the existing
+  ~#+PANDOC_OPTIONS~ export path — so slide decks build headlessly via ~wkbctl~
+  the way pandoc manuscripts already do.
 
 * Changelog (recent)
 
