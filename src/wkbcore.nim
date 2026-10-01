@@ -1324,10 +1324,16 @@ proc enableLatexPreview(app: var App): bool =
   ## Turn on LaTeX previews and render every whole-line display-math fragment
   ## ($$..$$, \[..\], \(..\), $..$) to a cached PNG. Returns false (and leaves
   ## the flag off) when the toolchain is missing.
+  ##
+  ## The `#+LATEX_HEADER:` preamble is often written for the export, not for
+  ## `latex` + `article` (a beamer theme, fontspec fonts for lualatex), and then
+  ## breaks every fragment. So a fragment that fails with it is retried without
+  ## it; if that works, the rest of the document is rendered without it too.
   if findExe("latex").len == 0 or findExe("dvipng").len == 0:
     app.msg = "latex preview needs `latex` and `dvipng` on PATH"; return false
   app.ed.setRenderFlag(rfLatexPreview, true)
-  let header = collectLatexHeader(app)
+  var header = collectLatexHeader(app)
+  var headerDropped = false
   try: createDir(getCacheDir() / "wkbenchless" / "ltximg") except CatchableError: discard
   var made, failed = 0
   var off = 0
@@ -1337,13 +1343,18 @@ proc enableLatexPreview(app: var App): bool =
     if latexDisplayMathAt(app.ed, off, inner, blockEnd):
       let outPng = ltxCachePath(inner)
       if not fileExists(outPng):
-        if renderLatexFragment(inner, header, outPng): inc made else: inc failed
+        if renderLatexFragment(inner, header, outPng): inc made
+        elif header.len > 0 and renderLatexFragment(inner, "", outPng):
+          header = ""; headerDropped = true; inc made
+        else: inc failed
       off = blockEnd
     else:
       while off < app.ed.len and app.ed[off] != '\L': inc off
       if off < app.ed.len: inc off
   app.msg = "latex preview on (" & $made & " rendered" &
-            (if failed > 0: ", " & $failed & " failed" else: "") & ")"
+            (if failed > 0: ", " & $failed & " failed" else: "") &
+            (if headerDropped: "; #+LATEX_HEADER skipped: it does not compile " &
+               "with latex -- move export-only lines to #+LATEX_HEADER_EXTRA" else: "") & ")"
   true
 
 proc latexPreview*(app: var App) =

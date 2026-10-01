@@ -221,6 +221,11 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
 
 * Changelog (recent)
 
+- *LaTeX previews survive an export-only preamble*: a formula that fails to
+  compile with the buffer's ~#+LATEX_HEADER:~ lines (a beamer theme, fontspec
+  fonts for lualatex) is retried without them, and the rest of the document is
+  then rendered without them; the status line suggests moving export-only lines
+  to ~#+LATEX_HEADER_EXTRA:~, which previews never read (Org's convention).
 - *Beamer PDF export*: Export → ~beamer~ (~M-x beamer-pdf-export~) builds
   ~<file>.pdf~ from org-beamer slides, no Emacs needed: pandoc (org → beamer)
   writes the ~.tex~ — after the org-beamer bits it ignores are translated
