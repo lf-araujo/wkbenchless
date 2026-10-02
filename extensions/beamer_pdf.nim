@@ -246,6 +246,13 @@ proc beamerPdfExport*(app: var App) =
   if haveBib:
     args.add "--citeproc"
     if csl.len > 0: args.add "--csl=" & resolve(csl)
+    # Like ox-beamer, only print a reference list where #+print_bibliography:
+    # asks for one; otherwise pandoc appends it to the last frame (a single
+    # frame cannot hold it, and LaTeX may run away).
+    var printBib = false
+    for ln in lines:
+      if ln.strip.toLowerAscii.startsWith("#+print_bibliography:"): printBib = true
+    if not printBib: args.add @["-M", "suppress-bibliography=true"]
   for o in popts:                                   # #+PANDOC_OPTIONS key:value
     let c = o.find(':')
     let (k, v) = if c < 0: (o, "t") else: (o[0 ..< c], o[c + 1 .. ^1].strip(chars = {'"'}))
