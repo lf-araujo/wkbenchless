@@ -10,6 +10,7 @@ background service, no Electron.
 #+begin_quote
 *Work in progress.* wkbenchless aims to reproduce, as one native binary, the
 literate scientific-workbench workflow the author built in Emacs (the
+
 [[https://github.com/lf-araujo/workbenchless][workbenchless]] config) — org-mode
 notebooks, remote REPLs, inline figures, and manuscript round-tripping —
 without Emacs. Expect rough edges; features are still landing.
@@ -216,11 +217,61 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
 - [ ] ~bib --insert~ — drop ~[cite:@key]~ at the cursor from a search result.
 - [ ] ~bib --extract~ — write the current file's cited keys to a slim project
   ~refs.bib~ at export time.
-- [ ] ~ctl diagnostics~ — surface LSP errors/warnings (~wkblsp~ already speaks
-  LSP); the last ~/ide~-parity gap (~open~/~where~/~selection~ now shipped).
+- [X] ~ctl diagnostics~ — shipped as the ~check~ / ~check-project~ agent verbs
+  (extensions/agent_tools.nim): ~nim check~ queued in the bash session (visible
+  in the panel) with a crisp ~check: ok|FAILED (exit N)~ last line. Surfacing
+  LSP publish-diagnostics on top remains optional polish, not a gap.
+- [ ] *org-tracked docx round-trip hardening* (extensions/org_tracked.nim) —
+  surfaced doing a real co-author round by hand (a reviewer's ~.docx~ merged
+  onto the canonical ~.org~); the corrected by-hand merge is the spec.
+  Import/merge (~otdImport~/~mergeContent~):
+  - tables are *structural* — a contiguous run of ~|~ lines is a passthrough
+    block from the canonical; never align/replace table rows as body;
+  - keep canonical comments on unchanged paragraphs (add only the new
+    reviewer's; never resurrect resolved ones);
+  - change detection is citation-blind and exact — strip ~[cite:@…]~ and
+    ~^{N}~ / ~Figure N~ / ~Table N~ before comparing, and treat *any* real
+    word difference as changed (no similarity threshold);
+  - back-substitute keys in changed paragraphs — ~^{N}~ → ~[cite:@key]~ via a
+    citeproc-order cite-map; ~Figure N~ / ~Table N~ → ~[cite:@fig:…]~ /
+    ~[cite:@tbl:…]~ from ~#+name:~ order;
+  - rebuild changed paragraphs by clean word-diff of canonical vs the
+    reviewer's citation-normalised text, emitting fresh ~{++/--/~~}~ — instead
+    of splicing raw tracked text (also sidesteps nested-CriticMarkup mangling);
+  - safety net — reviewer comments that can't be placed go to a
+    ~* Reviewer comments not auto-placed~ section, so nothing is lost.
+  Export (~otdExport~): OneDrive/Word strip ~customXml/~ on save, so also embed
+  the org as a base64 ~OrgTrackedSource~ custom document property and read
+  whichever survived on import.
+- [ ] *Document history: infinite undo + time-versioned browsing*
+  (src/vendor/uirelays/widgets/synedit.nim) — chosen model: linear + persist +
+  timestamps (deliberately not a branching tree).
+  - Layer 1 — make ~C-z~ infinite and cross-session: timestamp each version
+    group; persist ~actions~ to a per-file sidecar (serialize on save/idle,
+    reload on open, guard against the file changing on disk underneath);
+    keep the linear model (new edit still truncates redo).
+  - Layer 2 — ~M-x history~ time-versioned browser: timestamped buffer
+    snapshots on idle/save; a palette listing versions with adaptive time
+    density (recent dense → hours coarser → a couple per day), Time-Machine
+    style; diff preview before restore (reuse the diff panel); restoring
+    seeds the undo stack so a time-jump is just another edit, never a trap.
 
 * Changelog (recent)
 
+- *Babel sessions are nonce-safe and statement-wise*: every run carries a
+  unique nonce (BEGIN/END markers key on it), so a stale END left by a timed-out
+  long model fit can never poison the session; R blocks ~eval~ top-level forms
+  one by one (ESS-like), so one error is reported without aborting the rest;
+  the silence timeout is 10 min for model fits.
+- *run-all* (~C-c C-b~ / ~M-x run-all~ / ~ctl run-all~) runs every src block top
+  to bottom with a per-block ~[ok]/[ERR]~ report; the palette is wider (900 px)
+  with the best match on top while searching.
+- *Cut / selection over folds*: selecting across a folded region works — the
+  selection spans the fold instead of stopping at its edge.
+- *Bold at line start renders as body text*: org only treats a line as a
+  headline when the stars are followed by a space, so ~*Response.* …~
+  paragraphs keep body styling with a bold span — highlighter, big-font check,
+  outline and landmark nav all apply the same rule.
 - *LaTeX previews survive an export-only preamble*: a formula that fails to
   compile with the buffer's ~#+LATEX_HEADER:~ lines (a beamer theme, fontspec
   fonts for lualatex) is retried without them, and the rest of the document is
