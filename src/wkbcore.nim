@@ -195,6 +195,15 @@ proc setReadingMargin*(ext: string; px: int) =
   gReadingMargins[ext.toLowerAscii] = px
 proc registerRepl*(langId: string; spec: ReplSpec) =
   gRepls[langId.toLowerAscii] = spec
+type CtlVerbProc* = proc(app: var App; args: seq[string]; body: string): string
+var
+  gCtlVerbs*: Table[string, CtlVerbProc]  ## extra `wkbctl` verbs (extensions register)
+  gCtlVerbHelp*: Table[string, string]     ## verb -> one-line usage, for `wkbctl help`
+proc registerCtlVerb*(name, help: string; handler: CtlVerbProc) =
+  ## Extensions add control-socket verbs; wkbctrl dispatches unknown verbs here.
+  ## `help` is surfaced by `wkbctl help` so agents can discover verbs at runtime.
+  gCtlVerbs[name.toLowerAscii] = handler
+  gCtlVerbHelp[name.toLowerAscii] = help
 proc addHook*(name: string; h: Hook) =
   gHooks.mgetOrPut(name, @[]).add h
 proc runHooks*(app: var App; name: string) =

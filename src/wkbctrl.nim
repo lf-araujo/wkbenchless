@@ -295,7 +295,12 @@ proc handleImpl(app: var App; req: string): string =
     let sel = app.ed.getSelectedText()
     result = if sel.len > 0: sel else: "(no selection)"
   else:
-    result = "unknown verb: " & parts[0]
+    let verb = parts[0].toLowerAscii
+    if gCtlVerbs.hasKey(verb):
+      let vargs = if parts.len > 1: parts[1 .. ^1] else: @[]
+      result = gCtlVerbs[verb](app, vargs, body)
+    else:
+      result = "unknown verb: " & parts[0]
 
 proc handle(app: var App; req: string): string =
   ## Requests arrive from agents/scripts (Claude in a terminal tab): runs they

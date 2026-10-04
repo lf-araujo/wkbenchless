@@ -35,6 +35,35 @@ echo 'summary(fit)' | wkbctl eval r default     # ad-hoc in the r/default sessio
 `eval` takes `<lang> <session>` (defaults `r default`); the session's live
 process is the same one shown in the bottom panel, so state carries over.
 
+## Agent verbs (extensions/agent_tools.nim)
+Run `wkbctl help` to list these from the running editor — it is the source of
+truth. Symbol intelligence over a persistent nimsuggest (locate without
+reading files):
+```sh
+wkbctl symbols [file]                        # outline: "line: kind name"
+wkbctl find-symbol submitEval                # project-wide: "path:line: kind name"
+wkbctl references src/wkbcore.nim 2278 submitEval   # definition + usages
+wkbctl def src/wkbctrl.nim 155 submitEval    # definition of the symbol at a site
+wkbctl type-def src/wkbcore.nim 2278 submitEval     # its type's definition
+```
+Positions are `file line [word|col]`; the word locates the column for you. First
+use per project spawns nimsuggest (analysis warms in the background; queries
+answer "still warming up" until then — `symbols` works immediately).
+
+Check / build / run — queued in the bash session (visible in the panel, focus
+returns to the terminal when done) with a crisp pass/fail last line:
+```sh
+wkbctl check [file]                          # nim check + "check: ok|FAILED"
+wkbctl check-project                         # nim check on the project's main file
+wkbctl build [nim c args...]                 # project build + "build: ok|FAILED"
+echo 'ls -la' | wkbctl sh                    # bash in the session panel
+echo 'echo 1+1' | wkbctl nim-run             # Nim via the warm nimteractive session
+```
+`nim-run` (and `eval nim`) use nimteractive when installed (warm nimcache,
+incremental recompile); without it they fall back to `scratch.nim` + `nim r`
+from the project root. Prefer these over raw shell-outs — the user sees the
+run live in the panel.
+
 ## Edit the buffer
 - `echo TEXT | wkbctl set-buffer` — replace the whole buffer.
 - `echo TEXT | wkbctl insert <line>` — insert before 1-based `<line>`.

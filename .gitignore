@@ -9,6 +9,7 @@ toolchain/
 *.insyncdl
 .~*
 /wkbctl
+scratch.nim
 # compiled probes/spikes -- keep the sources, not the binaries
 debug/*
 !debug/*.nim

@@ -25,6 +25,8 @@ proc buildRequest(args: seq[string]; req: var string): string =
            "           cite-goto <key>|open <path>|where|selection\n" &
            "           jobs|status <id>|wait <id>...|interrupt <id>\n" &
            "           run-block [line] [--deps] [--force]|run-stale|infer-deps\n" &
+           "           symbols|find-symbol <q>|references|def|type-def (nimsuggest)\n" &
+           "           check|check-project|build|sh|nim-run (queued in the panel)\n" &
            "  (verbs that take text read it from stdin; run-block/run-all/eval wait\n" &
            "   for their jobs unless given --async, which prints the job id(s))"
   case args[0]
@@ -62,6 +64,10 @@ proc buildRequest(args: seq[string]; req: var string): string =
       if a.startsWith("--"): flags.add a
       elif line.len == 0: line = a
     req = "run-block\t" & line & "\t" & flags.join(" ")
+  of "sh":                              # bash from stdin, in the session panel
+    req = "sh" & (if args.len > 1: "\t" & args[1] else: "") & "\n" & stdin.readAll()
+  of "nim-run":                         # Nim from stdin: scratch.nim -> nim r
+    req = "nim-run\n" & stdin.readAll()
   of "bib":
     if args.len < 2: return "ctl bib <query>"
     req = "bib\t" & args[1 .. ^1].join(" ")
@@ -97,7 +103,9 @@ proc buildRequest(args: seq[string]; req: var string): string =
     req = "diff\t" & title & "\t" & absolutePath(args[2]) & "\n" &
           readFile(args[1]) & "\x1e" & readFile(args[2])
   else:
-    return "unknown verb: " & args[0]
+    # Extension-registered verbs pass straight through (args tab-joined on the
+    # request line); the editor reports "unknown verb" if nothing handles it.
+    req = args.join("\t")
 
 proc ctlCoordinates(port: var int; token: var string): string =
   ## Find the editor to talk to; "" on success, else an error message.
@@ -206,7 +214,8 @@ proc ctlClient*(args: seq[string]): int =
     if rerr.len > 0:
       stderr.writeLine rerr
       return 1
-    if not async and args[0] in ["run-block", "run-all", "run-stale", "eval"]:
+    if not async and args[0] in ["run-block", "run-all", "run-stale", "eval", "sh",
+                                 "nim-run", "check", "check-project", "build"]:
       ids = queuedIds(resp)
   if ids.len > 0:
     var res: seq[JobResult]
@@ -216,7 +225,7 @@ proc ctlClient*(args: seq[string]): int =
       return 1
     resp = ""
     case args[0]
-    of "eval":
+    of "eval", "sh", "nim-run", "check", "check-project", "build":
       for r in res: resp.add r.output
     of "run-block":
       for r in res:
