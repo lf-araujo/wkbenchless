@@ -1,6 +1,6 @@
 # wkbenchless.nimble
 
-version       = "0.4.2"
+version       = "0.4.3"
 author        = "Luis F. Araujo"
 description   = "A native, deeply Nim-configurable literate editor: org-babel, LSP, interactive REPL sessions, org-src fontification -- a workbench-less alternative to heavier IDEs."
 license       = "MIT"
@@ -23,6 +23,34 @@ task bundle, "Bundle a self-contained toolchain (Nim + zig) so C-c r needs no sy
   # Pass the zig path after `--`, e.g.  nimble bundle -- /opt/zig/zig
   let zig = if paramCount() >= 3: paramStr(paramCount()) else: ""
   exec "bash scripts/bundle-toolchain.sh " & zig
+
+# -- "Text file busy" ----------------------------------------------------------
+# Linux refuses to open a running executable for writing (ETXTBSY), and an
+# editor is usually running while you reinstall it: from ~/.nimble/pkgs2 after
+# `nimble install`, or from the repo's ./wkbenchless after C-c r. Before install,
+# replace each such file by a fresh copy of itself (cp + rename): a running
+# editor keeps its old inode, and the path now names a file nothing executes,
+# which the build and nimble's copy can overwrite. Unlike moving the binary
+# aside, nothing goes missing if nimble then skips the install as unchanged.
+when hostOS == "linux":
+  import std/os
+
+  proc unbusy(f: string) =
+    if fileExists(f):
+      let tmp = f & ".unbusy"
+      cpFile(f, tmp)
+      exec "chmod +x \"" & tmp & "\""
+      mvFile(tmp, f)
+
+  before install:
+    unbusy(thisDir() / "wkbenchless")
+    let nimbleDir = if existsEnv("NIMBLE_DIR"): getEnv("NIMBLE_DIR")
+                    else: getHomeDir() / ".nimble"
+    let pkgs = nimbleDir / "pkgs2"
+    if dirExists(pkgs):
+      for d in listDirs(pkgs):
+        if d.extractFilename.startsWith("wkbenchless-"):
+          unbusy(d / "wkbenchless")
 
 # The legacy GTK editor (src/nimacs.nim, owlkettle) is kept for history but is
 # no longer built by default; wkbenchless supersedes it.
