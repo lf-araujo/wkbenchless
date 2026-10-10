@@ -197,20 +197,6 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
 
 * Roadmap
 
-- [ ] *Bug: inline images don't render on macOS (cocoa driver)* — org/markdown
-  figures show neither the image nor the crossed-box placeholder: no space is
-  reserved at all for the line, even though the link is correctly recognized
-  (jumping to it via the objects list / ~C-c o~ works fine, and the file is
-  unfolded). /Update:/ the ImageMagick shell-out is gone —
-  [[https://github.com/treeform/pixie][pixie]] now decodes to the cached 24-bit
-  BMP in pure Nim, so this is no longer about ImageMagick or ~PATH~. Other
-  backends (gtk4/x11/windows) render inline images correctly, which points at
-  ~cocoa_backend.m~'s ~cocoa_loadImage~/~cocoa_drawImage~ (imported into
-  ~cocoa_driver.nim~) rather than the shared ~renderMarkdownImageLine~ /
-  ~getCachedImage~ logic in ~synedit.nim~. Needs an actual macOS GUI repro to
-  find where in that native path the draw is skipped or is a no-op — or, longer
-  term, have pixie hand raw pixels to every backend so there is one image path
-  instead of N native ones.
 - [ ] *Ctrl-click ~[cite:@key]~ → its BibTeX entry* — a click/keybinding hook
   on a citation that calls ~cite-goto~ (the ~wkbctl cite-goto <key>~ verb already
   does the jump for agents; this is the in-editor UI on top of it).
@@ -221,28 +207,32 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
   (extensions/agent_tools.nim): ~nim check~ queued in the bash session (visible
   in the panel) with a crisp ~check: ok|FAILED (exit N)~ last line. Surfacing
   LSP publish-diagnostics on top remains optional polish, not a gap.
-- [ ] *org-tracked docx round-trip hardening* (extensions/org_tracked.nim) —
-  surfaced doing a real co-author round by hand (a reviewer's ~.docx~ merged
-  onto the canonical ~.org~); the corrected by-hand merge is the spec.
-  Import/merge (~otdImport~/~mergeContent~):
-  - tables are *structural* — a contiguous run of ~|~ lines is a passthrough
-    block from the canonical; never align/replace table rows as body;
-  - keep canonical comments on unchanged paragraphs (add only the new
-    reviewer's; never resurrect resolved ones);
-  - change detection is citation-blind and exact — strip ~[cite:@…]~ and
-    ~^{N}~ / ~Figure N~ / ~Table N~ before comparing, and treat *any* real
-    word difference as changed (no similarity threshold);
-  - back-substitute keys in changed paragraphs — ~^{N}~ → ~[cite:@key]~ via a
-    citeproc-order cite-map; ~Figure N~ / ~Table N~ → ~[cite:@fig:…]~ /
-    ~[cite:@tbl:…]~ from ~#+name:~ order;
-  - rebuild changed paragraphs by clean word-diff of canonical vs the
-    reviewer's citation-normalised text, emitting fresh ~{++/--/~~}~ — instead
-    of splicing raw tracked text (also sidesteps nested-CriticMarkup mangling);
-  - safety net — reviewer comments that can't be placed go to a
-    ~* Reviewer comments not auto-placed~ section, so nothing is lost.
-  Export (~otdExport~): OneDrive/Word strip ~customXml/~ on save, so also embed
-  the org as a base64 ~OrgTrackedSource~ custom document property and read
-  whichever survived on import.
+- [X] *org-tracked docx round-trip hardening* (extensions/org_tracked.nim) —
+  ported the org-tracked-docx.el merge core and hardened it against the real
+  co-author round (Chandra's ~_cr.docx~ onto the canonical ~.org~; verified
+  end-to-end: tables 72/72, all comments survive, no spliced junk):
+  - [X] tables are *structural* — a contiguous run of ~|~ lines is a
+    passthrough block from the canonical; never align/replace table rows;
+  - [X] canonical comments always survive — carried onto replaced paragraphs
+    and re-anchored by tiered substring splice (exact → case-insensitive →
+    truncated → ordinal); the reviewer's comments get the same treatment;
+  - [X] change detection is citation-blind — every cite/cross-ref rendering
+    collapses to a ~[CITE]~ token before fingerprinting; two-pointer
+    alignment (40-char prefix, positional, lookahead 24) plus containment /
+    short-prefix / split-join tiers carries edits without splicing junk;
+  - [X] back-substitution maps through the docx's OWN bibliography (each
+    rendered reference matched to a ~.bib~ key by title) — robust even when
+    the canonical's citations drifted since the export; ~Figure N~ →
+    ~[cite:@fig:…]~ from ~#+name:~ order; unresolved numbers stay visible;
+  - [X] safety net — comments that can't be placed go to a
+    ~* Reviewer comments not auto-placed~ section, so nothing is lost;
+  - [ ] accepted edits (Word's accept strips the w:ins/w:del runs) are
+    carried but not *marked*: a clean word-diff of canonical vs the
+    reviewer's citation-normalised text, emitting fresh ~{++/--/~~}~, would
+    show what the acceptance changed.
+  - [X] Export (~otdExport~): embed fallback via docProps — the org also goes
+    in as a base64 ~OrgTrackedSource~ custom document property (Word/OneDrive
+    strip ~customXml/~ on save), and import reads whichever survived.
 - [ ] *Document history: infinite undo + time-versioned browsing*
   (src/vendor/uirelays/widgets/synedit.nim) — chosen model: linear + persist +
   timestamps (deliberately not a branching tree).
