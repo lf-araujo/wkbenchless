@@ -566,6 +566,17 @@ proc switchToBuffer*(app: var App; idx: int) =
   app.activate(idx)
   app.msg = "buffer: " & bufName(app.buffers[idx])
 
+proc nextBuffer*(app: var App) =
+  ## Cycle one buffer to the right (wraps) -- the toolbar's ▶, which reaches
+  ## tabs overflowed off the tab line.
+  if app.buffers.len < 2: app.msg = "no other buffers"; return
+  switchToBuffer(app, (app.curBuf + 1) mod app.buffers.len)
+
+proc prevBuffer*(app: var App) =
+  ## Cycle one buffer to the left (wraps) -- the toolbar's ◀.
+  if app.buffers.len < 2: app.msg = "no other buffers"; return
+  switchToBuffer(app, (app.curBuf - 1 + app.buffers.len) mod app.buffers.len)
+
 var gLastRevertCheck: float = 0.0        ## epochTime of last autoRevert poll
 
 proc autoRevertActive*(app: var App): bool =
@@ -3241,6 +3252,8 @@ proc registerBuiltins*() =
   defcommand("export", "Export this buffer (choose target: docx, html, ...)", openExportPalette)
   defcommand("save-as", "Save the buffer to a new path", saveAsCmd)
   defcommand("quit", "Quit", quitCmd)
+  defcommand("next-buffer", "Buffers: cycle to the next buffer", nextBuffer)
+  defcommand("prev-buffer", "Buffers: cycle to the previous buffer", prevBuffer)
   defcommand("run-line", "Run current line in R (default session), skip to next", runLine)
   defcommand("babel-execute", "Org-babel: run this src block", babelExecute)
   defcommand("babel-execute-force", "Org-babel: run this src block, ignoring :cache", babelExecuteForce)

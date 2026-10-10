@@ -816,16 +816,25 @@ proc main() =
                 else: measureText(app.font, label).w + 16
         toolbarRects.add (rect(x, 4, w, toolbarH - 8), cmd, label)
         x += w + 4
+      # ◀/▶ cycle buffers -- tabs overflow the line when titles are long, and
+      # these reach the ones scrolled off either end. Docked just left of [☰].
+      const aw = 26                        # arrow chip width
+      const mw = 30      # the [☰] button (drawn as three bars, not a glyph)
+      let tabsRight = screen.width - mw - 6 - 2 * aw - 20   # tabs stop at the ◀
+      toolbarRects.add (rect(screen.width - mw - 6 - 2 * aw - 8, 4, aw, toolbarH - 8),
+                        "prev-buffer", "◀")
+      toolbarRects.add (rect(screen.width - mw - 6 - aw - 4, 4, aw, toolbarH - 8),
+                        "next-buffer", "▶")
+      toolbarRects.add (rect(screen.width - mw - 6, 4, mw, toolbarH - 8), "__menu__", "")
       # buffer tabs (optional): one per open buffer -- click to switch, [x] to close
       if gBufferTabs:
         for i, b in app.buffers:
           let lw = measureText(app.font, " " & bufName(b) & " ").w + 4
           let xw = toolbarH - 8
+          if x + lw + xw > tabsRight: break   # overflowed: reach the rest via ◀/▶
           bufferTabRects.add (rect(x, 4, lw + xw, toolbarH - 8), i,
                               rect(x + lw, 4, xw, toolbarH - 8))
           x += lw + xw + 4
-      const mw = 30      # the [☰] button (drawn as three bars, not a glyph)
-      toolbarRects.add (rect(screen.width - mw - 6, 4, mw, toolbarH - 8), "__menu__", "")
     var menuRects: seq[tuple[r: Rect; cmd, label: string]]
     if toolbarMenuOpen:
       var mw = 24
@@ -860,7 +869,18 @@ proc main() =
           for bt in bufferTabRects:
             if e.x >= bt.r.x and e.x < bt.r.x + bt.r.w:
               hit = true
-              if e.x >= bt.xr.x: killBufferAt(app, bt.idx)   # the tab's [x]
+              if e.x >= bt.xr.x:                 # the tab's [x]
+                if app.buffers.len <= 1:
+                  quitCmd(app)                   # closing the last tab closes the window
+                else:
+                  let n = app.buffers.len
+                  killBufferAt(app, bt.idx)
+                  if app.buffers.len < n:        # killed: re-sync this frame's rects
+                    var keep: seq[tuple[r: Rect; idx: int; xr: Rect]]
+                    for t in bufferTabRects:
+                      if t.idx == bt.idx: continue
+                      keep.add (t.r, (if t.idx > bt.idx: t.idx - 1 else: t.idx), t.xr)
+                    bufferTabRects = keep
               else: switchToBuffer(app, bt.idx)
               break
         chromeHit = hit
