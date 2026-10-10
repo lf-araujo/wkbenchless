@@ -16,6 +16,15 @@ type
     prime*, ready*, run*, quit*: string
     reset*: string   ## sent after an interrupt, to undo what the run driver left
                      ## half-done (R's output sinks); "" if the REPL needs nothing
+    launch*: seq[string]
+      ## Shell lines typed before the interpreter exists (argv then starts a
+      ## shell, e.g. an ssh login): each is sent once the current shell answers
+      ## a probe, so a hop like `exec qsub -I ...` can wait in a batch queue
+      ## before the next line (the one that execs the interpreter) is sent.
+    launchTimeoutMs*: int   ## max wait for each launch shell to answer (0 = 120 s)
+    stage*: proc(code, nonce: string): string
+      ## Puts a run's code where the interpreter can read it and returns that
+      ## path ("" = failed). nil = a local temp file (the REPL runs here).
   JobState* = enum jsQueued, jsRunning, jsDone, jsInterrupted
   RunJob* = ref object
     ## One asynchronous run of `code` in a session: queued, then started when the
@@ -93,6 +102,20 @@ let bashSpec* = ReplSpec(
 proc startSession*(spec: ReplSpec): Session =
   var pty = spawnPty(spec.argv, env = spec.env)
   if not pty.alive: return nil
+  let probeWait = if spec.launchTimeoutMs > 0: spec.launchTimeoutMs else: 120_000
+  for i, line in spec.launch:
+    # Re-probe every 2 s: a shell still starting (or a qsub that flushes typed-
+    # ahead input) may drop a probe. The token is per-step, so a late answer
+    # from an earlier shell can't be mistaken for the next one being ready.
+    let tok = "WKBxSHELL" & $i
+    var waited = 0
+    while true:
+      pty.feed("echo WKBx\"\"SHELL" & $i & "\n")   # echo of this line lacks `tok`
+      if tok in pty.readUntil(tok, timeoutMs = 2_000, mirror = false): break
+      waited += 2_000
+      if not pty.alive or waited >= probeWait:
+        pty.closePty(); return nil
+    pty.feed(line & "\n")
   result = Session(pty: pty, spec: spec)
   result.pty.feed(spec.prime)
   result.pty.feed(spec.ready)                    # sync past banner + prime echo
@@ -115,6 +138,14 @@ proc extractOutput(acc, beginTok, endTok: string): string =
   while lines.len > 0 and strutils.strip(lines[^1]) == "": lines.setLen(lines.len - 1)
   lines.join("\n")
 
+proc stageCode(s: Session; code, nonce: string): tuple[path: string; local: bool] =
+  ## Where the interpreter reads this run's code from: the spec's stager (a
+  ## remote session copies it to the host), else a local temp file.
+  if s.spec.stage != nil: return (s.spec.stage(code, nonce), false)
+  let path = genTempPath("wkbenchless-", ".src")
+  writeFile(path, code)
+  (path, true)
+
 proc runBlock*(s: Session; code: string; quiet = false;
                timeoutMs = 15_000): string =
   ## Run `code` in the session, returning the captured output. `quiet` keeps the
@@ -130,11 +161,11 @@ proc runBlock*(s: Session; code: string; quiet = false;
   let nonce = "N" & $gRunSeq
   let beginTok = markerBegin & " " & nonce
   let endTok = markerEnd & " " & nonce
-  let path = genTempPath("wkbenchless-", ".src")
-  writeFile(path, code)
+  let (path, local) = stageCode(s, code, nonce)
+  if path.len == 0: return "Error: could not send the block to the session's host"
   s.pty.feed(s.spec.run.replace("{file}", path).replace("{nonce}", nonce))
   let acc = s.pty.readUntil(endTok, timeoutMs = timeoutMs, mirror = not quiet)
-  removeFile(path)
+  if local: removeFile(path)
   extractOutput(acc, beginTok, endTok)
 
 # -- asynchronous runs ------------------------------------------------------
@@ -159,12 +190,16 @@ proc startNext(s: Session) =
   let nonce = "N" & $gRunSeq
   j.beginTok = markerBegin & " " & nonce
   j.endTok = markerEnd & " " & nonce
-  j.path = genTempPath("wkbenchless-", ".src")
-  writeFile(j.path, j.code)
+  let (path, local) = stageCode(s, j.code, nonce)
+  if local: j.path = path        # finish() deletes it; a remote copy is the stager's
   j.code = ""
   s.pty.tap = ""
   s.pty.tapping = true
-  s.pty.feed(s.spec.run.replace("{file}", j.path).replace("{nonce}", nonce))
+  if path.len > 0:
+    s.pty.feed(s.spec.run.replace("{file}", path).replace("{nonce}", nonce))
+  else:                          # nothing to run: complete the job with the error
+    s.pty.tap = j.beginTok & "\nError: could not send the block to the session's host\n" &
+                j.endTok & "\n"
   j.state = jsRunning
   j.started = epochTime()
   s.job = j
@@ -193,7 +228,19 @@ proc pollSession*(s: Session): seq[RunJob] =
   ## since the last call (at most one, plus any failed because the REPL died).
   if s == nil: return
   startNext(s)
-  if s.job == nil: return
+  if s.job == nil:
+    # A REPL that died before running anything (e.g. R crashing at startup on a
+    # remote host) never starts its queue: fail those runs instead of leaving
+    # their placeholders "running" forever.
+    if not s.pty.alive and s.queue.len > 0:
+      let tail = s.pty.outbuf[max(0, s.pty.outbuf.len - 600) .. ^1].strip
+      for q in s.queue:
+        q.state = jsDone; q.finished = epochTime()
+        q.output = "Error: session ended before the run started" &
+                   (if tail.len > 0: "\n" & tail else: "")
+        result.add q
+      s.queue.setLen(0)
+    return
   if drain(s.pty) < 0 or not s.pty.alive:      # the REPL exited under the run
     let j = s.job
     finish(s, j, jsDone, extractOutput(s.pty.tap, j.beginTok, j.endTok) &

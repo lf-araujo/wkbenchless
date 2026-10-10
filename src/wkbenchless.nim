@@ -1216,7 +1216,7 @@ proc main() =
         else: "-- NORMAL --   "
       let jobsTag = runningJobsLabel(app)
       discard drawText(app.font, sr.x + 6, sr.y,
-        "  wkbenchless   " & vimTag & name & dirty & "   " &
+        vimTag & name & dirty & "   " &
         $(app.ed.currentLine + 1) & ":" & $(app.ed.currentCol + 1) &
         (if jobsTag.len > 0: "   [jobs: " & jobsTag & "]" else: "") &
         "   " & app.msg,

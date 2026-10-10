@@ -39,14 +39,14 @@ var
 const frameOpts = ["standout", "fragile", "plain", "allowframebreaks", "shrink",
                    "squeeze", "noframenumbering", "t", "c", "b"]
 
-proc run(exe: string; args: seq[string]; dir: string): tuple[code: int; outp: string] =
+proc run*(exe: string; args: seq[string]; dir: string): tuple[code: int; outp: string] =
   let p = startProcess(exe, workingDir = dir, args = args,
                        options = {poStdErrToStdOut, poUsePath})
   let outp = p.outputStream.readAll()
   result = (p.waitForExit(), outp)
   p.close()
 
-proc runLatex(engine, tex, dir: string): bool =
+proc runLatex*(engine, tex, dir: string): bool =
   ## One LaTeX pass in batchmode (no terminal output, so nothing to drain);
   ## false if it ran past gBeamerLatexTimeout and was killed (a runaway page loop).
   let p = startProcess(engine, workingDir = dir, options = {poUsePath},
@@ -59,7 +59,7 @@ proc runLatex(engine, tex, dir: string): bool =
     os.sleep(100)
   p.close()
 
-proc firstLatexErrors(log: string; n = 3): string =
+proc firstLatexErrors*(log: string; n = 3): string =
   ## The first `! ...` error lines of a LaTeX log, joined for the status line.
   var errs: seq[string]
   for ln in log.splitLines:
@@ -88,7 +88,7 @@ proc latexSize(v: string): string =
 proc isBlockEdge(low: string; edge: string): bool =
   low.startsWith("#+" & edge & "_src") or low.startsWith("#+" & edge & "_example")
 
-proc toPandocOrg(lines: seq[string]): seq[string] =
+proc toPandocOrg*(lines: seq[string]): seq[string] =
   ## Translate org-beamer heading properties and ATTR_LATEX into what pandoc's
   ## org reader understands (see the module doc).
   type Head = object

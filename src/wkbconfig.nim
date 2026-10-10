@@ -142,6 +142,17 @@ proc configure*(app: var App) =
   addExecPath("~/.emacs.d/.cache/copilot/bin")
   # gLoadLoginPath = false
 
+  # Remote sessions: org's `:dir "/ssh:host|METHOD:user@host:/path"` (or
+  # `/METHOD:user@host:/path`) logs in to host over ssh, runs METHOD's command
+  # there, and starts the interpreter in the shell it opens, in /path -- the
+  # TRAMP methods from ~/.emacs.d/init.el, so the same headers work in both.
+  # The env SHELL=/bin/sh mirrors their tramp-login-env.
+  defineRemoteMethod("workq", "env SHELL=/bin/sh qsub -I -q workq -l ncpus=23")
+  defineRemoteMethod("magma", "env SHELL=/bin/sh qsub -I -q magma -lnodes=giant")
+  # Max seconds to wait for each login step's shell (a busy queue may need longer).
+  # Note: the editor waits while the job starts.
+  gRemoteLaunchTimeout = 600
+
   # The `claude` action (C-c a) runs this. It's a real shell command (see
   # startPty), so `||` works: try to resume the last conversation in the
   # project, and if `--continue` finds none ("No conversation found to

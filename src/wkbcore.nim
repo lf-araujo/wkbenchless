@@ -172,6 +172,10 @@ var
                                            ## launching claude, so its file edits pop into
                                            ## this editor's diff pane (config; set false off)
   gSshPersist* = "600"                    ## seconds an ssh master connection persists
+  gRemoteMethods*: Table[string, string]  ## TRAMP-style :dir method -> login command
+                                          ## run on the host first (defineRemoteMethod)
+  gRemoteLaunchTimeout* = 600             ## seconds to wait for each remote login
+                                          ## step's shell (e.g. a qsub -I queue wait)
   gInlineImageWidth* = 0                   ## default inline image width in px
                                            ## (org #+ATTR_* :width overrides it);
   gBufferTabs* = false                     ## show a tab per open buffer in the top
@@ -195,6 +199,12 @@ proc setReadingMargin*(ext: string; px: int) =
   gReadingMargins[ext.toLowerAscii] = px
 proc registerRepl*(langId: string; spec: ReplSpec) =
   gRepls[langId.toLowerAscii] = spec
+proc defineRemoteMethod*(name, loginCmd: string) =
+  ## A TRAMP-style method for `:dir "/ssh:host|NAME:user@host:/path"` (or
+  ## `/NAME:user@host:/path`): after ssh logs in to host, `loginCmd` replaces the
+  ## login shell (e.g. `qsub -I -q workq` -> an interactive job's shell on a
+  ## compute node), and the interpreter is started in THAT shell, in the path.
+  gRemoteMethods[name] = loginCmd
 type CtlVerbProc* = proc(app: var App; args: seq[string]; body: string): string
 var
   gCtlVerbs*: Table[string, CtlVerbProc]  ## extra `wkbctl` verbs (extensions register)
@@ -364,12 +374,13 @@ proc sshControlPath*(): string =
   ## marker sessions, so a password host is authenticated ONCE.
   getHomeDir() / ".ssh" / "wkb-cm-%C"
 
-proc remoteSpec(base: ReplSpec; host: string; dir = ""): ReplSpec =
+proc remoteSpec(base: ReplSpec; host: string; dir = ""; meth = ""): ReplSpec =
   ## Wrap a REPL spec to run on `host` over ssh, so an org block executes on a
   ## remote machine and its output is captured the same way. `ssh -tt` forces a
   ## remote pty; the spec's env (PS1=, PYTHON_BASIC_REPL=1) is set remotely via
   ## `env`; ControlPath reuses an already-authenticated master (no password
   ## prompt). `dir` (if given) is the remote working directory (cd + exec).
+  ## `meth` names a defineRemoteMethod login step (qsub -I ...) run first.
   result = base
   let ctrl = @["ssh", "-tt",
                "-o", "ControlPath=" & sshControlPath(),
@@ -380,26 +391,56 @@ proc remoteSpec(base: ReplSpec; host: string; dir = ""): ReplSpec =
     remote.add "env"
     for (k, v) in base.env: remote.add k & "=" & v
   remote.add base.argv
-  if dir.len > 0:
-    var cmd = "cd " & quoteShell(dir) & " && exec"
-    for a in remote: cmd.add " " & quoteShell(a)
-    result.argv = ctrl & @["sh", "-c", cmd]
+  var cmd = "exec"
+  for a in remote: cmd.add " " & quoteShell(a)
+  if meth.len > 0 and gRemoteMethods.hasKey(meth):
+    # Like TRAMP: an interactive login shell, then the method's login command
+    # replaces it (waiting in a queue if need be), then the interpreter.
+    result.argv = ctrl
+    result.launch = @["exec " & gRemoteMethods[meth],
+                      (if dir.len > 0: "cd " & quoteShell(dir) & "; " else: "") & cmd]
+    result.launchTimeoutMs = gRemoteLaunchTimeout * 1000
+  elif dir.len > 0:
+    # ssh joins its arguments into ONE string for the remote shell, so pass the
+    # command as one string (a `sh -c "..."` argv would lose its quoting).
+    result.argv = ctrl & @["cd " & quoteShell(dir) & " && " & cmd]
   else:
     result.argv = ctrl & remote
   result.env = @[]           # applied remotely via `env` above, not locally
+  # The interpreter can't read a temp file on this machine: copy each run's code
+  # to ~/.wkbenchless-run on the host (shared with compute nodes via $HOME) over
+  # the master connection, dropping this session's previous one.
+  let tag = "s" & $getCurrentProcessId() & "-" & $(epochTime() * 1000).int64
+  let sshArgs = "ssh -o BatchMode=yes -o ControlPath=" & quoteShell(sshControlPath()) &
+                " " & quoteShell(host)
+  result.stage = proc(code, nonce: string): string =
+    let d = ".wkbenchless-run"
+    let f = d & "/" & tag & "-" & nonce & ".src"
+    let (outp, rc) = execCmdEx(sshArgs & " " & quoteShell("mkdir -p " & d &
+      " && rm -f " & d & "/" & tag & "-*.src && cat > " & f & " && pwd"), input = code)
+    let lines = strutils.strip(outp).splitLines()
+    if rc != 0 or lines.len == 0: "" else: strutils.strip(lines[^1]) & "/" & f
+
+proc specFor*(base: ReplSpec; name: string; dir = ""): ReplSpec =
+  ## The spec a session called `name` runs: "name@user@host" (optionally
+  ## "|method") is remote over ssh, a plain name local.
+  let at = name.find('@')
+  if at < 0 or at == name.len - 1: return base
+  let target = name[at + 1 .. ^1]
+  let bar = target.find('|')
+  if bar < 0: remoteSpec(base, target, dir)
+  else: remoteSpec(base, target[0 ..< bar], dir, target[bar + 1 .. ^1])
 
 proc getSession*(app: var App; lang, name: string; dir = ""): Session =
   ## A session named "name@host" runs on `host` over ssh (remote REPL, in `dir`
   ## if given); a plain name runs locally. `dir` is used only when creating.
   let key = lang.toLowerAscii & "/" & name
   if app.sessions.hasKey(key) and app.sessions[key] != nil:
-    return app.sessions[key]
+    if app.sessions[key].pty.alive or app.sessions[key].busy:
+      return app.sessions[key]       # (a dead one with runs left fails them first)
+    app.sessions.del(key)            # its REPL exited: start a fresh one
   if not gRepls.hasKey(lang.toLowerAscii): return nil
-  let base = gRepls[lang.toLowerAscii]
-  let at = name.rfind('@')
-  let spec = if at >= 0 and at < name.len - 1: remoteSpec(base, name[at + 1 .. ^1], dir)
-             else: base
-  let s = startSession(spec)
+  let s = startSession(specFor(gRepls[lang.toLowerAscii], name, dir))
   if s != nil:
     app.sessions[key] = s
     app.ranIn.del(key)            # a fresh REPL has none of the earlier blocks' state
@@ -409,13 +450,23 @@ const headerArgKeys = ["session", "dir", "results", "exports", "tangle", "eval",
   "var", "cache", "noweb", "comments", "padline", "hlines", "colnames",
   "rownames", "wrap", "file", "output-dir", "mkdirp", "ssh"]
 
-proc parseSshDir*(v: string): tuple[host, path: string] =
-  ## `/ssh:user@host:/path` -> (user@host, /path); a plain path -> ("", path).
-  if v.startsWith("/ssh:"):
-    let d = v[5 .. ^1]
-    let c = d.find(':')
-    if c >= 0: (d[0 ..< c], d[c + 1 .. ^1]) else: (d, "")
-  else: ("", v)
+proc parseSshDir*(v: string): tuple[host, path, meth: string] =
+  ## TRAMP-style `/method:user@host:/path` -> (user@host, /path, method); a plain
+  ## path -> ("", path, ""). Surrounding quotes are dropped (org allows `:dir "..."`).
+  ## Multi-hop `/ssh:hop|method:user@host:/path` uses the last hop's host --
+  ## `meth` is that hop's method ("" for ssh-like ones), which a
+  ## defineRemoteMethod login step (e.g. `workq` -> qsub -I) can implement.
+  let v = if v.len >= 2 and v[0] == '"' and v[^1] == '"': v[1 .. ^2] else: v
+  let c0 = v.find(':')
+  if not v.startsWith("/") or c0 < 0 or '/' in v[1 ..< c0]: return ("", v, "")
+  let hop = v[1 .. ^1].split('|')[^1]        # "method:user@host:/path"
+  let m = hop.find(':')
+  if m < 0: return ("", v, "")
+  let meth = hop[0 ..< m]
+  let d = hop[m + 1 .. ^1]
+  let c = d.find(':')
+  let (host, path) = if c >= 0: (d[0 ..< c], d[c + 1 .. ^1]) else: (d, "")
+  (host, path, if meth in ["ssh", "sshx", "scp", "scpx", "rsync"]: "" else: meth)
 
 proc headerArgTokens*(app: App; lang: string): seq[string] =
   ## Default header args for `lang` from `#+PROPERTY: header-args[:LANG| LANG] ...`
@@ -2338,7 +2389,12 @@ proc interruptJob*(app: var App; id: int): string =
   if i < 0: return "unknown job " & $id
   if app.jobs[i].job.state in {jsDone, jsInterrupted}: return "job " & $id & " already finished"
   let s = if app.sessions.hasKey(app.jobs[i].sessKey): app.sessions[app.jobs[i].sessKey] else: nil
-  if s == nil or s.interrupt(id) == nil: return "job " & $id & " not found in its session"
+  if s == nil or s.interrupt(id) == nil:
+    # Orphaned (its session died or is gone): nothing to stop, just retire it so
+    # it no longer blocks recompile or leaves its placeholder "running".
+    app.jobs[i].job.state = jsInterrupted
+    app.jobs[i].job.output = "(interrupted: its session had ended)"
+    app.jobs[i].job.finished = epochTime()
   if app.jobs[i].kind == jkBlock:
     var aj = app.jobs[i]
     finishBabelJob(app, aj)
@@ -2379,7 +2435,7 @@ proc babelExecuteImpl(app: var App; force: bool) =
   if isRmd:
     # Rmd chunk header is ```{r ...}; the language is the token after the brace.
     lang = "r"
-  var sessName, host, dir, fileOut = ""
+  var sessName, host, dir, meth, fileOut = ""
   var gW, gH, gRes = 0
   var gType = ""
   var rawResults = false
@@ -2394,8 +2450,10 @@ proc babelExecuteImpl(app: var App; force: bool) =
       elif toks[k] == ":ssh" and k + 1 < toks.len and host.len == 0:
         host = toks[k + 1]
       elif toks[k] == ":dir" and k + 1 < toks.len and dir.len == 0 and host.len == 0:
-        let (h, p) = parseSshDir(toks[k + 1])
-        if h.len > 0: host = h
+        let (h, p, m) = parseSshDir(toks[k + 1])
+        if h.len > 0:
+          host = h
+          meth = m
         dir = p
       elif toks[k] == ":file" and k + 1 < toks.len and fileOut.len == 0:
         fileOut = toks[k + 1]
@@ -2431,16 +2489,26 @@ proc babelExecuteImpl(app: var App; force: bool) =
   apply(headerLineArgs)                              # then #+header: lines
   apply(headerArgTokens(app, lang))                  # then document defaults
   if sessName.len == 0: sessName = "default"
-  if host.len > 0 and '@' notin sessName: sessName = sessName & "@" & host
+  if host.len > 0 and '@' notin sessName:
+    sessName = sessName & "@" & host
+    if meth.len > 0:
+      if not gRemoteMethods.hasKey(meth):
+        app.msg = "no remote method '" & meth & "' (defineRemoteMethod in your config)"; return
+      sessName.add "|" & meth
   if host.len > 0 and not ensureSshMaster(app, host): return   # authenticate first
 
   var bodyLines: seq[string]
   for i in b + 1 ..< e: bodyLines.add app.ed.getLineText(i)
   app.curLang = lang.toLowerAscii; app.curSession = sessName   # keys are lower-lang
-  # `dir` (remote cwd) is parsed from :dir only to recover the host; running the
-  # block IN that dir is deferred -- for now we just send code and capture results.
-  let s = getSession(app, lang, sessName)
-  if s == nil: app.msg = "no session for '" & lang & "'"; return
+  # A remote session starts in `dir` (the :dir path on the host); a local one
+  # ignores it (getSession uses `dir` only for remote sessions, at creation).
+  let s = getSession(app, lang, sessName, dir)
+  if s == nil:
+    app.msg = if host.len > 0:
+                "could not start " & lang & " on " & host &
+                  " -- check that `ssh " & host & "` gives a shell (password expired? qsub rejected?)"
+              else: "no session for '" & lang & "'"
+    return
 
   # A `:file <path>` header (with graphics results) means the block draws a
   # figure: wrap the body in a graphics device so R saves it, then insert a
@@ -2781,7 +2849,8 @@ proc adoptHandoff*(app: var App): tuple[terminals: seq[Terminal]; active: int] =
       discard fcntl(fd, F_SETFL, O_NONBLOCK)
       discard fcntl(fd, F_SETFD, FD_CLOEXEC)             # re-arm for the next reload
       if f[0] == "S" and gRepls.hasKey(f[3]):
-        let sess = Session(pty: Pty(master: fd, pid: Pid(parseInt(f[2]))), spec: gRepls[f[3]])
+        let sess = Session(pty: Pty(master: fd, pid: Pid(parseInt(f[2]))),
+                           spec: specFor(gRepls[f[3]], f[4]))   # remote: keeps its stager
         # Re-define the run driver so a reload also upgrades it in live sessions
         # (the REPL reads it once it is idle; its echo is filtered from the pane).
         sess.pty.feed(sess.spec.prime)
