@@ -502,6 +502,12 @@ when (NimMajor, NimMinor, NimPatch) >= (1, 6, 0):
       compressionMethod: uint16
       uncompressedCrc32: uint32
 
+    # wkbenchless patch: write a classic (non-ZIP64) archive whenever it fits
+    # -- always, for a .docx. pandoc's zip reader rejects ZIP64 ("Can't read
+    # ZIP64 archive"), so an always-ZIP64 docx could not be re-imported.
+    var totalLen = 0
+    for v in entries.values: totalLen += v.len
+    let classic = totalLen < 0x7fffffff and entries.len < 0xffff
     var
       keys = toSeq(entries.keys) # The entries table is modified so use toSeq
       records: seq[(string, ArchiveEntry)]
@@ -539,23 +545,28 @@ when (NimMajor, NimMinor, NimPatch) >= (1, 6, 0):
       )))
 
       result.add32(fileHeaderSignature)
-      result.add16(45) # Min version to extract
+      result.add16(if classic: 20 else: 45) # Min version to extract
       result.add16(1.uint16 shl 11) # General purpose flags
       result.add16(compressionMethod)
       result.add16(lastModifiedTime)
       result.add16(lastModifiedDate)
       result.add32(uncompressedCrc32) # CRC-32 of uncompressed data
-      result.add32(uint32.high) # Compressed size (or 0xffffffff for ZIP64)
-      result.add32(uint32.high) # Uncompressed size (or 0xffffffff for ZIP64)
+      if classic:
+        result.add32(compressed.len.uint32)
+        result.add32(uncompressedLen.uint32)
+      else:
+        result.add32(uint32.high) # Compressed size (or 0xffffffff for ZIP64)
+        result.add32(uint32.high) # Uncompressed size (or 0xffffffff for ZIP64)
       result.add16(cast[uint16](fileName.len)) # File name length
-      result.add16(20) # Extra field length
+      result.add16(if classic: 0 else: 20) # Extra field length
 
       result.add(fileName)
 
-      result.add16(zip64ExtraFieldId)
-      result.add16(16)
-      result.add64(uncompressedLen)
-      result.add64(compressed.len)
+      if not classic:
+        result.add16(zip64ExtraFieldId)
+        result.add16(16)
+        result.add64(uncompressedLen)
+        result.add64(compressed.len)
 
       # result.add(compressed)
       if compressed != "":
@@ -571,32 +582,49 @@ when (NimMajor, NimMinor, NimPatch) >= (1, 6, 0):
     for i in 0 ..< records.len:
       let entry = records[i][1]
       result.add32(centralDirectoryFileHeaderSignature)
-      result.add16(45) # Version made by
-      result.add16(45) # Min version to extract
+      result.add16(if classic: 20 else: 45) # Version made by
+      result.add16(if classic: 20 else: 45) # Min version to extract
       result.add16(1.uint16 shl 11) # General purpose flags
       result.add16(entry.compressionMethod)
       result.add16(lastModifiedTime)
       result.add16(lastModifiedDate)
       result.add32(entry.uncompressedCrc32)
-      result.add32(uint32.high) # Compressed size (or 0xffffffff for ZIP64)
-      result.add32(uint32.high) # Uncompressed size (or 0xffffffff for ZIP64)
+      if classic:
+        result.add32(entry.compressedLen.uint32)
+        result.add32(entry.uncompressedLen.uint32)
+      else:
+        result.add32(uint32.high) # Compressed size (or 0xffffffff for ZIP64)
+        result.add32(uint32.high) # Uncompressed size (or 0xffffffff for ZIP64)
       result.add16(cast[uint16](records[i][0].len)) # File name length
-      result.add16(28) # Extra field length
+      result.add16(if classic: 0 else: 28) # Extra field length
       result.add16(0) # File comment length
       result.add16(0) # Disk number where file starts
       result.add16(0) # Internal file attributes
       result.add32(0) # External file attributes
-      result.add32(uint32.high) # Relative offset of local file header (or 0xffffffff for ZIP64)
+      if classic: result.add32(entry.fileHeaderOffset.uint32)
+      else: result.add32(uint32.high) # Relative offset of local file header (or 0xffffffff for ZIP64)
 
       result.add(records[i][0])
 
-      result.add16(zip64ExtraFieldId)
-      result.add16(24)
-      result.add64(entry.uncompressedLen)
-      result.add64(entry.compressedLen)
-      result.add64(entry.fileHeaderOffset)
+      if not classic:
+        result.add16(zip64ExtraFieldId)
+        result.add16(24)
+        result.add64(entry.uncompressedLen)
+        result.add64(entry.compressedLen)
+        result.add64(entry.fileHeaderOffset)
 
     let centralDirectoryEnd = result.len
+
+    if classic:
+      result.add32(endOfCentralDirectorySignature)
+      result.add16(0) # Number of this disk
+      result.add16(0) # Disk where central directory starts
+      result.add16(records.len.uint16)
+      result.add16(records.len.uint16)
+      result.add32((centralDirectoryEnd - centralDirectoryStart).uint32)
+      result.add32(centralDirectoryStart.uint32)
+      result.add16(0) # Comment length
+      return
 
     result.add32(zip64EndOfCentralDirectorySignature)
     result.add64(44)

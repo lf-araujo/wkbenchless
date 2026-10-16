@@ -101,6 +101,14 @@ proc criticToSpans(md: string; doneIds: var seq[int]): string =
   result = newStringOfCap(md.len)
   var i = 0
   var cid = 0
+  proc sep(r: var string) =
+    ## A span written right after `]' -- e.g. a comment straight after a
+    ## citation/cross-ref, `[@tbl:x][note]{.comment-start}' -- reads in pandoc
+    ## markdown as a `[text][label]' reference link: the comment-start is
+    ## swallowed and Word gets an orphan commentRangeEnd/commentReference with
+    ## no comment (desktop Word repairs it; Word Online refuses to open the
+    ## file). An empty span `[]{}' separates them and renders as nothing.
+    if r.len > 0 and r[^1] == ']': r.add "[]{}"
   proc closeOf(o, c: char): int =
     var q = i + 3
     while q + 2 < md.len:
@@ -130,7 +138,7 @@ proc criticToSpans(md: string; doneIds: var seq[int]): string =
             if "[DONE]" in note:
               doneIds.add cid
               note = note.replace("[DONE] ", "").replace("[DONE]", "").strip()
-            result.add "[" & orgCiteToPandoc(note) & "]{.comment-start id=\"" & $cid &
+            sep(result); result.add "[" & orgCiteToPandoc(note) & "]{.comment-start id=\"" & $cid &
                        "\" author=\"" & cauth & "\" date=\"" & d & "\"}" & rng &
                        "[]{.comment-end id=\"" & $cid & "\"}"
             inc cid
@@ -146,19 +154,20 @@ proc criticToSpans(md: string; doneIds: var seq[int]): string =
           case x
           of '+':
             let (au, tx) = peelAuthor(inner, a)
-            result.add "[" & orgCiteToPandoc(tx) & "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
+            sep(result); result.add "[" & orgCiteToPandoc(tx) & "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
           of '-':
             let (au, tx) = peelAuthor(inner, a)
-            result.add "[" & orgCiteToPandoc(tx) & "]{.deletion author=\"" & au & "\" date=\"" & d & "\"}"
+            sep(result); result.add "[" & orgCiteToPandoc(tx) & "]{.deletion author=\"" & au & "\" date=\"" & d & "\"}"
           of '=': result.add orgCiteToPandoc(inner)                        # highlight: keep the text
           of '~':
             let (au, body) = peelAuthor(inner, a)
             let arrow = body.find("~>")
             if arrow >= 0:
-              result.add "[" & orgCiteToPandoc(body[0 ..< arrow]) & "]{.deletion author=\"" & au & "\" date=\"" & d & "\"}"
-              result.add "[" & orgCiteToPandoc(body[arrow+2 .. ^1]) & "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
+              sep(result); result.add "[" & orgCiteToPandoc(body[0 ..< arrow]) & "]{.deletion author=\"" & au & "\" date=\"" & d & "\"}"
+              let (au2, newText) = peelAuthor(body[arrow+2 .. ^1], au)   # `~>[Author]new'
+              sep(result); result.add "[" & orgCiteToPandoc(newText) & "]{.insertion author=\"" & au2 & "\" date=\"" & d & "\"}"
             else:
-              result.add "[" & orgCiteToPandoc(body) & "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
+              sep(result); result.add "[" & orgCiteToPandoc(body) & "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
           else: discard
           i = e + 1; continue
       elif x == '>' and y == '>':                         # {>>[A] note<<}
@@ -177,7 +186,7 @@ proc criticToSpans(md: string; doneIds: var seq[int]): string =
           if "[DONE]" in note:
             doneIds.add cid
             note = note.replace("[DONE] ", "").replace("[DONE]", "").strip()
-          result.add "[" & orgCiteToPandoc(note) & "]{.comment-start id=\"" & $cid & "\" author=\"" &
+          sep(result); result.add "[" & orgCiteToPandoc(note) & "]{.comment-start id=\"" & $cid & "\" author=\"" &
                      cauth & "\" date=\"" & d & "\"}[]{.comment-end id=\"" & $cid & "\"}"
           inc cid
           i = e + 1; continue
@@ -221,12 +230,40 @@ proc downgradeHeadings(s: string): string =
   lines.join("\n")
 
 proc rewriteCommentPairs(s: string): string =
-  ## `[CTEXT]{.comment-start id="N" author="A" ...}BODY[]{.comment-end id="N"}'
-  ## -> `{==CTEXT==}{>>[A] BODY<<}'. CTEXT may itself contain `]' (a comment
-  ## quoting a citation), so find the fixed closing tag first, then scan
+  ## `[NOTE]{.comment-start id="N" author="A" ...}ANCHOR[]{.comment-end id="N"}'
+  ## -> `{==ANCHOR==}{>>[A] NOTE<<}'. pandoc puts the reviewer's comment NOTE in
+  ## the comment-start span and the commented (anchored) document text between
+  ## the start and end markers, so the anchor is the CriticMarkup highlight (it
+  ## stays in the prose) and the note is the `{>>..<<}' comment (it does not) --
+  ## emitting them the other way round leaks the note into the text and exiles
+  ## the real sentence to a margin comment. NOTE may itself contain `]' (a
+  ## comment quoting a citation), so find the fixed closing tag first, then scan
   ## backward by bracket depth for its true matching `[` -- a `[^]]*' forward
-  ## search stops at CTEXT's own first `]' and silently drops the comment.
+  ## search stops at NOTE's own first `]' and silently drops the comment.
   var s = s
+  # pandoc can nest one comment's end marker inside another's when both ranges
+  # end at the same point -- `[[]{.comment-end id="13"}]{.comment-end id="12"}'
+  # -- so the outer end is not the empty `[]{..}' looked for below: comment 12
+  # turns orphan and 13's anchor swallows the `[' of an enclosing insertion.
+  # Unwrap: `[X]{.comment-end id="N"}' -> `X[]{.comment-end id="N"}'.
+  block:
+    var k = 0
+    while true:
+      let ce = s.find("]{.comment-end", k)
+      if ce < 0: break
+      if ce > 0 and s[ce - 1] != '[':
+        var depth = 1
+        var q = ce - 1
+        while q >= 0:
+          if s[q] == ']': inc depth
+          elif s[q] == '[':
+            dec depth
+            if depth == 0: break
+          dec q
+        if q >= 0 and depth == 0 and "{.comment-end" in s[q + 1 ..< ce]:
+          s = s[0 ..< q] & s[q + 1 ..< ce] & "[" & s[ce .. ^1]
+          k = 0; continue
+      k = ce + 1
   while true:
     let cs = s.find("]{.comment-start")
     if cs < 0: break
@@ -244,20 +281,44 @@ proc rewriteCommentPairs(s: string): string =
         dec depth
         if depth == 0: open = p
       dec p
-    let ctext = if open >= 0: s[open + 1 ..< cs] else: ""
+    let note = if open >= 0: s[open + 1 ..< cs] else: ""   # reviewer's comment text
     let endTok = "[]{.comment-end id=\"" & cid & "\"}"
     let endPos = s.find(endTok, braceEnd + 1)
+    let cmt = "{>>" & (if author.len > 0: "[" & author & "] " else: "") & note & "<<}"
     if endPos < 0:
-      # orphan start marker: unwrap the anchor, keep the text, drop the span
-      if open >= 0:
-        s = s[0 ..< open] & ctext & s[braceEnd + 1 ..^ 1]
-      else:
-        s = s[0 ..< cs] & s[braceEnd + 1 ..^ 1]
+      # orphan start marker (no matching comment-end): drop the wrapper and keep
+      # the note as a standalone comment rather than leaking it into the prose.
+      let cut = if open >= 0: open else: cs
+      s = s[0 ..< cut] & cmt & s[braceEnd + 1 ..^ 1]
       continue
-    let body = s[braceEnd + 1 ..< endPos]
-    let repl =
-      (if ctext.len > 0: "{==" & ctext & "==}" else: "") &
-      "{>>" & (if author.len > 0: "[" & author & "] " else: "") & body & "<<}"
+    var anchor = s[braceEnd + 1 ..< endPos]   # the commented document text
+    # A Word comment range may start outside a tracked change and end inside it
+    # (or the reverse), so the anchor holds half a span: an unmatched `[' of an
+    # insertion that opens inside it, or the `]{.insertion ..}' of one that
+    # closes inside it. Keep those halves out of the highlight, or the span
+    # loses its bracket and its text turns plain.
+    var head, tail = ""
+    block:
+      var opens: seq[int]
+      var lastClose = -1                      # end of the last unmatched `]{..}'
+      var k = 0
+      while k < anchor.len:
+        if anchor[k] == '\\': k += 2; continue
+        if anchor[k] == '[': opens.add k
+        elif anchor[k] == ']':
+          if opens.len > 0: discard opens.pop()
+          else:
+            var e = k
+            if k + 1 < anchor.len and anchor[k + 1] == '{':
+              let b = anchor.find('}', k)
+              if b > 0: e = b
+            lastClose = e
+        inc k
+      if opens.len > 0:
+        tail = anchor[opens[0] .. ^1]; anchor = anchor[0 ..< opens[0]]
+      if lastClose >= 0 and lastClose < anchor.len:
+        head = anchor[0 .. lastClose]; anchor = anchor[lastClose + 1 .. ^1]
+    let repl = head & (if anchor.strip.len > 0: "{==" & anchor & "==}" else: anchor) & cmt & tail
     s = s[0 ..< open] & repl & s[endPos + endTok.len ..^ 1]
   s
 
@@ -277,7 +338,14 @@ proc mergeSubstitutions(s: string): string =
             let e2 = s.find("++}", k)
             if e2 > k + 3:
               let new = s[k + 3 ..< e2]
-              if '{' notin new and '}' notin new:
+              proc tagOf(x: string): string =
+                if x.startsWith("["):
+                  let rb = x.find(']')
+                  if rb > 0: return x[0 .. rb]
+                ""
+              # one author's replacement only: a deletion by one coauthor next
+              # to another's insertion are two separate edits
+              if '{' notin new and '}' notin new and tagOf(old) == tagOf(new):
                 result.add "{~~" & old & "~>" & new & "~~}"
                 i = e2 + 3
                 continue
@@ -303,55 +371,241 @@ proc stripAnchorSpans(s: string): string =
 
 proc rewriteChangeSpans(md: string): string =
   ## pandoc markdown track-change spans -> CriticMarkup (for docx -> md).
-  ## Balanced-bracket scan so inserted/deleted text may itself contain `]`.
+  ## The matching `[` is located by a balanced, escape-aware scan over the text
+  ## ALREADY EMITTED (`result`), never by md-index arithmetic. That matters for
+  ## NESTED spans -- a reviewer's deletion inside another author's insertion,
+  ## `[... [-]{.deletion author="b"} ...]{.insertion author="a"}` -- which
+  ## pandoc emits when one author edits inside another's tracked insertion. Each
+  ## `]{.class}` is processed innermost-first, so by the time the outer span is
+  ## wrapped its inner spans are already CriticMarkup of a different length;
+  ## trimming `result` by the ORIGINAL md span length (the old approach) then
+  ## over- or under-counts and shreds surrounding text into unbalanced tokens.
+  ## Scanning `result` is length-correct because inner CriticMarkup (`{--[b]x--}`,
+  ## author tags `[b]`, `[cite:@k]`, display math `\[..\]`) is bracket-balanced,
+  ## so it is skipped and the true outer `[` is found and nested cleanly.
   result = newStringOfCap(md.len)
   var i = 0
   while i < md.len:
-    # a closing `]{.class ...}` -> find the matching `[`, wrap in CriticMarkup
+    # a closing `]{.class ...}` -> find the matching `[` in `result`, wrap it
     if md[i] == ']' and i + 2 < md.len and md[i+1] == '{' and md[i+2] == '.':
       let braceEnd = md.find('}', i)
       if braceEnd > 0:
         let attrs = md[i+3 ..< braceEnd]      # skip `]{.`
         let cls = attrs.split({' ', '\t'})[0]
-        # find matching open bracket
-        var depth = 1; var p = i - 1
-        while p >= 0 and depth > 0:
-          if md[p] == ']': inc depth
-          elif md[p] == '[': dec depth
-          if depth == 0: break
+        # find the matching open bracket in the already-emitted result
+        var depth = 1; var p = result.len - 1
+        while p >= 0:
+          let esc = p > 0 and result[p-1] == '\\'   # ignore escaped \[ \]
+          if result[p] == ']' and not esc: inc depth
+          elif result[p] == '[' and not esc:
+            dec depth
+            if depth == 0: break
           dec p
+        # Where in `result` the span begins: the matching `[` when found, else
+        # -- for a block-spanning insertion/deletion whose inline `[` pandoc
+        # could not emit (markdown spans can't hold a paragraph break) or that a
+        # reviewer's own edit consumed -- the start of the current block. That
+        # wraps a fully-inserted paragraph as one token (pandoc emits one
+        # `\]{.insertion}` closer per inserted block) instead of leaving a bare
+        # orphan closer in the org.
+        var cutPos = -1        # where result is truncated (span replaced from here)
+        var contentStart = -1  # where the span's inner text begins in result
         if p >= 0 and depth == 0:
-          let inner = md[p+1 ..< i]
+          cutPos = p; contentStart = p + 1              # drop inner and its `[`
+        elif cls in ["insertion", "deletion", "mark"]:
+          if result.len > 0 and result[^1] == '\\':     # the escaped \] of this closer
+            result.setLen(result.len - 1)
+          let bs = result.rfind("\n\n")
+          cutPos = (if bs >= 0: bs + 2 else: 0)          # start of the current block
+          contentStart = cutPos
+        if cutPos >= 0:
+          let inner = result[contentStart ..< result.len]   # already-rewritten inner text
           var wrapped = ""
           case cls
           of "insertion":
             let au = spanAuthor(attrs)   # keep per-coauthor authorship for re-export
-            wrapped = (if au.len > 0: "{++[" & au & "]" & inner & "++}" else: "{++" & inner & "++}")
+            if inner.strip.len > 0:      # drop empty insertions (pandoc split artifacts)
+              wrapped = (if au.len > 0: "{++[" & au & "]" & inner & "++}" else: "{++" & inner & "++}")
           of "deletion":
             let au = spanAuthor(attrs)
-            wrapped = (if au.len > 0: "{--[" & au & "]" & inner & "--}" else: "{--" & inner & "--}")
+            if inner.strip.len > 0:
+              wrapped = (if au.len > 0: "{--[" & au & "]" & inner & "--}" else: "{--" & inner & "--}")
           of "mark": wrapped = "{==" & inner & "==}"
           else: wrapped = ""    # unknown class: drop the span, keep the text
-          # replace result[p+1..] : rebuild -- we appended md up to p already?
-          # (handled below by rewriting; see note)
-          if wrapped.len > 0 or cls notin ["insertion", "deletion", "mark"]:
-            # trim what we already emitted back to the open bracket, then wrap
-            result.setLen(result.len - (i - (p + 1)) - 1)   # drop inner + '['
-            if wrapped.len > 0: result.add wrapped
-            else: result.add inner
-            i = braceEnd + 1
-            continue
+          result.setLen(cutPos)                         # drop the span text and its `[`
+          if wrapped.len > 0: result.add wrapped
+          elif cls notin ["insertion", "deletion", "mark"]: result.add inner
+          i = braceEnd + 1
+          continue
     result.add md[i]; inc i
+
+proc flattenCritic*(s: string): string =
+  ## Word lets revisions and comment ranges overlap freely; CriticMarkup can't
+  ## nest (the stash, the org export and every reader assume flat tokens). So
+  ## after the span rewrite, resolve every overlap into adjacent flat tokens:
+  ##   - a highlight `{==..==}' whose range holds other markup loses its
+  ##     highlight -- its comment stays right after the anchored text (a point
+  ##     comment at the range end), the inner markup is kept;
+  ##   - a comment inside an insertion/deletion moves to just after it;
+  ##   - an insertion/deletion inside another (a coauthor deleting text another
+  ##     inserted) splits the outer one around it, each piece keeping its author.
+  ## `{~~a~>b~~}' is a leaf (mergeSubstitutions only builds brace-free ones).
+  type
+    Kind = enum kText, kIns, kDel, kHl, kCmt, kSub
+    Node = ref object
+      kind: Kind
+      text: string          # kText / kCmt / kSub: raw token text
+      author: string        # kIns / kDel: the `[author]' prefix (with brackets)
+      kids: seq[Node]
+      runStart: int         # kIns / kDel: where its current run's text began in outp
+      split: bool           # kIns / kDel: a nested change split this run
+  let opens = ["{++", "{--", "{=="]
+  let closes = ["++}", "--}", "==}"]
+  var i = 0
+  proc parse(closers: seq[string]): seq[Node] =
+    ## closers[^1] closes this level; an ancestor's closer met first means the
+    ## ranges interleave (a comment starting inside an insertion and ending
+    ## after it): end this level there without consuming it.
+    var buf = ""
+    proc flush(r: var seq[Node]) =
+      if buf.len > 0: r.add Node(kind: kText, text: buf); buf.setLen 0
+    while i < s.len:
+      if closers.len > 0 and startsWithAt(s, i, closers[^1]):
+        flush(result); i += 3; return
+      if closers.anyIt(startsWithAt(s, i, it)):
+        flush(result); return
+      if closers.len == 0 and closes.anyIt(startsWithAt(s, i, it)):
+        i += 3; continue                       # stray closer of an interleaved range
+      let oi = (if i + 2 < s.len: opens.find(s[i ..< i + 3]) else: -1)
+      if oi >= 0 and s.find(closes[oi], i + 3) >= 0:
+        flush(result)
+        i += 3
+        var au = ""
+        if oi < 2 and i < s.len and s[i] == '[':
+          let rb = s.find(']', i)
+          if rb > i and rb - i < 80 and '\n' notin s[i .. rb] and ' ' notin s[i+1 ..< rb].strip:
+            au = s[i .. rb]; i = rb + 1
+        let kids = parse(closers & closes[oi])
+        result.add Node(kind: [kIns, kDel, kHl][oi], author: au, kids: kids)
+        continue
+      var leaf = false
+      for (o, c, k) in [("{>>", "<<}", kCmt), ("{~~", "~~}", kSub)]:
+        if startsWithAt(s, i, o):
+          let e = s.find(c, i + 3)
+          if e >= 0:
+            flush(result)
+            result.add Node(kind: k, text: s[i ..< e + 3])
+            i = e + 3; leaf = true
+          break
+      if leaf: continue
+      buf.add s[i]; inc i
+    flush(result)
+  let tree = parse(@[])
+  proc plain(ns: seq[Node]): bool = ns.allIt(it.kind == kText)
+  var outp = newStringOfCap(s.len)
+  proc openEmph(t: string): string =
+    ## markdown emphasis left open at the end of T (`*' / `**' toggles)
+    var one, two = false
+    var k = 0
+    while k < t.len:
+      if t[k] == '\\': k += 2; continue
+      if t[k] == '*':
+        if k + 1 < t.len and t[k + 1] == '*': two = not two; k += 2; continue
+        one = not one
+      inc k
+    (if two: "**" else: "") & (if one: "*" else: "")
+  proc closeRun(ctx: Node): string =
+    ## close CTX's run for a split; returns the emphasis to reopen with
+    ctx.split = true
+    result = openEmph(outp[ctx.runStart .. ^1])
+    var closer = result
+    closer.reverse
+    # the closer hugs the last word (`*a b*  ', not `*a b *'): move the run's
+    # trailing whitespace after it
+    var ws = ""
+    while outp.len > ctx.runStart and outp[^1] in {' ', '\t'}:
+      ws.insert($outp[^1], 0); outp.setLen(outp.len - 1)
+    outp.add closer & ws & (if ctx.kind == kIns: "++}" else: "--}")
+  proc reopenRun(ctx: Node; emph: string) =
+    outp.add (if ctx.kind == kIns: "{++" else: "{--") & ctx.author
+    ctx.runStart = outp.len
+    outp.add emph
+  proc emit(ns: seq[Node]; ctx: Node; deferred: var seq[string]) =
+    ## ctx: the enclosing insertion/deletion whose run is open, or nil.
+    ## Splitting a run around a nested change keeps markdown emphasis
+    ## balanced in each piece (`*a {--b--} c*' -> `*a*' `{--b--}' `*c*').
+    for n in ns:
+      case n.kind
+      of kText: outp.add n.text
+      of kSub:
+        if ctx == nil: outp.add n.text
+        else:                                  # close the run around it
+          let emph = closeRun(ctx)
+          outp.add n.text
+          reopenRun(ctx, emph)
+      of kCmt:
+        if ctx == nil: outp.add n.text else: deferred.add n.text
+      of kHl:
+        if ctx == nil and plain(n.kids):
+          var t = ""
+          for k in n.kids: t.add k.text
+          if t.strip.len > 0: outp.add "{==" & t & "==}"
+        else:                                  # overlap: keep the text, drop the highlight
+          emit(n.kids, ctx, deferred)
+      of kIns, kDel:
+        let (o, c) = if n.kind == kIns: ("{++", "++}") else: ("{--", "--}")
+        var emph = ""
+        if ctx != nil:                         # close the enclosing run, emit, reopen
+          emph = closeRun(ctx)
+        outp.add o & n.author
+        n.runStart = outp.len
+        var inner: seq[string]
+        emit(n.kids, n, inner)
+        if n.split:                            # its own last piece balanced too
+          var cl = openEmph(outp[n.runStart .. ^1])
+          cl.reverse
+          outp.add cl
+        outp.add c
+        if ctx != nil:
+          deferred.add inner
+          reopenRun(ctx, emph)
+        else:
+          for d in inner: outp.add d
+  var top: seq[string]
+  emit(tree, nil, top)
+  for d in top: outp.add d
+  # splitting can leave empty runs `{++[a]++}' / `{--++}' -- drop them
+  result = outp
+  for (o, c) in [("{++", "++}"), ("{--", "--}")]:
+    var k = 0
+    while true:
+      let p = result.find(o, k)
+      if p < 0: break
+      var q = p + 3
+      if q < result.len and result[q] == '[':
+        let rb = result.find(']', q)
+        if rb > 0 and rb - q < 80 and result[q ..< rb].anyIt(it.isAlphaAscii): q = rb + 1
+      if startsWithAt(result, q, c):
+        result = result[0 ..< p] & result[q + 3 .. ^1]
+        k = p
+      elif q < result.len and result.find(c, q) >= 0 and
+           result[q ..< result.find(c, q)].strip(chars = Whitespace + {'*'}).len == 0 and
+           '{' notin result[q ..< result.find(c, q)]:
+        let e = result.find(c, q)        # keep its whitespace, drop stray `*'s
+        result = result[0 ..< p] & result[q ..< e].replace("*", "") & result[e + 3 .. ^1]
+        k = p
+      else: k = p + 3
 
 proc spansToCritic*(md: string): string =
   ## pandoc markdown track-change/comment spans -> CriticMarkup (docx -> md),
   ## the same passes as org-tracked-docx.el's otd--rewrite-spans: downgrade
   ## misclassified ATX headings, pair comment-start/end into `{==..==}{>>..<<}',
-  ## wrap insertion/deletion/mark spans, merge adjacent del+ins into a
-  ## substitution, strip `.anchor' classes.
+  ## wrap insertion/deletion/mark spans, flatten overlaps (CriticMarkup can't
+  ## nest), merge adjacent del+ins into a substitution, strip `.anchor' classes.
   var s = downgradeHeadings(md)
   s = rewriteCommentPairs(s)
   s = rewriteChangeSpans(s)
+  s = flattenCritic(s)
   s = mergeSubstitutions(s)
   stripAnchorSpans(s)
 
@@ -395,7 +649,9 @@ proc isBlockSyntax(t: string): bool =
     return true
   var i = 0
   while i < t.len and t[i] in Digits: inc i
-  i > 0 and i + 1 < t.len and t[i] in {'.', ')'} and t[i + 1] == ' '
+  # `3. item', and a bare `217.' -- an inserted fragment ending a number that
+  # pandoc would otherwise read as an empty list item and renumber `1.'
+  i > 0 and i < t.len and t[i] in {'.', ')'} and (i + 1 == t.len or t[i + 1] == ' ')
 
 proc convertCriticTokens(tokens: var seq[string]; options: seq[string]) =
   ## The text INSIDE CriticMarkup skips the main org->md pass (it is stashed so
@@ -409,6 +665,7 @@ proc convertCriticTokens(tokens: var seq[string]; options: seq[string]) =
   type Frag = tuple[tok, part: int; lead, trail, text: string]
   var frags: seq[Frag]
   var parts = newSeq[seq[string]](tokens.len)
+  var authorTags = newSeq[seq[string]](tokens.len)
   for ti, tok in tokens:
     if tok.len < 6: continue
     let kind = tok[0 .. 2]
@@ -419,7 +676,18 @@ proc convertCriticTokens(tokens: var seq[string]; options: seq[string]) =
       let arrow = inner.find("~>")
       parts[ti] = if arrow >= 0: @[inner[0 ..< arrow], inner[arrow + 2 .. ^1]] else: @[inner]
     else: continue                                   # {>> comments <<}: untouched
-    for pi, p in parts[ti]:
+    for pi, p0 in parts[ti]:
+      # a coauthor's `[Author]' tag is not text: keep it out of pandoc (which
+      # would escape it to `\[Author\]', so peelAuthor misses it, the change
+      # exports under the default author and the tag prints in Word)
+      var p = p0
+      var tag = ""
+      if p.startsWith("["):
+        let (au, rest) = peelAuthor(p, "")
+        if au.len > 0: tag = "[" & au & "]"; p = rest
+      authorTags[ti].setLen(max(authorTags[ti].len, pi + 1))
+      authorTags[ti][pi] = tag
+      parts[ti][pi] = p
       let t = p.strip()
       if t.len == 0 or "\n\n" in p or isBlockSyntax(t): continue
       let lead = p[0 ..< p.len - p.strip(leading = true, trailing = false).len]
@@ -458,7 +726,78 @@ proc convertCriticTokens(tokens: var seq[string]; options: seq[string]) =
     if ps.len == 0: continue
     let kind = tokens[ti][0 .. 2]
     let close = tokens[ti][^3 .. ^1]
-    tokens[ti] = kind & (if ps.len == 2: ps[0] & "~>" & ps[1] else: ps[0]) & close
+    proc tagged(k: int): string =
+      (if k < authorTags[ti].len: authorTags[ti][k] else: "") & ps[k]
+    tokens[ti] = kind & (if ps.len == 2: tagged(0) & "~>" & tagged(1) else: tagged(0)) & close
+
+proc criticTokensToOrg*(tokens: var seq[string]) =
+  ## Import-side mirror of convertCriticTokens. On docx -> org the CriticMarkup
+  ## tokens are stashed through the md -> org pass, so their text came back in
+  ## pandoc MARKDOWN syntax: `**bold**', `10^-3^', `Study^®^', `\[', `\<', `\''.
+  ## In an org file those print literally on the next export. Convert every
+  ## inline fragment (insertion, deletion, both substitution sides, highlight,
+  ## and a comment's note after its `[Author] ' prefix) to org in ONE pandoc
+  ## call, with the same batch-split fallback; a fragment pandoc can't convert
+  ## as a single inline paragraph stays as it was.
+  type Frag = tuple[tok, part: int; lead, trail, text: string]
+  var frags: seq[Frag]
+  var parts = newSeq[seq[string]](tokens.len)
+  var prefix = newSeq[string](tokens.len)       # a comment's "[Author] "
+  for ti, tok in tokens:
+    if tok.len < 6: continue
+    let kind = tok[0 .. 2]
+    var inner = tok[3 ..< tok.len - 3]
+    case kind
+    of "{++", "{--", "{==": parts[ti] = @[inner]
+    of "{~~":
+      let arrow = inner.find("~>")
+      parts[ti] = if arrow >= 0: @[inner[0 ..< arrow], inner[arrow + 2 .. ^1]] else: @[inner]
+    of "{>>":
+      if inner.startsWith("["):
+        let rb = inner.find(']')
+        if rb > 0:
+          var p = rb + 1
+          while p < inner.len and inner[p] == ' ': inc p
+          prefix[ti] = inner[0 ..< p]; inner = inner[p .. ^1]
+      parts[ti] = @[inner]
+    else: continue
+    for pi, p in parts[ti]:
+      let t = p.strip()
+      if t.len == 0 or "\n\n" in p: continue
+      if not (('*' in t) or ('^' in t) or ('\\' in t) or ('~' in t) or ('`' in t) or ('_' in t)):
+        continue                                     # nothing markdown-specific to convert
+      let lead = p[0 ..< p.len - p.strip(leading = true, trailing = false).len]
+      let trail = p[p.strip(leading = false, trailing = true).len .. ^1]
+      frags.add (ti, pi, lead, trail, t)
+  if frags.len == 0: return
+  let src = getTempDir() / "otd-fragments-in.md"
+  let dst = getTempDir() / "otd-fragments-in.org"
+  proc convert(lo, hi: int) =
+    if hi <= lo: return
+    var doc = ""
+    for k in lo ..< hi: doc.add "WKBFRAG" & $k & "X\n\n" & frags[k].text & "\n\n"
+    doc.add "WKBFRAG" & $hi & "X\n"
+    writeFile(src, doc)
+    let (code, _) = pandoc(@["-f", "markdown", "-t", "org", "--wrap=none", src, "-o", dst])
+    if code != 0:
+      if hi - lo > 1:
+        let mid = (lo + hi) div 2
+        convert(lo, mid); convert(mid, hi)
+      return
+    let org = readFile(dst)
+    for k in lo ..< hi:
+      let a = org.find("WKBFRAG" & $k & "X")
+      let b = org.find("WKBFRAG" & $(k + 1) & "X")
+      if a < 0 or b < 0 or b < a: continue
+      let conv = org[a + ("WKBFRAG" & $k & "X").len ..< b].strip()
+      if conv.len == 0 or "\n\n" in conv or isBlockSyntax(conv): continue
+      parts[frags[k].tok][frags[k].part] = frags[k].lead & conv & frags[k].trail
+  convert(0, frags.len)
+  for ti, ps in parts:
+    if ps.len == 0: continue
+    let kind = tokens[ti][0 .. 2]
+    let close = tokens[ti][^3 .. ^1]
+    tokens[ti] = kind & prefix[ti] & (if ps.len == 2: ps[0] & "~>" & ps[1] else: ps[0]) & close
 
 # ---- embedded canonical org source (round-trip recovery) -------------------
 # Port of org-tracked-docx's customXml embed/extract: the .org that generated
@@ -471,6 +810,7 @@ const
   cxNamespace = "urn:org-tracked-docx:source"
   cxPropName  = "OrgTrackedSource"   ## docProps/custom.xml property (survives Word/WPS/OneDrive saves)
   cxPropFmtId = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}"
+  cxPropChunk = 32000                ## < Word's 32767-char cap on a text property
 
 proc cdataUnescape(s: string): string =
   s.replace("]]]]><![CDATA[>", "]]>")
@@ -492,11 +832,11 @@ proc nextRelId(rel: string): int =
   inc result
 
 proc stripOrgProperty(cx: string): string =
-  ## Drop a stale <property ... name="OrgTrackedSource" ...>...</property> so a
-  ## re-embed does not leave two copies of the source.
+  ## Drop stale <property ... name="OrgTrackedSource*" ...>...</property> (the
+  ## chunks and the length) so a re-embed does not leave two copies of the source.
   result = cx
   while true:
-    let n = result.find("name=\"" & cxPropName & "\"")
+    let n = result.find("name=\"" & cxPropName)
     if n < 0: break
     let ps = result.rfind("<property", 0, n)
     let pe = result.find("</property>", n)
@@ -543,7 +883,7 @@ proc embedOrgSource*(docx, orgContent: string): bool =
       cdataEscape(orgContent) & "</orgTrackedSource>\n"
     entries["customXml/" & cxItemProps] =
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" &
-      "<ds:datastoreItem ds:itemID=\"{ORG-TRACKED-DOCX-SOURCE}\"" &
+      "<ds:datastoreItem ds:itemID=\"{6F1C1E2A-0B5D-4C9E-9A7E-3D2B8C4F1A01}\"" &
       " xmlns:ds=\"http://schemas.openxmlformats.org/officeDocument/2006/customXml\">" &
       "<ds:schemaRefs><ds:schemaRef ds:uri=\"" & cxNamespace & "\"/></ds:schemaRefs>" &
       "</ds:datastoreItem>\n"
@@ -597,9 +937,22 @@ proc embedOrgSource*(docx, orgContent: string): bool =
         let pe = cx.rfind("/>")
         if pe >= 0: cx = cx[0 ..< pe] & "></Properties>" & cx[pe+2 .. ^1]
       cx = stripOrgProperty(cx)
-      cx = cx.replace("</Properties>",
-        "<property fmtid=\"" & cxPropFmtId & "\" pid=\"" & $nextPid(cx) & "\" name=\"" &
-        cxPropName & "\"><vt:lpwstr>" & b64 & "</vt:lpwstr></property></Properties>")
+      # Word truncates a text property to 32767 chars on save (a 150 KB org is
+      # ~200 KB of base64), so split it into numbered chunks -- OrgTrackedSource,
+      # OrgTrackedSource2, ... -- plus OrgTrackedSourceLen, the total base64
+      # length, so import can tell a complete source from a cut one.
+      var props = ""
+      var pid = nextPid(cx)
+      let nChunks = max(1, (b64.len + cxPropChunk - 1) div cxPropChunk)
+      for k in 0 ..< nChunks:
+        let name = if k == 0: cxPropName else: cxPropName & $(k + 1)
+        props.add "<property fmtid=\"" & cxPropFmtId & "\" pid=\"" & $pid & "\" name=\"" &
+          name & "\"><vt:lpwstr>" &
+          b64[k * cxPropChunk ..< min(b64.len, (k + 1) * cxPropChunk)] & "</vt:lpwstr></property>"
+        inc pid
+      props.add "<property fmtid=\"" & cxPropFmtId & "\" pid=\"" & $pid & "\" name=\"" &
+        cxPropName & "Len\"><vt:lpwstr>" & $b64.len & "</vt:lpwstr></property>"
+      cx = cx.replace("</Properties>", props & "</Properties>")
       entries["docProps/custom.xml"] = cx
 
     # [Content_Types].xml must be the FIRST archive entry; zippy emits entries in
@@ -689,24 +1042,47 @@ proc propagateSectionChrome*(docx: string): bool =
   except CatchableError:
     result = false
 
+var gEmbeddedTruncated* = false  ## set by extractOrgSource: the docx's source was cut
+
 proc extractOrgSourceProperty(docx: string): string =
   ## Recover the embedded org from the docProps/custom.xml <OrgTrackedSource>
   ## property -- the fallback used when Word/OneDrive stripped the customXml/
   ## part on save. Port of otd--extract-org-source-property; CRLF/CR -> LF.
+  ## The source may be split over OrgTrackedSource, OrgTrackedSource2, ... with
+  ## OrgTrackedSourceLen giving the full base64 length. A source that does not
+  ## add up -- Word cut a property at its 32767-char cap, as it does to the
+  ## single unchunked property older exports wrote -- is rejected (""), so
+  ## import merges onto the open buffer instead of a canonical that silently
+  ## ends mid-document and drops everything after the cut.
+  gEmbeddedTruncated = false
   let unzipExe = findExe("unzip")
   if unzipExe.len == 0 or not fileExists(docx): return ""
   let (content, cc) = execCmdEx(quoteShell(unzipExe) & " -p " &
                                 quoteShell(docx) & " docProps/custom.xml")
   if cc != 0: return ""
-  let ni = content.find("name=\"" & cxPropName & "\"")
-  if ni < 0: return ""
-  let vs = content.find("<vt:lpwstr>", ni)
-  if vs < 0: return ""
-  let payStart = vs + "<vt:lpwstr>".len
-  let ve = content.find("</vt:lpwstr>", payStart)
-  if ve < 0: return ""
-  let b64 = content[payStart ..< ve].strip()
-  if b64.len == 0: return ""
+  proc prop(name: string): tuple[found: bool; value: string] =
+    let ni = content.find("name=\"" & name & "\"")
+    if ni < 0: return
+    let vs = content.find("<vt:lpwstr>", ni)
+    if vs < 0: return
+    let payStart = vs + "<vt:lpwstr>".len
+    let ve = content.find("</vt:lpwstr>", payStart)
+    if ve < 0: return
+    (true, content[payStart ..< ve].strip())
+  var (found, b64) = prop(cxPropName)
+  if not found or b64.len == 0: return ""
+  var k = 2
+  while true:
+    let (more, chunk) = prop(cxPropName & $k)
+    if not more: break
+    b64.add chunk; inc k
+  let (hasLen, lenStr) = prop(cxPropName & "Len")
+  let complete =
+    if hasLen: (try: parseInt(lenStr) == b64.len except ValueError: false)
+    else: b64.len mod 4 == 0 and b64.len < 32767
+  if not complete:
+    gEmbeddedTruncated = true
+    return ""
   try:
     result = base64.decode(b64).replace("\r\n", "\n").replace("\r", "\n")
   except CatchableError:
@@ -745,18 +1121,20 @@ proc resolveDoneComments(docx: string; doneIds: seq[int]): bool =
   ## with w15:done="1" for those ids, registered in [Content_Types].xml and the
   ## document rels. Port of org-tracked-docx's otd-resolve-comments.py.
   if doneIds.len == 0: return false
-  let unzipExe = findExe("unzip")
-  let zipExe   = findExe("zip")
-  if unzipExe.len == 0 or zipExe.len == 0: return false
+  ## The package is read and rewritten in memory with zippy, like
+  ## embedOrgSource: [Content_Types].xml first and NO directory entries. (This
+  ## used to shell out to `zip -r', which put [Content_Types].xml last and added
+  ## folder entries -- Word Online then refused to open the exported file.)
   let docxAbs = absolutePath(docx)
-  let tmp = getTempDir() / ("otd-done-" & $getCurrentProcessId() & "-" & $int(epochTime()))
-  removeDir(tmp); createDir(tmp)
-  defer: removeDir(tmp)
-  if execCmdEx(quoteShell(unzipExe) & " -q " & quoteShell(docxAbs) &
-               " -d " & quoteShell(tmp)).exitCode != 0: return false
-  let cPath = tmp / "word" / "comments.xml"
-  if not fileExists(cPath): return false            # no comments -> nothing to do
-  var comments = readFile(cPath)
+  if not fileExists(docxAbs): return false
+  var pkg: OrderedTable[string, string]
+  try:
+    let reader = openZipArchive(docxAbs)
+    defer: reader.close()
+    for path in reader.walkFiles: pkg[path] = reader.extractFile(path)
+  except CatchableError: return false
+  if "word/comments.xml" notin pkg: return false      # no comments -> nothing to do
+  var comments = pkg["word/comments.xml"]
   let headEnd = comments.find('>')
   if headEnd > 0 and "xmlns:w14=" notin comments[0 .. headEnd]:
     comments = comments.replace("<w:comments ",
@@ -801,20 +1179,19 @@ proc resolveDoneComments(docx: string; doneIds: seq[int]): bool =
   for cid in doneIds:
     if paraIds.hasKey(cid):
       entries.add "<w15:commentEx w15:paraId=\"" & paraIds[cid] & "\" w15:done=\"1\"/>"
-  writeFile(cPath, res)
-  writeFile(tmp / "word" / "commentsExtended.xml",
+  pkg["word/comments.xml"] = res
+  pkg["word/commentsExtended.xml"] = (
     "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n" &
     "<w15:commentsEx xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">" &
     entries & "</w15:commentsEx>")
-  let ct = tmp / "[Content_Types].xml"
-  if fileExists(ct):
-    let c = readFile(ct)
+  var ct = pkg.getOrDefault("[Content_Types].xml", "")
+  if ct.len > 0:
+    let c = ct
     if "commentsExtended" notin c:
-      writeFile(ct, c.replace("</Types>",
+      ct = (c.replace("</Types>",
         "<Override PartName=\"/word/commentsExtended.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml\"/></Types>"))
-  let rels = tmp / "word" / "_rels" / "document.xml.rels"
-  if fileExists(rels):
-    let r = readFile(rels)
+  if "word/_rels/document.xml.rels" in pkg:
+    let r = pkg["word/_rels/document.xml.rels"]
     if "commentsExtended.xml" notin r:
       var maxId = 0
       var k = 0
@@ -826,10 +1203,16 @@ proc resolveDoneComments(docx: string; doneIds: seq[int]): bool =
         while j < r.len and r[j] in {'0'..'9'}: num.add r[j]; inc j
         if num.len > 0: maxId = max(maxId, parseInt(num))
         k = j + 1
-      writeFile(rels, r.replace("</Relationships>",
+      pkg["word/_rels/document.xml.rels"] = (r.replace("</Relationships>",
         "<Relationship Id=\"rId" & $(maxId+1) & "\" Type=\"http://schemas.microsoft.com/office/2011/relationships/commentsExtended\" Target=\"commentsExtended.xml\"/></Relationships>"))
-  removeFile(docxAbs)
-  execCmdEx(quoteShell(zipExe) & " -q -r " & quoteShell(docxAbs) & " .", workingDir = tmp).exitCode == 0
+  # zippy writes entries in reverse insertion order: insert [Content_Types].xml
+  # LAST so it is the FIRST entry in the archive.
+  pkg.del("[Content_Types].xml")
+  pkg["[Content_Types].xml"] = ct
+  try:
+    writeFile(docxAbs, createZipArchive(pkg))
+    true
+  except CatchableError: false
 
 # ---- import merge: embedded canonical + reviewer's tracked changes ---------
 # Recover cite keys / cross-refs / #+headers / structure from the embedded
@@ -1145,6 +1528,31 @@ proc substituteCiteKeys*(text: string; num2key: Table[string, string]): string =
                   "[cite:@" & k & "]")
   s = restoreCiteForms(s)
   let n2key = num2key
+  # bracketed numbers `[21]', `[36, 52]', `[32–34]' -- the form a citation
+  # takes once a coauthor's Word drops its superscript/hyperlink. Converted
+  # only when EVERY number resolves through the docx bibliography, and never
+  # an org link `[[..][N]]' or a `[cite:..]'.
+  block:
+    var o = ""
+    var i = 0
+    while i < s.len:
+      if s[i] == '[' and (i == 0 or s[i - 1] notin {'[', ']'}):
+        var e = i + 1
+        while e < s.len and s[e] in {'0'..'9', ',', ' ', '-'}: inc e
+        var inner = s[i + 1 ..< e]
+        var e2 = e
+        while startsWithAt(s, e2, "–"):          # en-dash range, multi-byte
+          inner.add "--"; e2 += "–".len
+          while e2 < s.len and s[e2] in {'0'..'9', ',', ' '}: inner.add s[e2]; inc e2
+        if e2 < s.len and s[e2] == ']' and inner.len > 0 and inner[0].isDigit and
+           (e2 + 1 >= s.len or s[e2 + 1] notin {'[', ']'}):
+          let keys = parseCiteNums(inner, n2key)
+          if keys.len > 0:
+            o.add "[cite:" & keys.join(";") & "]"
+            i = e2 + 1
+            continue
+      o.add s[i]; inc i
+    s = o
   # numeric superscripts -> [cite:@k1;@k2...] (ranges expanded). Two forms:
   # org `^{9,10}' (pandoc converted it) and markdown `^9,10^' -- CriticMarkup
   # tokens are stashed as sentinels through the md->org pass, so text inside
@@ -1291,9 +1699,19 @@ proc wordContainment*(a, b: string): float =
 
 var gAlignDebug* = false      ## echo alignParagraphs' pointer walk when set
 
-proc alignParagraphs*(canon, tracked: seq[string]): seq[string] =
-  ## Two-pointer alignment (positional + fingerprint, lookahead 12): result[i]
+type Alignment* = object
+  aligned*: seq[string]  ## per canonical paragraph: its tracked paragraph(s), or ""
+  owner*: seq[int]       ## per tracked paragraph: the canonical paragraph it
+                         ## belongs to or follows (-1: none)
+  used*: seq[bool]       ## per tracked paragraph: consumed by `aligned'
+
+proc alignParagraphsEx*(canon, tracked: seq[string]): Alignment =
+  ## Two-pointer alignment (positional + fingerprint, lookahead 12): aligned[i]
   ## is the tracked paragraph aligned to canonical body paragraph i, or "".
+  ## Tracked paragraphs the walk steps over (a paragraph a coauthor split off
+  ## or wrote new, a commented heading's neighbour) are not lost: `owner'
+  ## records the canonical paragraph each one sits after, so the merge can
+  ## insert new text there and put comments that can't re-anchor next to it.
   ## Positional keeps canonical and tracked in step when a coauthor accepted
   ## edits (fingerprint-only would fall back to canonical and lose them);
   ## lookahead absorbs pandoc unwrapping the frontmatter author block into a
@@ -1303,19 +1721,25 @@ proc alignParagraphs*(canon, tracked: seq[string]): seq[string] =
   const la = 24
   let cfp = canon.mapIt(normalizeForMatch(it))
   let tfp = tracked.mapIt(normalizeForMatch(it))
-  result = newSeq[string](canon.len)
+  result.aligned = newSeq[string](canon.len)
+  result.owner = newSeqWith(tracked.len, -1)
+  result.used = newSeq[bool](tracked.len)
   var i = 0
   var j = 0
+  proc take(r: var Alignment; i, j: int; text: string) =
+    r.aligned[i] = text; r.owner[j] = i; r.used[j] = true
   while i < canon.len and j < tracked.len:
     if gAlignDebug: echo "i=", i, " j=", j, " C=", cfp[i][0 ..< min(30, cfp[i].len)], " T=", tfp[j][0 ..< min(30, tfp[j].len)]
     if fpEq(cfp[i], tfp[j]):
       if gAlignDebug: echo "  -> prefix pair"
-      result[i] = tracked[j]; inc i; inc j
+      result.take(i, j, tracked[j]); inc i; inc j
     else:
       var found = -1
       for k in j + 1 ..< min(tracked.len, j + la):   # extra tracked paras
         if fpEq(cfp[i], tfp[k]): found = k; break
-      if found >= 0: j = found; continue
+      if found >= 0:
+        for k in j ..< found: result.owner[k] = max(0, i - 1)   # stepped over: follows i-1
+        j = found; continue
       found = -1
       for k in i + 1 ..< min(canon.len, i + la):     # extra canonical paras
         if fpEq(cfp[k], tfp[j]): found = k; break
@@ -1328,7 +1752,7 @@ proc alignParagraphs*(canon, tracked: seq[string]): seq[string] =
       if pn >= 16 and cfp[i][0 ..< pn] == tfp[j][0 ..< pn] and
          tfp[j].len <= 2 * cfp[i].len and cfp[i].len <= 2 * tfp[j].len:
         if gAlignDebug: echo "  tier2 positional prefix"
-        result[i] = tracked[j]; inc i; inc j
+        result.take(i, j, tracked[j]); inc i; inc j
         continue
       # No prefix match in window on either side. Tier 2: a heavy edit (an
       # abstract rewrite, an expanded paragraph) defeats the 40-char prefix
@@ -1350,7 +1774,9 @@ proc alignParagraphs*(canon, tracked: seq[string]): seq[string] =
         if wordContainment(cfp[i], fpJoin) >= 0.6 and
            cfp[i].len <= 2 * fpJoin.len and fpJoin.len <= 2 * cfp[i].len:
           if gAlignDebug: echo "  tier2/3 join through k=", k
-          result[i] = rawJoin; inc i; j = k + 1
+          result.take(i, j, rawJoin)
+          for q in j + 1 .. k: result.owner[q] = i; result.used[q] = true
+          inc i; j = k + 1
           joined = true
           break
       if joined: continue
@@ -1363,8 +1789,15 @@ proc alignParagraphs*(canon, tracked: seq[string]): seq[string] =
         if fpEq(cfp[k], tfp[j]) or wordContainment(cfp[k], tfp[j]) >= 0.7:
           junk = false; break
       if gAlignDebug: echo "  keep canonical; junk=", junk
-      if junk: inc j
+      if junk: result.owner[j] = i; inc j
       inc i
+  for k in j ..< tracked.len:                      # trailing (the bibliography)
+    if result.owner[k] < 0: result.owner[k] = max(0, canon.len - 1)
+
+proc alignParagraphs*(canon, tracked: seq[string]): seq[string] =
+  ## alignParagraphsEx's per-canonical-paragraph alignment only.
+  alignParagraphsEx(canon, tracked).aligned
+
 
 proc scanAnnotations*(text: string): seq[tuple[range, cmt: string]] =
   ## Balance-aware scan of `{==RANGE==}{>>CMT<<}' pairs: a bracket stack over
@@ -1497,6 +1930,392 @@ proc criticComments(text: string): seq[string] =
     result.add text[s ..< e + 3]
     i = e + 3
 
+proc cslOf(canonical, baseDir: string): string =
+  ## The `csl:' value of the canonical's `#+PANDOC_OPTIONS:' headers, resolved
+  ## like the bibliography paths; "" when none (pandoc then uses its default).
+  for ln in canonical.splitLines():
+    let t = ln.strip
+    if t.toLowerAscii.startsWith("#+pandoc_options:"):
+      let v = t[t.find(':') + 1 ..^ 1].strip
+      if v.toLowerAscii.startsWith("csl:"):
+        let p = expandTilde(v[4 ..^ 1].strip)
+        return if isAbsolute(p): p else: baseDir / p
+  ""
+
+proc isCrossRef(body: string): bool =
+  ## A `[cite:...]' whose keys are all pandoc-crossref labels (@tbl:, @fig:, ...).
+  for part in body.split(';'):
+    let k = part.strip
+    if k.len > 0 and not (k.startsWith("@tbl:") or k.startsWith("@fig:") or
+                          k.startsWith("@sec:") or k.startsWith("@eq:")):
+      return false
+  true
+
+proc buildAuthorYearMap*(canonical, baseDir: string): seq[tuple[rendered, cite: string]] =
+  ## Rendered citation text -> the canonical's own `[cite:...]', for
+  ## author-date styles (APA, Chicago author-date, ...), where citeproc writes
+  ## "(Nash et al., 2005; Verhulst et al., 2015)" into the docx and the
+  ## numeric back-substitution (buildDocxNumMap) has nothing to key on.
+  ## Every bibliographic citation of the canonical is rendered with the
+  ## document's own CSL and bibliographies in ONE pandoc run, in document
+  ## order, so citeproc's whole-document disambiguation ("H. H. Maes" vs
+  ## "H. Maes", "Neale, Aggen, et al.") matches what went into the docx.
+  ## Returns @[] (no substitution) when rendering fails or the paragraph count
+  ## does not line up -- a wrong key is worse than plain text.
+  var cites: seq[string]                       # the original `[cite...]' text
+  var i = 0
+  while true:
+    let s = canonical.find("[cite", i)
+    if s < 0: break
+    let colon = canonical.find(':', s)
+    let e = canonical.find(']', s)
+    if e < 0 or colon < 0 or colon > e: break
+    let tok = canonical[s .. e]
+    if not isCrossRef(canonical[colon + 1 ..< e]) and tok notin cites: cites.add tok
+    i = e + 1
+  if cites.len == 0: return
+  let bibs = bibPathsOf(canonical, baseDir)
+  var args = @["-f", "markdown", "-t", "plain", "--wrap=none", "--citeproc",
+               "-M", "suppress-bibliography=true"]
+  var anyBib = false
+  for b in bibs:
+    if fileExists(b): args.add "--bibliography=" & b; anyBib = true
+  if not anyBib: return
+  let csl = cslOf(canonical, baseDir)
+  if csl.len > 0 and fileExists(csl): args.add "--csl=" & csl
+  var md = ""
+  for c in cites: md.add orgCiteToPandoc(c) & "\n\n"
+  let src = getTempDir() / "otd-cites.md"
+  let dst = getTempDir() / "otd-cites.txt"
+  writeFile(src, md)
+  let (code, _) = pandoc(args & @[src, "-o", dst])
+  if code != 0 or not fileExists(dst): return
+  var paras: seq[string]
+  for p in readFile(dst).split("\n\n"):
+    let q = nbspToSpace(p).strip
+    if q.len > 0: paras.add q
+  if paras.len != cites.len: return
+  proc keySet(c: string): seq[string] =        # same keys in another order = same cite
+    for k in c[c.find(':') + 1 ..^ 2].split(';'): result.add k.strip
+    result.sort()
+  var seen: Table[string, string]
+  for k in 0 ..< cites.len:
+    let r = paras[k]
+    if "???" in r or r.len < 6: continue        # unresolved key: leave the text alone
+    if seen.hasKey(r):
+      if seen[r].len > 0 and keySet(seen[r]) != keySet(cites[k]): seen[r] = ""  # truly ambiguous
+    else: seen[r] = cites[k]
+  for r, c in seen:
+    if c.len > 0: result.add (r, c)
+  result.sort(proc (a, b: tuple[rendered, cite: string]): int = cmp(b.rendered.len, a.rendered.len))
+
+proc substituteAuthorYear*(text: string; ay: seq[tuple[rendered, cite: string]]): string =
+  ## Replace each rendered author-date citation in TEXT by its `[cite:...]'
+  ## (longest first, so a two-key group wins over its one-key prefix).
+  result = nbspToSpace(text)
+  for (r, c) in ay:
+    result = result.replace(r, c)
+
+type RbTok = object
+  key: string      ## comparison key; "" = glue (whitespace, emphasis markers)
+  text: string
+
+proc rbTokens(s: string; xrefMap: XrefMap): seq[RbTok] =
+  ## Tokenize a paragraph for rebaseOnCanonical: CriticMarkup tokens, citations,
+  ## cross-refs, links, sub/superscripts and words are atoms; whitespace and
+  ## emphasis markers are glue. Keys normalise what the docx round-trip changes
+  ## without meaning to: citation forms, `Table N' vs `[cite:@tbl:x]', bare vs
+  ## bracketed URLs, curly vs straight quotes, `--' vs an en dash.
+  var nOf: Table[string, string]                 # "tbl:one" -> "tbl1"
+  for typ, entries in xrefMap.pairs:
+    for (label, n) in entries: nOf[typ & ":" & label] = typ & $n
+  const xwords = {"table": "tbl", "tbl.": "tbl", "figure": "fig", "fig.": "fig",
+                  "section": "sec", "sec.": "sec", "equation": "eq", "eq.": "eq"}
+  proc normInner(t: string): string =
+    ## markup content key: drop `[author]' tags and emphasis, collapse spaces
+    var x = t
+    for sep in ["~>"]:
+      x = x.replace(sep, " \x03 ")
+    var o = ""
+    var k = 0
+    var atStart = true
+    while k < x.len:
+      if atStart and x[k] == '[':
+        let rb = x.find(']', k)
+        if rb > k and rb - k < 60 and '@' notin x[k .. rb] and ':' notin x[k .. rb]:
+          k = rb + 1; atStart = false; continue
+      if x[k] == '\x03': atStart = true; o.add " > "; inc k; continue
+      if x[k] notin {'*', '/', '_', '=', '~', '\t', '\n'}: o.add x[k]
+      if x[k] != ' ': atStart = false
+      inc k
+    o.splitWhitespace.join(" ").toLowerAscii
+  proc add(r: var seq[RbTok]; key, text: string) = r.add RbTok(key: key, text: text)
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    # CriticMarkup atom
+    if c == '{' and i + 2 < s.len:
+      let op = s[i ..< i + 3]
+      let cl = case op
+               of "{++": "++}"
+               of "{--": "--}"
+               of "{~~": "~~}"
+               of "{==": "==}"
+               of "{>>": "<<}"
+               else: ""
+      if cl.len > 0:
+        let e = s.find(cl, i + 3)
+        if e >= 0:
+          result.add("M" & op & normInner(s[i + 3 ..< e]), s[i ..< e + 3])
+          i = e + 3; continue
+    # [cite:...] -- a citation, or a cross-ref keyed by its rendered number
+    if startsWithAt(s, i, "[cite:"):
+      let e = s.find(']', i)
+      if e > 0:
+        let body = s[i + 6 ..< e].strip
+        let lab = if body.startsWith("@"): body[1 .. ^1] else: body
+        result.add((if nOf.hasKey(lab): "X" & nOf[lab] else: "CITE"), s[i .. e])
+        i = e + 1; continue
+    # org links [[url]] / [[url][desc]] -- citeproc anchors are citations
+    if startsWithAt(s, i, "[["):
+      let e = s.find("]]", i)
+      if e > 0:
+        let inner = s[i + 2 ..< e]
+        let br = inner.find("][")
+        let url = (if br >= 0: inner[0 ..< br] else: inner)
+        if url.startsWith("#citeproc_bib_item"): result.add("CITE", s[i .. e + 1])
+        elif url.startsWith("#"):
+          let lab = url[1 .. ^1]
+          result.add((if nOf.hasKey(lab): "X" & nOf[lab] else: "L" & url), s[i .. e + 1])
+        else: result.add("L" & url.strip(chars = {'<', '>'}).toLowerAscii, s[i .. e + 1])
+        i = e + 2; continue
+    # numeric citation forms: ^{21}, [21], [36, 52], [32–34]
+    if c == '^' and i + 2 < s.len and s[i + 1] == '{':
+      let e = s.find('}', i)
+      if e > 0:
+        let body = s[i + 2 ..< e]
+        result.add((if body.len > 0 and body.allCharsInSet({'0'..'9', ',', ' ', '-'}): "CITE"
+                    else: "^" & body), s[i .. e])
+        i = e + 1; continue
+    if c == '_' and i + 1 < s.len and s[i + 1] == '{':
+      let e = s.find('}', i)
+      if e > 0: result.add("_" & s[i + 2 ..< e], s[i .. e]); i = e + 1; continue
+    if c == '[' and i + 1 < s.len and s[i + 1].isDigit:
+      var e = i + 1
+      while e < s.len and (s[e] in {'0'..'9', ',', ' ', '-'} or startsWithAt(s, e, "–")):
+        e += (if startsWithAt(s, e, "–"): "–".len else: 1)
+      if e < s.len and s[e] == ']':
+        result.add("CITE", s[i .. e]); i = e + 1; continue
+    # bare URL
+    if startsWithAt(s, i, "http://") or startsWithAt(s, i, "https://"):
+      var e = i
+      while e < s.len and s[e] notin {' ', '\t', '\n', ')', ']', '>'}: inc e
+      var url = s[i ..< e]
+      while url.len > 0 and url[^1] in {'.', ',', ';'}: url.setLen(url.len - 1)
+      result.add("L" & url.toLowerAscii, url)
+      i += url.len; continue
+    # multi-byte glue / punctuation
+    if startsWithAt(s, i, "​"): result.add("", "​"); i += 3; continue
+    if startsWithAt(s, i, " "): result.add("", " "); i += 2; continue
+    block uni:
+      for (u, k) in [("’", "'"), ("‘", "'"), ("“", "\""), ("”", "\""),
+                     ("–", "-"), ("—", "--"), ("−", "-"), ("…", "...")]:
+        if startsWithAt(s, i, u):
+          result.add(k, u); i += u.len; break uni
+      # ASCII
+      if c in {' ', '\t', '\n', '\r'}:
+        var e = i
+        while e < s.len and s[e] in {' ', '\t', '\n', '\r'}: inc e
+        result.add("", s[i ..< e]); i = e
+      elif c in {'*', '/', '_'}:
+        result.add("", $c); inc i
+      elif startsWithAt(s, i, "---"): result.add("--", "---"); i += 3
+      elif startsWithAt(s, i, "--"): result.add("-", "--"); i += 2
+      elif c == '\\' and startsWithAt(s, i, "\\\\"): result.add("", "\\\\"); i += 2
+      elif c.isAlphaNumeric or ord(c) >= 0x80:
+        var e = i
+        while e < s.len and (s[e].isAlphaNumeric or (ord(s[e]) >= 0x80 and
+              not startsWithAt(s, e, "’") and not startsWithAt(s, e, "–") and
+              not startsWithAt(s, e, "—") and not startsWithAt(s, e, "​") and
+              not startsWithAt(s, e, " ") and not startsWithAt(s, e, "“") and
+              not startsWithAt(s, e, "”") and not startsWithAt(s, e, "‘"))): inc e
+        if e == i: e = i + 1
+        let w = s[i ..< e]
+        # `Table 2' / `Figure 1' as one cross-ref atom
+        let lw = w.toLowerAscii
+        var done = false
+        for (xw, typ) in xwords:
+          if lw == xw.strip(chars = {'.'}) :
+            var k = e
+            if k < s.len and s[k] == '.': inc k
+            var sp = k
+            while sp < s.len and s[sp] == ' ': inc sp
+            if startsWithAt(s, sp, " "): sp += 2
+            var ne = sp
+            while ne < s.len and s[ne].isDigit: inc ne
+            if ne > sp and sp > k - 0 and (sp > k or startsWithAt(s, k, " ")):
+              result.add("X" & typ & s[sp ..< ne], s[i ..< ne]); i = ne; done = true
+            break
+        if not done:
+          result.add(lw, w); i = e
+      else:
+        result.add($c, $c); inc i
+
+proc commentsOutOfWords*(s: string): string =
+  ## Word anchors comments inside words (`status f{>>..<<}or', or with the
+  ## formatting-run split `f/{>>..<<}/or'): move each such run of comments to
+  ## the end of the word it splits, the word rejoined.
+  result = s
+  var k = 0
+  while true:
+    let p = result.find("{>>", k)
+    if p < 0: break
+    var e = p                                   # end of the run of comments
+    while startsWithAt(result, e, "{>>"):
+      let c = result.find("<<}", e)
+      if c < 0: break
+      e = c + 3
+    if e == p: break
+    var a = p                                   # emphasis markers before / after
+    while a > 0 and result[a - 1] in {'*', '/', '_'}: dec a
+    var b = e
+    while b < result.len and result[b] in {'*', '/', '_'}: inc b
+    if a > 0 and result[a - 1].isAlphaNumeric and b < result.len and
+       result[b].isAlphaNumeric and result[a ..< p] == result[e ..< b]:
+      var w = b
+      while w < result.len and result[w].isAlphaNumeric: inc w
+      # `f/` + `/or' are a closing and reopening italic: drop both
+      result = result[0 ..< a] & result[b ..< w] & result[p ..< e] & result[w .. ^1]
+      k = a + (w - b) + (e - p)
+    else: k = e
+
+proc rebaseOnCanonical*(canon, tracked: string; xrefMap: XrefMap): string =
+  ## Carry a coauthor's paragraph onto the canonical one instead of replacing
+  ## it: a token LCS keeps the canonical's own text -- emphasis, `[cite:]'
+  ## keys, cross-refs, links, list numbers, dashes -- wherever the words agree,
+  ## and takes from TRACKED only what differs: the coauthors' CriticMarkup and
+  ## any untracked rewording. The docx round-trip otherwise turns italic quotes
+  ## into bold fragments, bare URLs into `[[url][<url>]]', `2.' into `1.'.
+  ## The canonical's own comments always survive. Returns "" when the two
+  ## paragraphs agree on too little to trust the alignment.
+  # Highlights are only comment anchors, and Word's comment ranges cut across
+  # words and citations (`intac{==t[32--34==}{==].==}'). Align on the bare
+  # text, then re-wrap each anchor that still sits intact right before its
+  # comment; the rest stay point comments at the same spot.
+  var anchors: seq[tuple[x, tok: string]]
+  var bare = newStringOfCap(tracked.len)
+  block:
+    var pending = ""
+    var i = 0
+    while i < tracked.len:
+      if startsWithAt(tracked, i, "{=="):
+        let e = tracked.find("==}", i + 3)
+        if e >= 0 and not hasCriticMarkup(tracked[i + 3 ..< e]):
+          pending = tracked[i + 3 ..< e]
+          bare.add pending; i = e + 3; continue
+      if startsWithAt(tracked, i, "{>>"):
+        let e = tracked.find("<<}", i + 3)
+        if e >= 0:
+          let tok = tracked[i .. e + 2]
+          if pending.len > 0: anchors.add (pending, tok)
+          pending = ""
+          bare.add tok; i = e + 3; continue
+      pending = ""
+      bare.add tracked[i]; inc i
+  # pandoc splits a word where Word's formatting runs break inside it
+  # (`f//or', `e**ntering'): a doubled emphasis marker between two word
+  # characters is never real org, so drop it before tokenizing.
+  block:
+    var o = newStringOfCap(bare.len)
+    var i = 0
+    while i < bare.len:
+      if i > 0 and bare[i] in {'*', '/', '_', '=', '~', '+'} and bare[i - 1].isAlphaNumeric:
+        var e = i
+        while e < bare.len and bare[e] == bare[i]: inc e
+        if e - i >= 2 and e < bare.len and bare[e].isAlphaNumeric:
+          i = e; continue
+      o.add bare[i]; inc i
+    bare = o
+  # Word keeps an edit typed inside a sub/superscript run in that run, so
+  # pandoc nests it in the braces -- `γ_{1{++)++}}': markup inside `_{..}' is
+  # neither valid org nor matchable, so hoist it out after the script.
+  block:
+    var o = newStringOfCap(bare.len)
+    var i = 0
+    while i < bare.len:
+      if i + 1 < bare.len and bare[i] in {'_', '^'} and bare[i + 1] == '{':
+        let cb = bare.find('}', i + 2)
+        let ob = bare.find('{', i + 2)
+        if ob >= 0 and cb > ob and ob + 2 < bare.len and bare[ob + 1] in {'+', '-', '~', '>', '='}:
+          var hoisted = ""
+          var k = ob
+          var ok = true
+          while k < bare.len and bare[k] == '{':
+            let cl = case bare[k + 1]
+                     of '+': "++}"
+                     of '-': "--}"
+                     of '~': "~~}"
+                     of '>': "<<}"
+                     else: "==}"
+            let e = bare.find(cl, k + 3)
+            if e < 0: ok = false; break
+            hoisted.add bare[k ..< e + 3]; k = e + 3
+          if ok and k < bare.len and bare[k] == '}':
+            o.add bare[i ..< ob] & "}" & hoisted
+            i = k + 1; continue
+      o.add bare[i]; inc i
+    bare = o
+  bare = commentsOutOfWords(bare)
+  let ct = rbTokens(canon, xrefMap)
+  let tt = rbTokens(bare, xrefMap)
+  var ci, ti: seq[int]                            # significant token indexes
+  for k, t in ct: (if t.key.len > 0: ci.add k)
+  for k, t in tt: (if t.key.len > 0: ti.add k)
+  let n = ci.len
+  let m = ti.len
+  if n == 0 or m == 0: return ""
+  # LCS table (suffix form), uint16 cells -- paragraphs are a few hundred tokens
+  var dp = newSeq[uint16]((n + 1) * (m + 1))
+  template D(a, b: int): untyped = dp[(a) * (m + 1) + (b)]
+  for a in countdown(n - 1, 0):
+    for b in countdown(m - 1, 0):
+      D(a, b) = if ct[ci[a]].key == tt[ti[b]].key: D(a + 1, b + 1) + 1
+                else: max(D(a + 1, b), D(a, b + 1))
+  if D(0, 0).int * 2 < n: return ""              # too little in common
+  proc glueBefore(toks: seq[RbTok]; idx: seq[int]; p: int): string =
+    let lo = if p == 0: 0 else: idx[p - 1] + 1
+    let hi = if p < idx.len: idx[p] else: toks.len
+    for k in lo ..< hi: result.add toks[k].text
+  proc fmtOnly(g: string): string =
+    for ch in g:
+      if ch in {'*', '/', '_'}: result.add ch
+  proc wsOnly(g: string): string =
+    if g.len == 0: "" else:
+      (if g.anyIt(it in {' ', '\t', '\n'}) or " " in g: " " else: "")
+  result = ""
+  var a = 0
+  var b = 0
+  while a < n or b < m:
+    if a < n and b < m and ct[ci[a]].key == tt[ti[b]].key:
+      result.add glueBefore(ct, ci, a) & ct[ci[a]].text
+      inc a; inc b
+    elif b < m and (a == n or D(a, b + 1) >= D(a + 1, b)):
+      result.add wsOnly(glueBefore(tt, ti, b)) & tt[ti[b]].text
+      inc b
+    else:
+      let tok = ct[ci[a]]
+      if tok.key.startsWith("M{>>"):                  # canonical comments always survive
+        result.add glueBefore(ct, ci, a) & tok.text
+      else:
+        result.add fmtOnly(glueBefore(ct, ci, a))     # keep emphasis balanced
+      inc a
+  result.add glueBefore(ct, ci, n)
+  for (x, tok) in anchors:
+    let p = result.find(tok)
+    if p > x.len and x.strip.len >= 3 and x.anyIt(it.isAlphaNumeric) and
+       result[0 ..< p].endsWith(x) and not insideAnnotation(result, p - x.len):
+      result = result[0 ..< p - x.len] & "{==" & x & "==}" & result[p .. ^1]
+
 proc mergeContent*(canonical, tracked, baseDir: string; report: var string): string =
   ## Walk CANONICAL preserving its full structure (headers, property drawers,
   ## export/src blocks, tables -- all verbatim); replace a body paragraph with
@@ -1510,28 +2329,107 @@ proc mergeContent*(canonical, tracked, baseDir: string; report: var string): str
   ## substring; any that still can't be placed go to a
   ## `* Reviewer comments not auto-placed' section -- nothing is ever lost.
   let num2key = buildDocxNumMap(tracked, bibPathsOf(canonical, baseDir))
+  let ay = buildAuthorYearMap(canonical, baseDir)
   let xrefMap = buildXrefMap(canonical)
+  proc backsub(t: string): string =
+    substituteXrefs(substituteAuthorYear(substituteCiteKeys(t, num2key), ay), xrefMap)
+  proc backsubFor(t, canon: string): string =
+    ## Back-substitution for a tracked paragraph replacing canonical CANON:
+    ## rendered `Table N' / `Figure N' become cross-refs only where CANON used
+    ## them (a response letter's plain "Table 1" stays plain); and when the
+    ## paragraph carries as many citations as CANON, CANON's own `[cite:]'s
+    ## are put back in order -- exact keys and order, instead of trusting the
+    ## title match of the docx bibliography (similar titles can mis-resolve)
+    ## or leaving a number that did not resolve.
+    result = substituteAuthorYear(substituteCiteKeys(t, num2key), ay)
+    if "[cite:@fig:" in canon or "[cite:@tbl:" in canon or "[cite:@sec:" in canon or
+       "[cite:@eq:" in canon:
+      result = substituteXrefs(result, xrefMap)
+    proc isXref(c: string): bool =
+      for x in ["[cite:@fig:", "[cite:@tbl:", "[cite:@sec:", "[cite:@eq:", "[cite:@lst:"]:
+        if c.startsWith(x): return true
+    proc citeSpans(x: string; numeric: bool): seq[Slice[int]] =
+      var k = 0
+      while k < x.len:
+        if startsWithAt(x, k, "[cite:"):
+          let e = x.find(']', k)
+          if e < 0: break
+          if not isXref(x[k .. e]): result.add k .. e
+          k = e + 1; continue
+        if numeric and x[k] == '[' and (k == 0 or x[k - 1] notin {'[', ']'}):
+          var e = k + 1
+          while e < x.len and (x[e] in {'0'..'9', ',', ' ', '-'} or startsWithAt(x, e, "–")):
+            e += (if startsWithAt(x, e, "–"): "–".len else: 1)
+          if e < x.len and x[e] == ']' and e > k + 1 and x[k + 1].isDigit and
+             (e + 1 >= x.len or x[e + 1] notin {'[', ']'}):
+            result.add k .. e; k = e + 1; continue
+        if numeric and x[k] == '^' and k + 2 < x.len and x[k + 1] == '{' and x[k + 2].isDigit:
+          let e = x.find('}', k)
+          if e > 0 and x[k + 2 ..< e].allCharsInSet({'0'..'9', ',', ' ', '-'}):
+            result.add k .. e; k = e + 1; continue
+        inc k
+    let cc = citeSpans(canon, false)
+    let tc = citeSpans(result, true)
+    if cc.len > 0 and cc.len == tc.len:
+      for k in countdown(tc.len - 1, 0):
+        result = result[0 ..< tc[k].a] & canon[cc[k]] & result[tc[k].b + 1 .. ^1]
+  proc listMarker(t: string): int =
+    ## length of a leading `N. ' list marker, or 0
+    var k = 0
+    while k < t.len and t[k].isDigit: inc k
+    if k > 0 and k + 1 < t.len and t[k] in {'.', ')'} and t[k + 1] == ' ': k + 2 else: 0
   let units = parseUnits(canonical)
   let cParas = bodyParas(units)
-  let tParas = bodyParas(parseUnits(tracked))
-  let align = alignParagraphs(cParas, tParas)
+  let tUnits = parseUnits(tracked)
+  let tParas = bodyParas(tUnits)
+  let al = alignParagraphsEx(cParas, tParas)
+  # Paragraph-end sentinels: where a comment that can't re-anchor goes (the
+  # end of the canonical paragraph its tracked paragraph aligned to or follows).
+  proc mark(k: int): string = "\x01P" & $k & "\x02"
+  proc hasEdits(t: string): bool = "{++" in t or "{--" in t or "{~~" in t
   var outLines: seq[string]
   var bi = 0
   var nMerged = 0
+  var nNew = 0
   for u in units:
     if u.kind == ukStruct:
       outLines.add u.text
     else:
-      let ti = align[bi]; inc bi
+      let ti = al.aligned[bi]
       if ti.len > 0 and (hasCriticMarkup(ti) or normalizeForMatch(ti) != normalizeForMatch(u.text)):
-        var repl = substituteXrefs(substituteCiteKeys(ti, num2key), xrefMap)
+        var ti2 = ti
+        # keep the canonical's list number: Word numbers each list item of a
+        # docx apart, so pandoc hands every one back as `1.'
+        let cm = listMarker(u.text)
+        let tm = listMarker(ti2)
+        if cm > 0 and tm > 0: ti2 = u.text[0 ..< cm] & ti2[tm .. ^1]
+        var repl = rebaseOnCanonical(u.text,
+                     substituteAuthorYear(substituteCiteKeys(ti2, num2key), ay), xrefMap)
+        if repl.len == 0: repl = backsubFor(ti2, u.text)
         # the canonical paragraph's own comments must survive the replacement
         for c in criticComments(u.text):
           if not repl.contains(c): repl.add " " & c
-        outLines.add repl
+        outLines.add repl & mark(bi)
         inc nMerged
       else:
-        outLines.add u.text
+        outLines.add u.text & mark(bi)
+      # tracked paragraphs the alignment stepped over that carry edits -- a
+      # paragraph a coauthor split off or wrote new -- go in right after
+      # tracked paragraphs the alignment stepped over go in right after it when
+      # they carry edits (a paragraph a coauthor wrote new) or hold text of
+      # this canonical paragraph that its replacement lacks (a coauthor split
+      # it in two: the replacement is only the first half)
+      let replText = normalizeForMatch(outLines[^1])
+      for j, t in tParas:
+        if al.used[j] or al.owner[j] != bi: continue
+        let tn = normalizeForMatch(t)
+        let splitOff = wordContainment(tn, normalizeForMatch(u.text)) >= 0.8 and
+                       wordContainment(tn, replText) < 0.8
+        if hasEdits(t) or splitOff:
+          outLines.add ""
+          outLines.add substituteAuthorYear(substituteCiteKeys(t, num2key), ay)
+          inc nNew
+      inc bi
   var merged = outLines.join("\n")
   var nGrafted = 0
   var unplaced: seq[tuple[range, cmt: string]]
@@ -1539,12 +2437,75 @@ proc mergeContent*(canonical, tracked, baseDir: string; report: var string): str
   # The canonical's OWN comments must survive a paragraph replacement too:
   # graft any that the replaced tracked text no longer carries.
   reanchorComments(merged, canonical, num2key, xrefMap, nGrafted, unplaced)
+  # Every tracked comment still missing (a short or repeated anchor, a comment
+  # on a heading, a figure caption or a table) becomes a point comment at the
+  # end of the paragraph it belongs to, quoting its anchor -- never nested
+  # into a heading, caption, table or cite.
+  var anchorOf: Table[string, string]
+  for a in scanAnnotations(tracked): anchorOf["{>>" & a.cmt & "<<}"] = a.range
+  var nPoint = 0
+  var placedToks: HashSet[string]
+  var still: seq[tuple[range, cmt: string]]
+  var tb = -1                                  # tracked body-paragraph index
+  var pendingHeading: seq[string]              # comments on struct lines
+  proc place(tok: string; owner: int) =
+    if merged.contains(tok) or merged.contains(backsub(tok)): return
+    let rng = applyCriticMarkup(anchorOf.getOrDefault(tok, ""), accept = true).strip
+    let inner = tok[3 ..< tok.len - 3]
+    var note = inner
+    if rng.len > 0:
+      let q = "(re: \"" & (if rng.len > 60: rng[0 ..< 57] & "..." else: rng) & "\") "
+      let rb = inner.find("] ")
+      note = if inner.startsWith("[") and rb > 0: inner[0 .. rb + 1] & q & inner[rb + 2 .. ^1]
+             else: q & inner
+    let m = mark(max(owner, 0))
+    if owner >= 0 and merged.contains(m):
+      merged = merged.replace(m, " {>>" & note & "<<}" & m)
+      placedToks.incl tok
+      inc nPoint
+    else:
+      still.add (rng, inner)
+  proc commentsIn(t: string): seq[string] =
+    var k = 0
+    while true:
+      let p = t.find("{>>", k)
+      if p < 0: break
+      let e = t.find("<<}", p)
+      if e < 0: break
+      result.add t[p .. e + 2]; k = e + 3
+  for u in tUnits:
+    if u.kind == ukBody:
+      inc tb
+      let owner = if tb < al.owner.len: al.owner[tb] else: -1
+      for tok in pendingHeading: place(tok, owner)
+      pendingHeading.setLen 0
+      for tok in commentsIn(u.text): place(tok, owner)
+    else:
+      pendingHeading.add commentsIn(u.text)
+  for tok in pendingHeading: place(tok, cParas.len - 1)
+  for k in 0 ..< cParas.len: merged = merged.replace(mark(k), "")
+  merged = commentsOutOfWords(merged)
+  for r in unplaced:
+    let tok = "{>>" & r.cmt & "<<}"
+    if tok notin placedToks and not merged.contains(tok) and
+       not merged.contains(backsub(tok)) and r notin still: still.add r
+  unplaced = still
   if unplaced.len > 0:
     merged.add "\n\n* Reviewer comments not auto-placed\n:PROPERTIES:\n:UNNUMBERED: t\n:END:\n"
+    # The anchor text and the note are printed as plain text here, so neutralise
+    # any stray CriticMarkup delimiters they carry (a mis-paired or overlapping
+    # source annotation can leave one) -- otherwise the dumped `{>>note<<}' wrapper
+    # would nest and leave the document with an unbalanced CriticMarkup token.
+    proc flatCritic(s: string): string =
+      s.multiReplace(("{==", ""), ("==}", ""), ("{>>", ""), ("<<}", ""),
+                     ("{++", ""), ("++}", ""), ("{--", ""), ("--}", ""),
+                     ("{~~", ""), ("~~}", ""), ("~>", " -> ")).strip
     for (r, c) in unplaced:
-      merged.add "\n- re: " & r & " :: " & "{>>" & c & "<<}" & "\n"
+      merged.add "\n- re: " & flatCritic(r) & " :: " & "{>>" & flatCritic(c) & "<<}" & "\n"
   report = $nMerged & " paragraph" & (if nMerged == 1: "" else: "s") & " merged, " &
+            (if nNew > 0: $nNew & " new, " else: "") &
             $nGrafted & " comment" & (if nGrafted == 1: "" else: "s") & " re-anchored" &
+            (if nPoint > 0: ", " & $nPoint & " placed at their paragraph" else: "") &
             (if unplaced.len > 0: ", " & $unplaced.len & " unplaced (listed at the end)" else: "")
   merged
 
@@ -1608,7 +2569,8 @@ proc authorBlock(app: App): string =
   ##   #+AUTHOR_LIST: Name :: key1, key2 :: corresponding
   ##   #+AUTHOR_GROUP: for the ... Group
   ## into a #+begin_export markdown block with pandoc superscript affiliation
-  ## letters (a, b, ... in #+AFFIL declaration order) and a numbered affil list.
+  ## numbers (1, 2, ... in #+AFFIL declaration order) matching the numbered
+  ## affiliation list below the byline (Nature-style numeric affiliations).
   var affils: seq[(string, string)]                 # (key, description), in order
   var authors: seq[tuple[name: string; keys: seq[string]; corr: bool]]
   var group = ""
@@ -1632,13 +2594,13 @@ proc authorBlock(app: App): string =
     elif low.startsWith("#+author_group:"):
       group = strutils.strip(ln[ln.find(':') + 1 .. ^1])
   if authors.len == 0: return ""
-  var letter: Table[string, string]
-  for idx, a in affils: letter[a[0]] = $chr(ord('a') + (idx mod 26))
+  var label: Table[string, string]
+  for idx, a in affils: label[a[0]] = $(idx + 1)   # numeric superscripts, matching the list
   var authorStrs: seq[string]
   for au in authors:
     var sups: seq[string]
     for k in au.keys:
-      if letter.hasKey(k): sups.add letter[k]
+      if label.hasKey(k): sups.add label[k]
     if au.corr: sups.add "*"
     authorStrs.add (if sups.len > 0: au.name & "^" & sups.join(",") & "^" else: au.name)
   var authorLine = authorStrs.join(", ")
@@ -1664,6 +2626,7 @@ proc otdImport(app: var App) =
   let orgOut = getTempDir() / "otd-import.org"
   (code, outp) = pandoc(@["-f", "markdown", "-t", "org", "--wrap=none", md, "-o", orgOut])
   if code != 0: (app.msg = "pandoc md->org failed: " & outp.strip(); return)
+  criticTokensToOrg(toks)          # their text skipped md->org: convert it too
   let tracked = unstash(readFile(orgOut), toks)
   # Merge base: the org embedded in the docx when it survived the round-trip
   # (customXml, or the docProps fallback Word/OneDrive leave intact), else the
@@ -1672,7 +2635,8 @@ proc otdImport(app: var App) =
   var base = "embedded org source"
   if canonical.len == 0 and app.filePath.len > 0 and app.filePath.endsWith(".org"):
     canonical = app.ed.fullText()
-    base = "the open buffer"
+    base = "the open buffer" &
+           (if gEmbeddedTruncated: " (the docx's embedded source was truncated by Word)" else: "")
   if canonical.len > 0:
     var report: string
     app.ed.setText(mergeContent(canonical, tracked,
