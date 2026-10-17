@@ -3107,7 +3107,19 @@ proc drawToken(db: var DrawBuf; fg, bg: Color) =
           db.tempStr.setLen db.tempStr.len - 1   # drop the char that overflowed
           break
         inc probe
-      if probe <= ra: break
+      if probe <= ra:
+        # Not even one char fits in what is left of this row (the token starts
+        # right at the edge). Wrap to the next row and retry instead of giving
+        # up: a bare `break` here dropped the rest of the token and left dim.x
+        # at the edge, so every later token on the line failed the same way and
+        # the rest of the paragraph silently vanished until a resize moved the
+        # wrap points. Only stop when the row is already empty (pane narrower
+        # than one glyph), which would otherwise loop forever.
+        if db.dim.x <= db.oldX: break
+        db.dim.x = db.oldX
+        db.dim.y += db.lineH
+        if db.dim.y + db.lineH > db.maxY: break
+        continue
       let ext2 = textWidth(db.font, db.tempStr)
       drawSubtoken(db, ra, probe - 1, fg, bg)
       db.dim.x += ext2
