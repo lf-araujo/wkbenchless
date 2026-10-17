@@ -1,6 +1,6 @@
 # wkbenchless.nimble
 
-version       = "0.4.3"
+version       = "0.4.4"
 author        = "Luis F. Araujo"
 description   = "A native, deeply Nim-configurable literate editor: org-babel, LSP, interactive REPL sessions, org-src fontification -- a workbench-less alternative to heavier IDEs."
 license       = "MIT"
