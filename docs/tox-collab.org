@@ -1,0 +1,140 @@
+#+TITLE: P2P collaborative editing: Tox transport, CRDT.el model
+#+AUTHOR: wkbenchless
+#+STARTUP: nohideblocks
+
+Design notes for collaborative editing in wkbenchless: share a tox
+address with another user and co-edit the same buffer, with no server
+anywhere on the wire. The editing model is ported from CRDT.el (Logoot
+split); the transport is libtoxcore, used the way minitox.c demonstrates.
+
+* Ingredients
+
+** minitox (github.com/hqwrong/minitox)
+
+Single-file C client over toxcore; the annotated reference for the
+plumbing the daemon needs: identity (=tox_self_get_address=, savedata),
+DHT bootstrap, friend requests/messages, text conferences, presence.
+
+** CRDT.el (code.librehq.com/qhong/crdt.el)
+
+The editing brain, ported rather than reinvented:
+
+- Logoot split :: every character block carries a CRDT-ID -- a list of
+  =(position, site)= pairs packed as 2-byte big-endian integers, plus a
+  block offset; blocks are contiguous runs sharing a base ID, with an
+  end-of-block flag so split segments don't re-merge. Concurrent edits
+  converge with no coordination -- which is what makes a serverless
+  transport viable at all.
+- op protocol :: =insert (buffer, user, crdt-id, position-hint, content)=,
+  =delete (buffer, user, position-hint, id-list)=,
+  =cursor (point-id, mark-id)=, plus =sync=/=ready= (initial dump),
+  =get= (resync), =contact=, =leave=. Position hints let receivers
+  binary-search from nearby.
+- roadmap :: remote cursors as overlays, org folding sync, buffer-local
+  variable CRDTs, remote commands, shared processes.
+
+* License finding (drives the architecture)
+
+c-toxcore is GPL-3.0-or-later (verified in its LICENSE file; only some
+bundled components are MIT). nim-toxcore (~ehmry), a nice compile-time
+link wrapper with closure callbacks, is also GPL-3.0-or-later. Any
+in-process use -- link-time, or even =dlopen= under the FSF's reading of
+"combined work" -- makes the wkbenchless binary GPL-3. wkbenchless is
+MIT; that is not an acceptable side effect of an optional feature.
+
+Solution: keep tox entirely out of process. A separate companion
+daemon owns the GPL surface; wkbenchless talks to it over a local unix
+socket. Processes communicating at arm's length are separate works --
+both licenses stay intact. (This is also CRDT.el's own "editor as a
+service" cross-editor pattern, and matches our ctl-socket culture.)
+
+* Architecture
+
+#+begin_example
+wkbenchless A (host)                     wkbenchless B (guest)
+  crdt session, listens on TCP :6543      connects localhost:6543
+       |                                      |
+       | extension spawns/manages             | tuntox -i <A's tox ID> \
+  tuntox (server mode)  <---- Tox DHT ----  -L 6543:127.0.0.1:6543
+#+end_example
+
+The transport insight (proven in the wild by an HN commenter who pairs
+Emacs CRDT.el sessions over tuntox): tuntox already IS the daemon -- a
+mature GPLv3 single binary that tunnels TCP over Tox. wkbenchless only
+needs a TCP socket (stdlib =net=, zero new deps); the extension spawns
+and manages tuntox as a child process, the same way the editor already
+spawns terminals and REPL sessions. License-clean (process boundary),
+no wkbtoxd to write, and LAN mode is free (plain TCP, no tox).
+
+- The extension owns the CRDT doc (the idmap), buffer glue, remote
+cursors, and the TCP server/client for the session.
+- =M-x tox-share= starts listening and prints the tuntox command line
+for the peer; =M-x tox-join <host:port>= connects (localhost when
+behind tuntox).
+- Phase 5: speak crdt.el's own protocol over the same tunnel for Emacs
+interop (their HACKING.org documents both the primary sexp protocol and
+the cross-editor bridge protocol).
+
+* Dependency posture
+
+| Platform             | libtoxcore                | Note                             |
+|----------------------+---------------------------+----------------------------------|
+| Debian/Fedora/Arch/ALT | packaged (0.2.22+)      | plain =-ltoxcore=                |
+| macOS                | =brew install toxcore=    | homebrew-core                    |
+| Solus                | not packaged              | source build: cmake + libsodium  |
+|                      |                           | (libsodium-devel now installed)  |
+| Windows              | buildable                 | upstream CI uses vcpkg; mingw    |
+|                      |                           | builds confirmed easy            |
+
+wkbenchless itself gains no dependency on any platform -- the collab
+feature is stdlib-only (net/json). tuntox is the only optional piece:
+a single C binary (its deps: libtoxcore + libsodium), built only where
+tox transport is wanted; over LAN the session is plain TCP with no tox
+at all.
+
+* Files
+
+#+begin_example
+extensions/_logoot.nim      pure CRDT: IDs, blocks, ops, pending deletes (MIT)
+extensions/tox_collab.nim   extend*(app): doc glue + TCP session + tuntox (MIT)
+src/test_logoot.nim         unit + convergence property tests
+#+end_example
+
+* The one core hook this needs
+
+A per-frame =tick= hook (in main; ~2 lines) so the extension can drain
+the daemon socket each loop wake (the loop already wakes every 30-100ms
+for the pty/ctl polling). Edit deltas are captured by shadow-diffing
+the buffer on version change -- no further core surface required.
+
+* Protocol
+
+** Wire (TCP, line JSON v1)
+
+=hello= (protocol version) -> =sync= (block dump: id, eob, text) ->
+=ready= -> then =insert= / =delete= / =cursor= / =contact= / =leave= /
+=get= (resync on error). Deletes of not-yet-seen IDs become pending
+tombstones: Tox delivers out of order, and Logoot lets a character be
+born deleted.
+
+Phase 1 keeps CRDT.el's host-relayed star (total order = host order).
+Phase 2 is the payoff: broadcast ops to a Tox conference and let Logoot
+convergence replace the relay -- no server, no relay, two addresses.
+
+* UX surface
+
+- =M-x tox-share= (listen + print the tuntox command line for the peer),
+  =M-x tox-join <host:port>=, =M-x tox-leave=
+- remote peers = colored cursor markers + name in the status line
+- =wkbctl tox-peers= so agents can drive sessions
+- phase 5 fun: a =#+TOX:= header makes the file its own invite; share
+  the host's babel session (CRDT.el's remote-process idea)
+
+* Phases
+
+1. [X] design
+2. [ ] =_logoot.nim= + tests -- the riskiest part proven first
+3. [ ] TCP session: sync + ops + remote cursors (host-relayed star)
+4. [ ] tuntox spawn/manage: the tox transport
+5. [ ] crdt.el protocol adapter: Emacs interop over the same tunnel
+6. [ ] org folding sync, shared babel, binary wire format

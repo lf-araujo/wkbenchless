@@ -456,7 +456,9 @@ static int imageCount = 0;
 
 int cocoa_loadImage(const char *path) {
   if (!path || path[0] == '\0') return 0;
-  if (imageCount >= MAX_IMAGES) return 0;
+  int haveFree = 0;
+  for (int i = 0; i < imageCount; i++) if (!imageSlots[i]) { haveFree = 1; break; }
+  if (!haveFree && imageCount >= MAX_IMAGES) return 0;
 
   CFStringRef cfPath = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
   if (!cfPath) return 0;
@@ -472,9 +474,19 @@ int cocoa_loadImage(const char *path) {
   CFRelease(source);
   if (!cgImage) return 0;
 
-  int idx = imageCount++;
+  /* reuse a slot freed by cocoa_freeImage, else take a new one */
+  int idx = -1;
+  for (int i = 0; i < imageCount; i++) if (!imageSlots[i]) { idx = i; break; }
+  if (idx < 0) idx = imageCount++;
   imageSlots[idx] = cgImage;
   return idx + 1; /* 1-based handle */
+}
+
+void cocoa_freeImage(int handle) {
+  int idx = handle - 1;
+  if (idx < 0 || idx >= imageCount || !imageSlots[idx]) return;
+  CGImageRelease(imageSlots[idx]);
+  imageSlots[idx] = NULL;
 }
 
 void cocoa_getImageSize(int handle, int *outW, int *outH) {

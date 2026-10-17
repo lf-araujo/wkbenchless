@@ -92,12 +92,23 @@ proc configure*(app: var App) =
     rgb(0x2aa198), rgb(0x268bd2), rgb(0x6c71c4), rgb(0xd33682)])
   # "seventeen": a NANO light theme styled after Sublime Text's "Sixteen".
   # grey5 text on off-white; strong/headings pink-red, salient/links orange,
-  # strings green, comments faded grey, selection light grey.
-  registerTheme("seventeen", [
+  # strings green, comments faded grey, selection light grey. The chrome is
+  # hand-tuned below: Sublime paints its tab & status lines in one flat gray
+  # (its tab-line label gray, #323233 -- not the lighter status-line one),
+  # keeps every control gray, and paints the active tab in the buffer's own
+  # background so it merges with the text area.
+  var seventeen = base16Theme("seventeen", [
     rgb(0xf9f9f9), rgb(0xededed), rgb(0xd8d8d8), rgb(0xb8b8b8),
     rgb(0x767676), rgb(0x545454), rgb(0x333333), rgb(0xffffff),
     rgb(0xd2322d), rgb(0xf09642), rgb(0xc9a227), rgb(0x9dbf42),
     rgb(0x4d9d9d), rgb(0xf09642), rgb(0xd2322d), rgb(0x8b5a2b)])
+  seventeen.statusFg = rgb(0x323233)      # Sublime's tab-line gray, everywhere
+  seventeen.chipFg = rgb(0x323233)        # tab labels / toolbar icons
+  seventeen.chipActiveFg = rgb(0x323233)   # active tab label (bg does the work)
+  seventeen.chipActiveBg = rgb(0xf9f9f9)   # = base00: active tab merges with the buffer
+  seventeen.closeBg = rgb(0x767676)       # gray [x] (was the pink-red accent)
+  seventeen.minBg = rgb(0x767676)         # gray [_] (was the yellow accent)
+  registerTheme(seventeen)
   applyThemeByName(app, "seventeen")    # the default (persisted choice overrides it)
 
   # ---- Your customisations --------------------------------------------------

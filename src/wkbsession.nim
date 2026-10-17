@@ -22,9 +22,27 @@ type
       ## a probe, so a hop like `exec qsub -I ...` can wait in a batch queue
       ## before the next line (the one that execs the interpreter) is sent.
     launchTimeoutMs*: int   ## max wait for each launch shell to answer (0 = 120 s)
-    stage*: proc(code, nonce: string): string
+    cwd*: string            ## working directory for a LOCAL REPL ("" = inherit)
+    tmuxName*: string
+      ## Non-empty: argv runs `tmux -CC new-session -A -s <tmuxName>` on a host
+      ## (after printing WKBxTMUXNEW/OLD), so the REPL outlives the connection.
+      ## A NEW session runs `launch` inside the pane; an OLD one is reattached
+      ## and only re-primed -- whatever it was running is still there.
+    stage*: proc(pty: var Pty; code, nonce: string): string
       ## Puts a run's code where the interpreter can read it and returns that
-      ## path ("" = failed). nil = a local temp file (the REPL runs here).
+      ## path ("" = failed). nil = a local temp file (the REPL runs here). Takes
+      ## the session's own pty so a remote stager can write the file through
+      ## the SAME already-open channel (see `writeBytesCode`) instead of a
+      ## second ssh connection -- a second channel can be refused outright by
+      ## a server that caps sessions per connection (sshd's MaxSessions), no
+      ## matter how many times the one channel it does allow logs back in.
+    writeBytesCode*: proc(bytes: openArray[byte]; path, marker: string): string
+      ## REPL-specific source that writes `bytes` to `path` then prints
+      ## `marker` on its own line -- the byte-value encoding (not a base64 or
+      ## quoted-text one) needs no escaping for arbitrary source bytes and no
+      ## library beyond this REPL's own built-ins. nil = this REPL has no
+      ## pty-based stager (only a local temp file, or the old second-channel
+      ## one, is available to it).
   JobState* = enum jsQueued, jsRunning, jsDone, jsInterrupted
   RunJob* = ref object
     ## One asynchronous run of `code` in a session: queued, then started when the
@@ -37,15 +55,42 @@ type
     beginTok, endTok: string
     output*: string                    ## captured output, once done
     started*, finished*: float         ## epochTime; 0 while unset
+  StartPhase* = enum
+    spReady    ## handshake done (the default -- a local session is ready at once)
+    spLaunch   ## working through spec.launch (an ssh login hop, e.g. qsub -I,
+               ## that can queue for an arbitrary time on a shared cluster)
+    spPriming  ## launch done; waiting for the REPL to answer spec.ready
+    spFailed   ## the handshake died or timed out -- spec.startFailed says how
+    spAttach   ## tmux spec: waiting to learn whether the host session is new
+    spReattach ## tmux spec, existing session: waiting for its live REPL to answer
+    spBooting  ## last launch line sent alone; waiting for the REPL to answer
   Session* = ref object
     pty*: Pty
     spec*: ReplSpec
     job*: RunJob                       ## the run in flight, or nil
     queue*: seq[RunJob]                ## runs waiting for the session, FIFO
+    phase*: StartPhase                 ## spReady unless still mid-handshake
+    startFailed*: string               ## why, once phase == spFailed
+    launchIdx: int                     ## next spec.launch step to answer
+    hsAcc: string                      ## handshake bytes not yet matched
+    hsWaitStart, hsLastProbe: float    ## epochTime; this step's budget/probe
 
 const
   markerBegin = "__NIMACS_BOR__"
   markerEnd = "__NIMACS_END__"
+
+const stageChunk = 400
+  ## Bytes per staging line: at most ~4 chars each, so every typed line stays
+  ## well under R's 4096-byte console line limit (and any tty's line buffer).
+  ## The marker the stager prints is split in its source (paste0 / adjacent
+  ## literals) so the echo of the typed line can't satisfy the wait for it.
+
+proc byteList(bytes: openArray[byte]): string =
+  ## "12,3,255,...": plain decimal, so the REPL's own integer-literal syntax
+  ## can rebuild the bytes with zero escaping, whatever they are.
+  var parts = newSeq[string](bytes.len)
+  for i, b in bytes: parts[i] = $int(b)
+  parts.join(",")
 
 let rSpec* = ReplSpec(
   argv: @["R", "--no-save", "--no-restore", "--quiet"],
@@ -69,7 +114,17 @@ let rSpec* = ReplSpec(
   quit: "q('no')\n",
   # A session primed by an older driver may still have output sinks active
   # when a run is interrupted; drop them (a no-op otherwise).
-  reset: "try(sink(type=\"message\"), silent=TRUE); while (sink.number() > 0) sink()\n")
+  reset: "try(sink(type=\"message\"), silent=TRUE); while (sink.number() > 0) sink()\n",
+  writeBytesCode: proc(bytes: openArray[byte]; path, marker: string): string =
+    result = "dir.create(dirname(\"" & path & "\"), recursive=TRUE, showWarnings=FALSE); " &
+             ".wkbf <- file(\"" & path & "\", \"wb\")\n"
+    var i = 0
+    while i < bytes.len:
+      let j = min(i + stageChunk, bytes.len)
+      result.add "writeBin(as.raw(c(" & byteList(bytes.toOpenArray(i, j - 1)) & ")), .wkbf)\n"
+      i = j
+    result.add "close(.wkbf); cat(paste0(\"" & marker[0 ..< 3] & "\",\"" &
+               marker[3 .. ^1] & "\"), \"\\n\")\n")
 
 let pySpec* = ReplSpec(
   argv: @["python3", "-q", "-u"],
@@ -87,7 +142,17 @@ let pySpec* = ReplSpec(
          "\n",
   ready: "print('NIMACS' 'xREADY')\n",
   run: "_nimacs_run('{file}','{nonce}')\n",
-  quit: "exit()\n")
+  quit: "exit()\n",
+  writeBytesCode: proc(bytes: openArray[byte]; path, marker: string): string =
+    result = "import os as _os_s\n" &
+             "_os_s.makedirs(_os_s.path.dirname('" & path & "') or '.', exist_ok=True)\n" &
+             "_wkbf = open('" & path & "','wb')\n"
+    var i = 0
+    while i < bytes.len:
+      let j = min(i + stageChunk, bytes.len)
+      result.add "_ = _wkbf.write(bytes([" & byteList(bytes.toOpenArray(i, j - 1)) & "]))\n"
+      i = j
+    result.add "_wkbf.close(); print('" & marker[0 ..< 3] & "' '" & marker[3 .. ^1] & "')\n")
 
 let bashSpec* = ReplSpec(
   argv: @["bash", "--norc", "--noprofile"],
@@ -97,32 +162,157 @@ let bashSpec* = ReplSpec(
   prime: "nimacs_run() { echo \"__NIMACS\"\"_BOR__\" \"$2\"; source \"$1\" 2>&1; echo \"__NIMACS\"\"_END__\" \"$2\"; }\n",
   ready: "echo \"NIMACS\"\"xREADY\"\n",
   run: "nimacs_run '{file}' '{nonce}'\n",
-  quit: "exit\n")
+  quit: "exit\n",
+  writeBytesCode: proc(bytes: openArray[byte]; path, marker: string): string =
+    # \NNN octal escapes: printf resolves each before any %-scanning touches
+    # the result, so an escaped '%' or '\' byte can never reopen a spec.
+    result = "mkdir -p \"$(dirname \"" & path & "\")\" && : > \"" & path & "\"\n"
+    var i = 0
+    while i < bytes.len:
+      let j = min(i + stageChunk, bytes.len)
+      var esc = ""
+      for k in i ..< j: esc.add "\\" & toOct(BiggestInt(bytes[k]), 3)
+      result.add "printf '" & esc & "' >> \"" & path & "\"\n"
+      i = j
+    result.add "echo \"" & marker[0 ..< 3] & "\"\"" & marker[3 .. ^1] & "\"\n")
+
+proc probeWaitMs(spec: ReplSpec): int =
+  if spec.launchTimeoutMs > 0: spec.launchTimeoutMs else: 120_000
 
 proc startSession*(spec: ReplSpec): Session =
-  var pty = spawnPty(spec.argv, env = spec.env)
+  ## A plain (no `launch`) spec starts synchronously here, same as always --
+  ## spawning and priming a local REPL is near-instant. A spec WITH a `launch`
+  ## (an ssh login hop, e.g. `qsub -I`, that can sit queued for an arbitrary
+  ## time on a shared cluster) must not block here: it is handed back right
+  ## away in phase `spLaunch`, and `pollSession` -- already called every frame
+  ## by the host -- advances the handshake a non-blocking step at a time via
+  ## `advanceStart`, so a slow login never freezes the single-threaded host.
+  ## Any run queued on it meanwhile just waits (`startNext` checks `phase`).
+  var pty = spawnPty(spec.argv, dir = spec.cwd, env = spec.env)
   if not pty.alive: return nil
-  let probeWait = if spec.launchTimeoutMs > 0: spec.launchTimeoutMs else: 120_000
-  for i, line in spec.launch:
-    # Re-probe every 2 s: a shell still starting (or a qsub that flushes typed-
-    # ahead input) may drop a probe. The token is per-step, so a late answer
-    # from an earlier shell can't be mistaken for the next one being ready.
-    let tok = "WKBxSHELL" & $i
-    var waited = 0
-    while true:
-      pty.feed("echo WKBx\"\"SHELL" & $i & "\n")   # echo of this line lacks `tok`
-      if tok in pty.readUntil(tok, timeoutMs = 2_000, mirror = false): break
-      waited += 2_000
-      if not pty.alive or waited >= probeWait:
-        pty.closePty(); return nil
-    pty.feed(line & "\n")
+  if spec.tmuxName.len > 0:
+    pty.tmuxTarget = spec.tmuxName
+    pty.tmuxCommand("refresh-client -C 250,50")   # wide pane: no wrapping
+    pty.tapping = true                            # see hsRead
+    return Session(pty: pty, spec: spec, phase: spAttach, hsWaitStart: epochTime())
+  if spec.launch.len > 0:
+    pty.tapping = true                            # see hsRead
+    return Session(pty: pty, spec: spec, phase: spLaunch, hsWaitStart: epochTime())
   result = Session(pty: pty, spec: spec)
   result.pty.feed(spec.prime)
   result.pty.feed(spec.ready)                    # sync past banner + prime echo
   # mirror=false: the banner, the multi-line prime definition, and the REPL's
   # continuation prompts must NOT land in the terminal (python's def spans many
   # lines that don't carry the "nimacs" token the display filter keys on).
-  discard result.pty.readUntil("NIMACSxREADY", mirror = false)
+  # Must actually check for the marker: an interpreter that never starts (R
+  # missing on a remote host, a qsub login that silently dropped back to a
+  # plain shell, ...) leaves this PTY sitting at some other prompt forever --
+  # discarding the result used to hand back that broken session as if it were
+  # ready, so every later run against it hung or failed with a useless error.
+  if "NIMACSxREADY" notin result.pty.readUntil("NIMACSxREADY", timeoutMs = probeWaitMs(spec), mirror = false):
+    result.pty.closePty(); return nil
+
+proc hsRead(s: Session) =
+  ## Collect handshake output via the tap -- the same single-reader scheme jobs
+  ## use. The host pumps the visible session pane every frame; reading the pty
+  ## directly here raced that pump, which swallowed the probe/ready tokens into
+  ## the pane and left the handshake waiting forever. Whoever drains, the tap
+  ## sees every byte (and the login/qsub progress shows in the pane).
+  discard drain(s.pty)
+  s.hsAcc.add s.pty.tap
+  s.pty.tap = ""
+
+proc advanceStart(s: Session) =
+  ## One non-blocking step of a session's login handshake (`s.phase !=
+  ## spReady`); called from `pollSession` every frame. Mirrors the old
+  ## blocking `startSession` loop step for step, just spread across frames
+  ## instead of sleeping in a loop: a re-probe every 2s (a shell still
+  ## starting, or a qsub that flushes typed-ahead input, may drop one), the
+  ## same per-step timeout budget, and the same final wait for the REPL's
+  ## own `ready` token once the last hop answers.
+  if s.phase in [spReady, spFailed]: return
+  if not s.pty.alive:
+    s.phase = spFailed; s.startFailed = "session ended during login"; return
+  let budget = probeWaitMs(s.spec).float / 1000.0
+  case s.phase
+  of spAttach:
+    hsRead(s)
+    let isNew = "WKBxTMUXNEW" in s.hsAcc
+    if isNew or "WKBxTMUXOLD" in s.hsAcc:
+      s.hsAcc = ""; s.hsWaitStart = epochTime(); s.hsLastProbe = 0
+      if isNew:
+        s.phase = spLaunch             # a fresh pane: log in and start the REPL
+      else:
+        s.pty.feed(s.spec.ready)       # reattached: is its REPL there and free?
+        s.phase = spReattach
+      return
+    if epochTime() - s.hsWaitStart >= budget:
+      s.phase = spFailed; s.startFailed = "could not start tmux on the host"
+  of spReattach:
+    hsRead(s)
+    if "NIMACSxREADY" in s.hsAcc:
+      s.pty.feed(s.spec.prime)         # (re)define the run driver -- idempotent
+      s.pty.feed(s.spec.ready)
+      s.hsAcc = ""; s.hsWaitStart = epochTime()
+      s.phase = spPriming
+      return
+    if epochTime() - s.hsWaitStart >= budget:
+      # Never type login steps blind into a pane whose state we don't know
+      # (still queued in qsub, busy with an old run, ...): say where to look.
+      s.phase = spFailed
+      s.startFailed = "reattached to tmux session '" & s.spec.tmuxName &
+        "' but its REPL did not answer (still busy, or not running) -- " &
+        "`tmux attach -t " & s.spec.tmuxName & "` on the host to look, " &
+        "or `tmux kill-session -t " & s.spec.tmuxName & "` to start over"
+  of spLaunch:
+    let tok = "WKBxSHELL" & $s.launchIdx
+    if s.hsLastProbe == 0:
+      s.pty.feed("echo WKBx\"\"SHELL" & $s.launchIdx & "\n")
+      s.hsLastProbe = epochTime()
+    hsRead(s)
+    if tok in s.hsAcc:
+      s.pty.feed(s.spec.launch[s.launchIdx] & "\n")
+      inc s.launchIdx
+      s.hsAcc = ""; s.hsLastProbe = 0; s.hsWaitStart = epochTime()
+      if s.launchIdx >= s.spec.launch.len:
+        # Don't type the prime right behind the line that starts the REPL:
+        # a shell with a line-editor add-on (ble.sh on a qsub compute node,
+        # whatever SHELL says) takes a multi-line burst for a paste and turns
+        # Enter into "insert newline", so the REPL never even starts. Let
+        # that line run alone; spBooting waits for the REPL itself to answer.
+        s.hsLastProbe = epochTime()
+        s.phase = spBooting
+      return
+    if epochTime() - s.hsWaitStart >= budget:
+      s.phase = spFailed; s.startFailed = "login timed out"; return
+    if epochTime() - s.hsLastProbe >= 2.0:
+      s.pty.feed("echo WKBx\"\"SHELL" & $s.launchIdx & "\n")
+      s.hsLastProbe = epochTime()
+  of spBooting:
+    # Re-send the bare ready probe every 2 s until the REPL (not the shell
+    # that exec'd it) answers; only then send the prime. Extra probes that
+    # queue up are harmless: input order still puts the prime before any run.
+    hsRead(s)
+    if "NIMACSxREADY" in s.hsAcc:
+      s.pty.feed(s.spec.prime)
+      s.pty.feed(s.spec.ready)
+      s.hsAcc = ""; s.hsWaitStart = epochTime()
+      s.phase = spPriming
+      return
+    if epochTime() - s.hsWaitStart >= budget:
+      s.phase = spFailed; s.startFailed = "the interpreter never started on the host"; return
+    if epochTime() - s.hsLastProbe >= 2.0:
+      s.pty.feed(s.spec.ready)
+      s.hsLastProbe = epochTime()
+  of spPriming:
+    hsRead(s)
+    if "NIMACSxREADY" in s.hsAcc:
+      s.phase = spReady
+      s.pty.tapping = false; s.pty.tap = ""   # jobs own the tap from here
+      return
+    if epochTime() - s.hsWaitStart >= budget:
+      s.phase = spFailed; s.startFailed = "REPL never answered ready"
+  else: discard
 
 var gRunSeq = 0   ## monotonic per-process counter -> a unique nonce per run
 
@@ -141,7 +331,7 @@ proc extractOutput(acc, beginTok, endTok: string): string =
 proc stageCode(s: Session; code, nonce: string): tuple[path: string; local: bool] =
   ## Where the interpreter reads this run's code from: the spec's stager (a
   ## remote session copies it to the host), else a local temp file.
-  if s.spec.stage != nil: return (s.spec.stage(code, nonce), false)
+  if s.spec.stage != nil: return (s.spec.stage(s.pty, code, nonce), false)
   let path = genTempPath("wkbenchless-", ".src")
   writeFile(path, code)
   (path, true)
@@ -183,7 +373,7 @@ proc busy*(s: Session): bool =
   s != nil and (s.job != nil or s.queue.len > 0)
 
 proc startNext(s: Session) =
-  if s.job != nil or s.queue.len == 0 or not s.pty.alive: return
+  if s.job != nil or s.queue.len == 0 or not s.pty.alive or s.phase != spReady: return
   let j = s.queue[0]
   s.queue.delete(0)
   inc gRunSeq
@@ -227,7 +417,21 @@ proc pollSession*(s: Session): seq[RunJob] =
   ## Non-blocking: drain the session's output and return the runs that completed
   ## since the last call (at most one, plus any failed because the REPL died).
   if s == nil: return
+  if s.phase != spReady:
+    advanceStart(s)                 # one non-blocking login-handshake step
+    if s.phase != spFailed: return  # still logging in: nothing else to do yet
+    s.pty.closePty()                # so `getSession` starts a fresh one next time
+    for q in s.queue:
+      q.state = jsDone; q.finished = epochTime()
+      q.output = "Error: " & s.startFailed
+      result.add q
+    s.queue.setLen(0)
+    return
   startNext(s)
+  if s.job == nil and s.pty.alive:
+    # Idle: still drain, so output the REPL prints between runs reaches the
+    # pane and its ssh/tmux child never blocks on a full pty.
+    discard drain(s.pty)
   if s.job == nil:
     # A REPL that died before running anything (e.g. R crashing at startup on a
     # remote host) never starts its queue: fail those runs instead of leaving

@@ -12,14 +12,48 @@ when defined(windows):
   proc winShutdown(s: SocketHandle; how: cint): cint
     {.importc: "shutdown", stdcall, dynlib: "ws2_32.dll".}
 else:
-  from std/posix import shutdown, SHUT_WR
+  from std/posix import shutdown, SHUT_WR, kill, Pid
 
 proc portPath(): string = getCacheDir() / "wkbenchless" / "control.port"
+proc instancesDir(): string = getCacheDir() / "wkbenchless" / "instances"
+
+type Coords = tuple[pid, port: int; token: string]
+
+proc readCoords(path: string; c: var Coords): bool =
+  try:
+    let lines = readFile(path).splitLines()
+    c.port = parseInt(lines[0].strip())
+    c.token = if lines.len > 1: lines[1].strip() else: ""
+    true
+  except CatchableError: false
+
+proc pidAlive(pid: int): bool =
+  when defined(posix): kill(Pid(pid), 0) == 0
+  else: true
+
+proc liveInstances(): seq[Coords] =
+  ## Running editors (instances/<pid>); files of dead pids are cleaned up.
+  if not dirExists(instancesDir()): return
+  for kind, f in walkDir(instancesDir()):
+    if kind != pcFile: continue
+    let pid = try: parseInt(extractFilename(f)) except ValueError: -1
+    if pid <= 0: continue
+    if not pidAlive(pid):
+      try: removeFile(f) except CatchableError: discard
+      continue
+    var c: Coords
+    c.pid = pid
+    if readCoords(f, c): result.add c
+
+proc canon(path: string): string =
+  ## One spelling per file: "~/Documents/OneDrive - X" and the CloudStorage
+  ## path it links to must compare equal.
+  try: expandFilename(path) except CatchableError: absolutePath(path)
 
 proc buildRequest(args: seq[string]; req: var string): string =
   ## Fill `req` from CLI args; return "" on success, else an error message.
   if args.len == 0:
-    return "usage: ctl buffer|blocks|command <name>|eval [lang] [session]|\n" &
+    return "usage: ctl [--file PATH] buffer|buffers|blocks|command <name>|open-terminal <cmd...>|eval [lang] [session]|\n" &
            "           set-buffer|insert <line>|replace <from> <to>|goto <line>|\n" &
            "           run-block [line]|run-all|diff <old> <new> [title]|bib <query>\n" &
            "           cite-goto <key>|open <path>|where|selection\n" &
@@ -41,6 +75,9 @@ proc buildRequest(args: seq[string]; req: var string): string =
   of "command":
     if args.len < 2: return "ctl command <name>"
     req = "command\t" & args[1]
+  of "open-terminal":                    # a VISIBLE terminal tab running <cmd>
+    if args.len < 2: return "ctl open-terminal <cmd...>"
+    req = "open-terminal\n" & args[1 .. ^1].join(" ")
   of "eval":
     let lang = if args.len > 1: args[1] else: "r"
     let sess = if args.len > 2: args[2] else: "default"
@@ -107,28 +144,6 @@ proc buildRequest(args: seq[string]; req: var string): string =
     # request line); the editor reports "unknown verb" if nothing handles it.
     req = args.join("\t")
 
-proc ctlCoordinates(port: var int; token: var string): string =
-  ## Find the editor to talk to; "" on success, else an error message.
-  # Prefer this-instance coordinates from the env (exported by the launching
-  # editor), so a hook targets the editor Claude was launched from; otherwise
-  # fall back to the shared control.port file.
-  let envPort = getEnv("WKB_CTL_PORT")
-  let envTok  = getEnv("WKB_CTL_TOKEN")
-  if envPort.len > 0 and envTok.len > 0:
-    port = try: parseInt(envPort) except CatchableError: 0
-    token = envTok
-    return ""
-  let pf = portPath()
-  if not fileExists(pf):
-    return "wkbenchless is not running (no control port at " & pf & ")"
-  try:
-    let lines = readFile(pf).splitLines()
-    port = parseInt(lines[0].strip())
-    if lines.len > 1: token = lines[1].strip()
-  except CatchableError:
-    return "bad control port file: " & pf
-  ""
-
 proc request(port: int; token, req: string; resp: var string): string =
   ## One request/response round trip; "" on success, else an error message.
   var s = newSocket()
@@ -145,6 +160,47 @@ proc request(port: int; token, req: string; resp: var string): string =
     if chunk.len == 0: break
     resp.add chunk
   s.close()
+  ""
+
+proc resolveCoords(file: string; port: var int; token: var string): string =
+  ## Which editor to talk to; "" on success, else an error message.
+  ## 1. --file PATH / $WKB_CTL_FILE: the running instance that has PATH open.
+  ## 2. The coordinates this process inherited from its editor (WKB_CTL_*),
+  ##    if that editor still answers -- they survive hot reloads.
+  ## 3. Otherwise: the only running instance, else the latest (control.port),
+  ##    with a warning naming the one chosen -- never a silent wrong window.
+  if file.len > 0:
+    let want = canon(file)
+    var byName: seq[Coords]
+    for c in liveInstances():
+      var resp = ""
+      if request(c.port, c.token, "buffers", resp).len > 0 or resp == "unauthorized": continue
+      for f in resp.splitLines():
+        if f.len == 0: continue
+        if canon(f) == want: (port = c.port; token = c.token; return "")
+        if extractFilename(f) == extractFilename(want): byName.add c
+    if byName.len == 1: (port = byName[0].port; token = byName[0].token; return "")
+    return "no running wkbenchless has " & file & " open"
+  let envPort = getEnv("WKB_CTL_PORT")
+  let envTok  = getEnv("WKB_CTL_TOKEN")
+  if envPort.len > 0 and envTok.len > 0:
+    let p = try: parseInt(envPort) except CatchableError: 0
+    var resp = ""
+    if p > 0 and request(p, envTok, "where", resp).len == 0 and resp != "unauthorized":
+      port = p; token = envTok; return ""
+  let live = liveInstances()
+  var c: Coords
+  if live.len == 1: c = live[0]
+  elif readCoords(portPath(), c): discard
+  elif live.len > 0: c = live[^1]
+  else: return "wkbenchless is not running (no control port at " & portPath() & ")"
+  if envPort.len > 0 or live.len > 1:
+    var w = ""
+    discard request(c.port, c.token, "where", w)
+    stderr.writeLine "wkbctl: " & (if envPort.len > 0: "the editor this shell came from no longer answers; " else: "") &
+      "using " & (if live.len > 1: $live.len & " running editors -> " else: "") &
+      w.split(':')[0].extractFilename & "  (pick one with --file PATH)"
+  port = c.port; token = c.token
   ""
 
 proc queuedIds(resp: string): seq[int] =
@@ -193,6 +249,10 @@ proc ctlClient*(args: seq[string]): int =
   var args = args
   let async = "--async" in args
   if async: args.delete(args.find("--async"))
+  var file = getEnv("WKB_CTL_FILE")      # --file PATH: the editor with PATH open
+  let fi = args.find("--file")
+  if fi >= 0 and fi + 1 < args.len:
+    file = args[fi + 1]; args.delete(fi + 1); args.delete(fi)
   var req = ""
   let err = buildRequest(args, req)
   if err.len > 0:
@@ -200,7 +260,7 @@ proc ctlClient*(args: seq[string]): int =
     return 1
   var port = 0
   var token = ""
-  let cerr = ctlCoordinates(port, token)
+  let cerr = resolveCoords(file, port, token)
   if cerr.len > 0:
     stderr.writeLine cerr
     return 1

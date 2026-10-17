@@ -85,6 +85,7 @@ proc cDrawPoint(x, y: cint; r, g, b, a: cint) {.importc: "cocoa_drawPoint", cdec
 
 proc cLoadImage(path: cstring): cint {.importc: "cocoa_loadImage", cdecl.}
 proc cGetImageSize(handle: cint; outW, outH: ptr cint) {.importc: "cocoa_getImageSize", cdecl.}
+proc cFreeImage(handle: cint) {.importc: "cocoa_freeImage", cdecl.}
 proc cDrawImage(handle, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH: cint)
   {.importc: "cocoa_drawImage", cdecl.}
 
@@ -135,6 +136,9 @@ proc cocoaSetClipRect(r: Rect) =
 proc cocoaLoadImage(path: string): Image =
   let handle = cLoadImage(path.cstring)
   result = Image(handle)
+
+proc cocoaFreeImage(img: Image) =
+  cFreeImage(img.int.cint)
 
 proc cocoaImageSize(img: Image): tuple[w, h: int] =
   var w, h: cint
@@ -310,7 +314,8 @@ proc initCocoaDriver*() =
   drawRelays = DrawRelays(
     fillRect: cocoaFillRect, drawLine: cocoaDrawLine,
     drawPoint: cocoaDrawPoint,
-    loadImage: cocoaLoadImage, drawImage: cocoaDrawImage, imageSize: cocoaImageSize)
+    loadImage: cocoaLoadImage, freeImage: cocoaFreeImage, drawImage: cocoaDrawImage,
+    imageSize: cocoaImageSize)
   inputRelays = InputRelays(
     pollEvent: cocoaPollEvent, waitEvent: cocoaWaitEvent,
     getTicks: cocoaGetTicks, sleep: cocoaDelay,

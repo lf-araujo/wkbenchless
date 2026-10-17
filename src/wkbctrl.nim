@@ -162,6 +162,15 @@ proc handleImpl(app: var App; req: string): string =
       # Echo the resulting status line so scripts/agents can read outcome/state.
       result = "ok: " & parts[1] & (if app.msg.len > 0: " -- " & app.msg else: "")
     else: result = "unknown command"
+  of "open-terminal":                    # open-terminal\n<cmd>: a VISIBLE terminal tab,
+    # same primitive as the interactive ssh login flow -- so an agent can put
+    # something the user needs to see (e.g. `ssh host tmux attach -t name`,
+    # watching a long remote job already running there) in front of them
+    # instead of only reporting on it from outside the editor.
+    let cmd = strutils.strip(if body.len > 0: body elif parts.len > 1: parts[1] else: "")
+    if cmd.len == 0: return "error: open-terminal needs a command"
+    openTerminal(app, cmd)
+    result = "ok: opened terminal: " & cmd
   of "diff":                             # diff\t<title>[\t<path>]: body = OLD \x1e NEW
     let title = if parts.len > 1: parts[1] else: "diff"
     let path = if parts.len > 2: parts[2] else: ""   # the file it is about (cursor jump)
@@ -284,6 +293,12 @@ proc handleImpl(app: var App; req: string): string =
     openFile(app, path)
     result = "ok: open " & extractFilename(path) &
              " (" & $app.ed.getLineCount() & " lines)"
+  of "buffers":                            # every file open in this instance
+    var seen: seq[string]
+    if app.filePath.len > 0: seen.add app.filePath
+    for b in app.buffers:
+      if b.filePath.len > 0 and b.filePath notin seen: seen.add b.filePath
+    result = seen.join("\n")
   of "where":                              # cursor location + current file
     var off = 0
     for i in 0 ..< app.ed.currentLine: off += app.ed.getLineText(i).len + 1
@@ -310,40 +325,63 @@ proc handle(app: var App; req: string): string =
   finally: app.ctlOrigin = false
 
 proc portPath*(): string = getCacheDir() / "wkbenchless" / "control.port"
+proc instancesDir*(): string = getCacheDir() / "wkbenchless" / "instances"
+proc instancePath*(): string = instancesDir() / $getCurrentProcessId()
 
 proc genToken(): string =
   var r = initRand()
   const hex = "0123456789abcdef"
   for _ in 0 ..< 32: result.add hex[r.rand(15)]
 
-proc startControl*(): ControlServer =
-  ## Bind a loopback listener on an ephemeral port; record port+token so clients
-  ## can find and authenticate to it. On failure the listener stays nil and
-  ## `poll` is a no-op.
+proc writePrivate(path, text: string) =
   try:
+    createDir(path.parentDir)
+    writeFile(path, text)
+    when defined(posix): setFilePermissions(path, {fpUserRead, fpUserWrite})
+  except CatchableError: discard
+
+proc startControl*(): ControlServer =
+  ## Bind a loopback listener; record port+token so clients can find and
+  ## authenticate to it. On failure the listener stays nil and `poll` is a no-op.
+  ##
+  ## A hot reload (WKB_CTL_KEEP, set just before the re-exec) keeps the SAME
+  ## port and token: terminals started before the reload (Claude among them)
+  ## inherited WKB_CTL_PORT/TOKEN and must keep reaching this editor. Every
+  ## instance also writes instances/<pid> (port, token), so a client can pick
+  ## the editor that has a given file open instead of whichever instance last
+  ## wrote the shared control.port.
+  try:
+    let keep = getEnv("WKB_CTL_KEEP") == "1"
+    delEnv("WKB_CTL_KEEP")
     let s = newSocket()
     s.setSockOpt(OptReuseAddr, true)
-    s.bindAddr(Port(0), "127.0.0.1")
+    var bound = false
+    if keep:
+      try:
+        s.bindAddr(Port(parseInt(getEnv("WKB_CTL_PORT"))), "127.0.0.1"); bound = true
+      except CatchableError: discard
+    if not bound: s.bindAddr(Port(0), "127.0.0.1")
     s.listen()
     let (_, port) = s.getLocalAddr()
     s.getFd.setBlocking(false)
     when defined(posix):
       discard fcntl(s.getFd.cint, F_SETFD, FD_CLOEXEC)   # don't leak into forked sessions
     result.listener = s
-    result.token = genToken()
-    try: createDir(portPath().parentDir) except CatchableError: discard
-    writeFile(portPath(), $port.int & "\n" & result.token & "\n")
+    result.token = if keep and bound and getEnv("WKB_CTL_TOKEN").len > 0: getEnv("WKB_CTL_TOKEN")
+                   else: genToken()
+    let coords = $port.int & "\n" & result.token & "\n"
+    writePrivate(portPath(), coords)          # "the latest instance" (old clients)
+    writePrivate(instancePath(), coords)      # this instance, by pid
     # Export THIS instance's control coordinates into the process env so child
-    # terminals (notably the claude PTY) inherit them and target this editor's
-    # diff pane, rather than the shared control.port file that the newest
-    # instance overwrites.
+    # terminals (notably the claude PTY) inherit them and target this editor.
     putEnv("WKB_CTL_PORT", $port.int)
     putEnv("WKB_CTL_TOKEN", result.token)
-    when defined(posix):
-      try: setFilePermissions(portPath(), {fpUserRead, fpUserWrite})
-      except CatchableError: discard
   except CatchableError:
     result = ControlServer()
+
+proc stopControl*() =
+  ## On a real exit (not a reload): drop this instance's file.
+  try: removeFile(instancePath()) except CatchableError: discard
 
 proc poll*(cs: var ControlServer; app: var App): bool =
   ## Service any pending wkbctl / agent request. Returns true if a request was

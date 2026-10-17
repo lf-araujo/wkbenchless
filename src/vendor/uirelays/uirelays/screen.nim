@@ -139,7 +139,10 @@ proc drawLine*(x1, y1, x2, y2: int; color: Color) =
   drawRelays.drawLine(x1, y1, x2, y2, color)
 proc drawPoint*(x, y: int; color: Color) = drawRelays.drawPoint(x, y, color)
 proc loadImage*(path: string): Image = drawRelays.loadImage(path)
-proc freeImage*(img: Image) = drawRelays.freeImage(img)
+proc freeImage*(img: Image) =
+  # A driver that builds its own DrawRelays may leave this nil (cocoa did):
+  # calling it then jumped to address 0 on the first buffer clear holding an image.
+  if drawRelays.freeImage != nil: drawRelays.freeImage(img)
 proc drawImage*(img: Image; src, dst: Rect) = drawRelays.drawImage(img, src, dst)
 proc imageSize*(img: Image): tuple[w, h: int] =
   if drawRelays.imageSize != nil: drawRelays.imageSize(img) else: (0, 0)

@@ -11,7 +11,8 @@ import wkbsession
 import wkblsp                    # pure std/json LSP client -- portable, no GTK
 import wkbref                    # reference context: prose/notes/paper by citekey
 import wkbblocks                 # src blocks as a dependency graph (hashes, :depends)
-import std/[tables, strutils, os, osproc, algorithm, times, sets, sequtils]
+import std/[tables, strutils, os, osproc, algorithm, times, sets, sequtils,
+           json, sha1]
 when defined(posix): import std/posix
 
 export uirelays, synedit, wkbsession, wkblsp, wkbref, wkbblocks   # config sees Event/SynEdit/ReplSpec/LspClient/gCorpusRoots/...
@@ -24,7 +25,7 @@ type
     cmd*: string                         ## the shell command it runs
     started*: bool                       ## host has spawned the PTY at least once
 
-  JobKind* = enum jkBlock, jkEval, jkCacheLoad
+  JobKind* = enum jkBlock, jkEval, jkCacheLoad, jkFetch
   AppJob* = object
     ## An async run the editor tracks: a babel block (its results replace
     ## `placeholder` in the buffer `filePath` when it finishes) or an ad-hoc eval.
@@ -35,7 +36,9 @@ type
     filePath*: string                     ## target buffer (jkBlock)
     placeholder*: string                  ## unique `#+RESULTS` line to replace
     fileOut*: string                      ## `:file` graphics output, if any
+    localPath*: string                    ## jkFetch: where the fetched file goes
     rawResults*: bool
+    drawerResults*: bool                  ## `:results drawer`: raw, in :RESULTS:/:END:
     hash*: string                         ## block content hash ("" if none)
     fromCtl*: bool                        ## started over the control socket (Claude)
     applied*: bool                        ## results written back (or given up)
@@ -82,8 +85,22 @@ type
     searchQuery*: string                  ## the needle
     searchReplace*: string                ## replacement text (smReplace)
     searchMatches*: seq[int]              ## buffer offsets of every match
+    searchMatchEnds*: seq[int]            ## each match's end offset (exclusive)
     searchIdx*: int                       ## index into searchMatches (current)
-    searchCase*: bool                     ## case-sensitive matching
+    searchCase*: bool                     ## case-sensitive matching ("Aa")
+    searchRegex*: bool                     ## the needle is a regex (".*")
+    searchWord*: bool                      ## whole-word matches only ("ab")
+    searchHistory*: seq[string]            ## past needles, newest first (Up in the panel)
+    searchHistIdx*: int                    ## -1 = typing fresh; else index into history
+    searchDraft*: string                   ## the half-typed needle saved on first Up
+    replaceHistory*: seq[string]           ## past replacements, newest first
+    replaceHistIdx*: int
+    replaceDraft*: string
+    snaps*: seq[tuple[t: float; text: string]]  ## time-versioned snapshots (history)
+    histPreview*: int                     ## history palette entry being diff-previewed
+    lastSeenDepth*: int                   ## undo depth last frame (activity tracking)
+    lastActivity*: float                  ## epoch of the last buffer edit
+    lastSnapAt*: float                    ## epoch of the last history snapshot
     focus*: string                        ## which pane gets keyboard events
     theme*: AppTheme                      ## active theme (chrome + editor)
     themeIdx*: int                        ## index into gThemes
@@ -128,7 +145,7 @@ type
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
   PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent,
-                   pmSaveAs, pmExport
+                   pmSaveAs, pmExport, pmHistory
   ExportTarget* = tuple[id, label, cmd: string]   ## palette entry: id -> command
   SearchMode* = enum smFind, smReplace
   SearchField* = enum sfQuery, sfReplace
@@ -175,6 +192,9 @@ var
   gRemoteMethods*: Table[string, string]  ## TRAMP-style :dir method -> login command
                                           ## run on the host first (defineRemoteMethod)
   gRemoteLaunchTimeout* = 600             ## seconds to wait for each remote login
+  gRemoteTmux* = true                     ## remote REPLs live in a tmux session on
+                                          ## the host: they survive a dropped
+                                          ## connection and are reattached
                                           ## step's shell (e.g. a qsub -I queue wait)
   gInlineImageWidth* = 0                   ## default inline image width in px
                                            ## (org #+ATTR_* :width overrides it);
@@ -189,6 +209,10 @@ proc defcommand*(name, label: string; run: proc(app: var App)) =
   gCommands[name] = Command(label: label, run: run)
 proc bindkey*(chord, name: string) = gKeymap[chord] = name
 proc openPalette(app: var App; mode: PaletteMode)   # defined below; fwd for openExportPalette
+proc loadHistory*(app: var App)               # fwd: document history, below
+proc persistUndo*(app: var App)
+proc takeSnapshot*(app: var App)
+proc relTime*(t: float): string
 var gExportTargets*: seq[ExportTarget]   ## registered Export-button targets
 proc registerExport*(id, label, cmd: string) =
   ## Add a target to the Export button's palette ("Export…" opens it).
@@ -374,7 +398,15 @@ proc sshControlPath*(): string =
   ## marker sessions, so a password host is authenticated ONCE.
   getHomeDir() / ".ssh" / "wkb-cm-%C"
 
-proc remoteSpec(base: ReplSpec; host: string; dir = ""; meth = ""): ReplSpec =
+proc tmuxSessionName*(sessName: string; base: ReplSpec): string =
+  ## "wkb-<session>-<interpreter>", tmux-safe (no ':' or '.'): the same name on
+  ## every reconnect is what lets `new-session -A` find the running REPL.
+  result = "wkb-"
+  for c in sessName & "-" & (if base.argv.len > 0: extractFilename(base.argv[0]) else: "repl"):
+    result.add(if c.isAlphaNumeric or c in {'-', '_'}: c else: '_')
+
+proc remoteSpec(base: ReplSpec; host: string; dir = ""; meth = "";
+                tmuxName = ""): ReplSpec =
   ## Wrap a REPL spec to run on `host` over ssh, so an org block executes on a
   ## remote machine and its output is captured the same way. `ssh -tt` forces a
   ## remote pty; the spec's env (PS1=, PYTHON_BASIC_REPL=1) is set remotely via
@@ -393,7 +425,23 @@ proc remoteSpec(base: ReplSpec; host: string; dir = ""; meth = ""): ReplSpec =
   remote.add base.argv
   var cmd = "exec"
   for a in remote: cmd.add " " & quoteShell(a)
-  if meth.len > 0 and gRemoteMethods.hasKey(meth):
+  if tmuxName.len > 0:
+    # ssh runs tmux in control mode (one channel, a line protocol -- see the
+    # adapter in wkbpty), creating the host session or reattaching to it. The
+    # probe line says which, so a reattach skips the login and just re-primes.
+    # Login + interpreter are typed into the pane, as on a TRAMP-style hop.
+    # The pane starts a plain `sh -l` (login PATH, no .bashrc): an interactive
+    # shell with line-editor add-ons (ble.sh) takes our burst of typed lines
+    # for a paste and turns Enter into "insert newline", so nothing runs.
+    result.tmuxName = tmuxName
+    result.argv = ctrl & @["tmux has-session -t " & tmuxName & " 2>/dev/null" &
+      " && echo WKBx\"\"TMUXOLD || echo WKBx\"\"TMUXNEW;" &
+      " exec tmux -CC new-session -A -s " & tmuxName & " '/bin/sh -l'"]
+    let hasMeth = meth.len > 0 and gRemoteMethods.hasKey(meth)
+    result.launch = (if hasMeth: @["exec " & gRemoteMethods[meth]] else: @[]) &
+                    @[(if dir.len > 0: "cd " & quoteShell(dir) & "; " else: "") & cmd]
+    if hasMeth: result.launchTimeoutMs = gRemoteLaunchTimeout * 1000
+  elif meth.len > 0 and gRemoteMethods.hasKey(meth):
     # Like TRAMP: an interactive login shell, then the method's login command
     # replaces it (waiting in a queue if need be), then the interpreter.
     result.argv = ctrl
@@ -407,19 +455,23 @@ proc remoteSpec(base: ReplSpec; host: string; dir = ""; meth = ""): ReplSpec =
   else:
     result.argv = ctrl & remote
   result.env = @[]           # applied remotely via `env` above, not locally
-  # The interpreter can't read a temp file on this machine: copy each run's code
-  # to ~/.wkbenchless-run on the host (shared with compute nodes via $HOME) over
-  # the master connection, dropping this session's previous one.
+  # The interpreter can't read a temp file on this machine: stage each run's
+  # code into ~/.wkbenchless-run on the host through the SAME channel the
+  # interactive REPL is already using (writeBytesCode), relative to `dir` so
+  # it lands wherever that REPL's cwd is. A second ssh connection used to copy
+  # it there instead; some hosts (this cluster included) cap sessions per
+  # connection, so that second channel got refused outright no matter how
+  # many times the one channel it does allow logged back in -- the interactive
+  # shell was already using the only slot the server would grant.
   let tag = "s" & $getCurrentProcessId() & "-" & $(epochTime() * 1000).int64
-  let sshArgs = "ssh -o BatchMode=yes -o ControlPath=" & quoteShell(sshControlPath()) &
-                " " & quoteShell(host)
-  result.stage = proc(code, nonce: string): string =
-    let d = ".wkbenchless-run"
-    let f = d & "/" & tag & "-" & nonce & ".src"
-    let (outp, rc) = execCmdEx(sshArgs & " " & quoteShell("mkdir -p " & d &
-      " && rm -f " & d & "/" & tag & "-*.src && cat > " & f & " && pwd"), input = code)
-    let lines = strutils.strip(outp).splitLines()
-    if rc != 0 or lines.len == 0: "" else: strutils.strip(lines[^1]) & "/" & f
+  result.stage = proc(pty: var Pty; code, nonce: string): string =
+    if base.writeBytesCode == nil: return ""
+    let f = ".wkbenchless-run/" & tag & "-" & nonce & ".src"
+    let marker = "WKBSTAGE" & nonce
+    var bytes = newSeq[byte](code.len)
+    for i in 0 ..< code.len: bytes[i] = byte(code[i])
+    pty.feed(base.writeBytesCode(bytes, f, marker))
+    if marker in pty.readUntil(marker, timeoutMs = 15_000, mirror = false): f else: ""
 
 proc specFor*(base: ReplSpec; name: string; dir = ""): ReplSpec =
   ## The spec a session called `name` runs: "name@user@host" (optionally
@@ -428,8 +480,9 @@ proc specFor*(base: ReplSpec; name: string; dir = ""): ReplSpec =
   if at < 0 or at == name.len - 1: return base
   let target = name[at + 1 .. ^1]
   let bar = target.find('|')
-  if bar < 0: remoteSpec(base, target, dir)
-  else: remoteSpec(base, target[0 ..< bar], dir, target[bar + 1 .. ^1])
+  let tn = if gRemoteTmux: tmuxSessionName(name[0 ..< at], base) else: ""
+  if bar < 0: remoteSpec(base, target, dir, tmuxName = tn)
+  else: remoteSpec(base, target[0 ..< bar], dir, target[bar + 1 .. ^1], tn)
 
 proc getSession*(app: var App; lang, name: string; dir = ""): Session =
   ## A session named "name@host" runs on `host` over ssh (remote REPL, in `dir`
@@ -440,7 +493,14 @@ proc getSession*(app: var App; lang, name: string; dir = ""): Session =
       return app.sessions[key]       # (a dead one with runs left fails them first)
     app.sessions.del(key)            # its REPL exited: start a fresh one
   if not gRepls.hasKey(lang.toLowerAscii): return nil
-  let s = startSession(specFor(gRepls[lang.toLowerAscii], name, dir))
+  var spec = specFor(gRepls[lang.toLowerAscii], name, dir)
+  if '@' notin name:
+    # Local REPLs start where org-babel starts them: in `:dir` if given (relative
+    # to the file), else the org file's own directory -- not wherever the editor
+    # process happens to be (often "/"), which broke every relative data path.
+    let base = if app.filePath.len > 0: app.filePath.parentDir else: getCurrentDir()
+    spec.cwd = if dir.len == 0: base elif dir.isAbsolute: dir else: base / dir
+  let s = startSession(spec)
   if s != nil:
     app.sessions[key] = s
     app.ranIn.del(key)            # a fresh REPL has none of the earlier blocks' state
@@ -660,6 +720,7 @@ proc openFile*(app: var App; path: string) =
   app.syncActive()
   app.buffers.add BufferState(ed: ed, filePath: path, docLang: extToLangId(ext))
   app.activate(app.buffers.high)
+  loadHistory(app)                             # snapshots + cross-session undo
   applyOrgStartup(app)                         # #+STARTUP: latexpreview / inlineimages
   app.msg = "opened " & extractFilename(path)
 
@@ -784,6 +845,19 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
       let nm = gThemes[i].name
       if q.len == 0 or q in nm.toLowerAscii:
         result.add ($i, nm & (if i == app.themeIdx: "  (current)" else: ""))
+  of pmHistory:
+    # Snapshots newest first: id = index into app.snaps. The label shows the
+    # age and the line delta vs the current buffer, so a scan of the list
+    # already tells you where the text grew or shrank.
+    let curLines = app.ed.getLineCount()
+    for i in countdown(app.snaps.high, 0):
+      let s = app.snaps[i]
+      let lab = relTime(s.t)
+      if q.len == 0 or q in lab.toLowerAscii:
+        let dl = s.text.splitLines().len - curLines
+        result.add ($i, lab & "  " & $s.text.splitLines().len & " lines" &
+          (if dl != 0: "  (" & (if dl > 0: "+" else: "") & $dl & ")" else: "") &
+          (if app.histPreview == i: "  [previewing -- Enter again to restore]" else: ""))
   of pmOrg:
     for (line, label) in orgOutline(app):
       if q.len == 0 or q in label.toLowerAscii:
@@ -829,7 +903,8 @@ proc refreshObjects*(app: var App) =
     app.objects.setText("(no objects query for " & lang & ")"); return
   let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
   if s == nil: app.objects.setText("(no session)"); return
-  if s.busy:                     # a synchronous query would eat the job's output
+  if s.busy or s.phase != spReady:   # a synchronous query would eat the job's
+                                      # output, or hit a REPL still logging in
     app.objects.setText("Objects [" & lang & "/" & app.curSession & "]\n(session busy)")
     return
   let outp = s.runBlock(gObjectsQuery[lang], quiet = true)   # keep off the terminal
@@ -844,7 +919,8 @@ proc showHelp*(app: var App) =
     app.help.setText("(no help query for " & lang & ")"); return
   let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
   if s == nil: app.help.setText("(no session)"); return
-  if s.busy: app.help.setText("Help: " & w & "\n\n(session busy -- try again when the run finishes)"); return
+  if s.busy or s.phase != spReady:
+    app.help.setText("Help: " & w & "\n\n(session busy -- try again when the run finishes)"); return
   let outp = cleanOverstrike(s.runBlock(gHelpQuery[lang].replace("{word}", w), quiet = true))
   app.help.setText("Help: " & w & "\n\n" & outp)
   app.msg = "help: " & w
@@ -1050,7 +1126,12 @@ proc runLine*(app: var App) =
 proc saveCmd*(app: var App) =
   if app.filePath.len > 0:
     app.ed.saveToFile(app.filePath); app.ed.markSaved()
+    app.syncActive()                       # write the cleared dirty flag back into the
+                                           # buffer snapshot the tab bar reads, else the
+                                           # '*' lingers until the next buffer switch
     app.noteDiskMtime()                    # our own save must not trigger a revert
+    persistUndo(app)                       # buffer == file: the undo sidecar is valid
+    takeSnapshot(app)                      # a save is a moment worth remembering
     app.msg = "saved"
     app.runHooks("after-save")
   else: app.msg = "no file (pass a path on the command line)"
@@ -1094,6 +1175,7 @@ proc saveBufferAs*(app: var App; path: string) =
   if not isAbsolute(p): p = getCurrentDir() / p
   try:
     app.ed.saveToFile(p); app.filePath = p; app.ed.markSaved()
+    app.syncActive()                       # cleared dirty flag -> tab-bar snapshot
     app.noteDiskMtime(); app.runHooks("after-save")
     app.msg = "saved as " & extractFilename(p)
   except CatchableError as ex:
@@ -1130,25 +1212,213 @@ proc openFileCmd*(app: var App) =
   openPalette(app, pmFiles)
 
 # -- find / replace --------------------------------------------------------
+# A tiny backtracking regex engine for the find panel's ".*" toggle: the
+# everyday subset (literals, '.', '*', '+', '?', '[...]' classes, '^', '$',
+# '|', '(...)', '\' escapes incl. \d \w \s). std/re would add a PCRE link-time
+# dependency the dep-free mingw cross-build can't afford. Matching is
+# continuation-passing: every node consumes input, then hands the rest of the
+# pattern (as a closure) the new position, so alternation and repetition
+# backtrack naturally.
+type
+  RxKind = enum rxChar, rxClass, rxAny, rxBol, rxEol, rxRep, rxAlt, rxGroup
+  RxNode = ref object
+    kind: RxKind
+    ch: char                 ## rxChar
+    neg: bool                ## rxClass: negate the set
+    cs: array[32, uint8]     ## rxClass: 256-bit membership bitmap
+    kid: RxNode              ## rxRep / rxGroup body
+    alts: seq[RxNode]        ## rxAlt: one chain per option
+    next: RxNode             ## concatenation: the rest of the pattern
+    minR, maxR: int          ## rxRep counts (maxR < 0 = unbounded)
+
+proc rxInSet(n: RxNode; c: char): bool =
+  result = (n.cs[c.uint8 shr 3] and (1'u8 shl (c.uint8 and 7))) != 0
+  if n.neg: result = not result
+
+proc rxMatch(n: RxNode; s: string; pos: int; ic: bool;
+             k: proc(p: int): bool): bool =
+  if n == nil: return k(pos)
+  case n.kind
+  of rxChar:
+    if pos < s.len and (s[pos] == n.ch or
+        ic and toLowerAscii(s[pos]) == toLowerAscii(n.ch)):
+      return rxMatch(n.next, s, pos + 1, ic, k)
+  of rxAny:
+    if pos < s.len and s[pos] != '\n':   # PCRE: '.' never crosses lines
+      return rxMatch(n.next, s, pos + 1, ic, k)
+  of rxClass:
+    if pos < s.len and (rxInSet(n, s[pos]) or
+        ic and (rxInSet(n, toLowerAscii(s[pos])) or rxInSet(n, toUpperAscii(s[pos])))):
+      return rxMatch(n.next, s, pos + 1, ic, k)
+  of rxBol:
+    if pos == 0 or s[pos - 1] == '\n': return rxMatch(n.next, s, pos, ic, k)
+  of rxEol:
+    if pos == s.len or s[pos] == '\n': return rxMatch(n.next, s, pos, ic, k)
+  of rxGroup:
+    return rxMatch(n.kid, s, pos, ic,
+                   proc(p: int): bool = rxMatch(n.next, s, p, ic, k))
+  of rxAlt:
+    for opt in n.alts:
+      if rxMatch(opt, s, pos, ic,
+                 proc(p: int): bool = rxMatch(n.next, s, p, ic, k)):
+        return true
+  of rxRep:
+    proc rep(p, count: int): bool =
+      if n.maxR < 0 or count < n.maxR:
+        if rxMatch(n.kid, s, p, ic, proc(p2: int): bool =
+            if p2 > p: rep(p2, count + 1) else: false):
+          return true
+      if count >= n.minR: return rxMatch(n.next, s, p, ic, k)
+      false
+    return rep(pos, 0)
+  false
+
+proc rxBit(n: RxNode; c: char) =
+  n.cs[c.uint8 shr 3] = n.cs[c.uint8 shr 3] or (1'u8 shl (c.uint8 and 7))
+
+proc rxParse(pattern: string): RxNode =
+  ## Compile `pattern` into a match chain; raises ValueError on bad syntax.
+  var i = 0
+  proc parseAlt(): RxNode
+  proc parseAtom(): RxNode =
+    result = nil
+    if i >= pattern.len: return
+    template classNode(): untyped = RxNode(kind: rxClass)
+    let c = pattern[i]
+    case c
+    of '(':
+      inc i
+      let body = parseAlt()
+      if i < pattern.len and pattern[i] == ')': inc i
+      else: raise newException(ValueError, "unclosed (")
+      result = RxNode(kind: rxGroup, kid: body)
+    of '[':
+      inc i
+      result = classNode()
+      if i < pattern.len and pattern[i] == '^': result.neg = true; inc i
+      var first = true
+      while i < pattern.len and (pattern[i] != ']' or first):
+        first = false
+        var a = pattern[i]; inc i
+        if a == '\\' and i < pattern.len: a = pattern[i]; inc i
+        if i + 1 < pattern.len and pattern[i] == '-' and pattern[i + 1] != ']':
+          inc i
+          var b = pattern[i]; inc i
+          if b == '\\' and i < pattern.len: b = pattern[i]; inc i
+          if b < a: raise newException(ValueError, "bad class range")
+          for ch in a .. b: rxBit(result, ch)
+        else:
+          rxBit(result, a)
+      if i < pattern.len: inc i
+      else: raise newException(ValueError, "unclosed [")
+    of '.':
+      inc i; result = RxNode(kind: rxAny)
+    of '^':
+      inc i; result = RxNode(kind: rxBol)
+    of '$':
+      inc i; result = RxNode(kind: rxEol)
+    of '\\':
+      inc i
+      if i >= pattern.len: raise newException(ValueError, "dangling \\")
+      let e = pattern[i]; inc i
+      case e
+      of 'd':
+        result = classNode()
+        for ch in '0' .. '9': rxBit(result, ch)
+      of 'w':
+        result = classNode()
+        for ch in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}: rxBit(result, ch)
+      of 's':
+        result = classNode()
+        for ch in {' ', '\t', '\n', '\r', '\f', '\v'}: rxBit(result, ch)
+      else:
+        result = RxNode(kind: rxChar, ch: e)   # \., \\, \( ... : the literal
+    of '*', '+', '?':
+      raise newException(ValueError, "nothing to repeat")
+    else:
+      inc i; result = RxNode(kind: rxChar, ch: c)
+    if result != nil and i < pattern.len:
+      case pattern[i]
+      of '*': inc i; result = RxNode(kind: rxRep, kid: result, minR: 0, maxR: -1)
+      of '+': inc i; result = RxNode(kind: rxRep, kid: result, minR: 1, maxR: -1)
+      of '?': inc i; result = RxNode(kind: rxRep, kid: result, minR: 0, maxR: 1)
+      else: discard
+  proc parseConcat(): RxNode =
+    var head, tail: RxNode
+    while i < pattern.len and pattern[i] notin {'|', ')'}:
+      let atom = parseAtom()
+      if atom == nil: break
+      if head == nil: head = atom
+      else: tail.next = atom
+      tail = atom
+    head
+  proc parseAlt(): RxNode =
+    var opts = @[parseConcat()]
+    while i < pattern.len and pattern[i] == '|':
+      inc i
+      opts.add parseConcat()
+    if opts.len == 1: opts[0]
+    else: RxNode(kind: rxAlt, alts: opts)
+  result = parseAlt()
+  if i < pattern.len: raise newException(ValueError, "unbalanced )")
+
+proc rxSearch*(pattern, s: string; ic: bool): seq[tuple[a, e: int]] =
+  ## Every non-overlapping match of `pattern` in `s`, as [start, end) pairs.
+  ## Zero-width matches are reported (so "^$" finds empty lines) but the
+  ## caller skips marking them.
+  let re = rxParse(pattern)
+  var start = 0
+  while start <= s.len:
+    var fin = -1
+    if rxMatch(re, s, start, ic, proc(p: int): bool = fin = p; true):
+      result.add (start, max(fin, start))
+      start = if fin > start: fin else: start + 1
+    else:
+      inc start
+
+proc isWordBounded*(s: string; a, e: int): bool =
+  ## True when [a, e) has no word character glued to either end.
+  proc wordy(c: char): bool =
+    c in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}
+  (a == 0 or not s[a - 1].wordy) and (e >= s.len or not s[e].wordy)
+
 proc recomputeMatches*(app: var App) =
-  ## Rescan the buffer for the current needle, refresh the highlight markers,
-  ## and pick the match nearest the cursor as current.
+  ## Rescan the buffer for the current needle -- plain or regex, honoring the
+  ## case ("Aa") and whole-word ("ab") toggles -- refresh the highlight
+  ## markers, and pick the match nearest the cursor as current.
   app.searchMatches.setLen 0
+  app.searchMatchEnds.setLen 0
   app.ed.clearMarkers()
   if app.searchQuery.len == 0:
     app.searchIdx = -1
     return
-  let hay = if app.searchCase: app.ed.fullText else: app.ed.fullText.toLowerAscii
-  let needle = if app.searchCase: app.searchQuery else: app.searchQuery.toLowerAscii
-  var start = 0
-  while true:
-    let p = hay.find(needle, start)
-    if p < 0: break
-    app.searchMatches.add p
-    app.ed.addMarker(p, p + needle.len - 1, app.theme.ed.selBg)
-    start = p + max(1, needle.len)
+  let hay = app.ed.fullText
+  var badRx = false
+  if app.searchRegex:
+    try:
+      for (a, e) in rxSearch(app.searchQuery, hay, not app.searchCase):
+        if app.searchWord and not isWordBounded(hay, a, e): continue
+        app.searchMatches.add a
+        app.searchMatchEnds.add e
+        if e > a: app.ed.addMarker(a, e - 1, app.theme.ed.selBg)
+    except ValueError:
+      badRx = true
+  else:
+    let needle = if app.searchCase: app.searchQuery else: app.searchQuery.toLowerAscii
+    let hayL = if app.searchCase: hay else: hay.toLowerAscii
+    var start = 0
+    while true:
+      let p = hayL.find(needle, start)
+      if p < 0: break
+      let e = p + needle.len
+      start = e
+      if app.searchWord and not isWordBounded(hay, p, e): continue
+      app.searchMatches.add p
+      app.searchMatchEnds.add e
+      app.ed.addMarker(p, e - 1, app.theme.ed.selBg)
   if app.searchMatches.len == 0:
     app.searchIdx = -1
+    if badRx: app.msg = "bad regex"
     return
   let cur = app.ed.cursor
   app.searchIdx = 0
@@ -1159,7 +1429,7 @@ proc recomputeMatches*(app: var App) =
 proc gotoCurrentMatch*(app: var App) =
   if app.searchIdx < 0 or app.searchIdx >= app.searchMatches.len: return
   app.ed.gotoPos(app.searchMatches[app.searchIdx])
-  app.msg = "match " & $(app.searchIdx + 1) & "/" & $app.searchMatches.len
+  app.msg = $(app.searchIdx + 1) & " of " & $app.searchMatches.len
 
 proc searchNext*(app: var App) =
   if app.searchMatches.len == 0: app.msg = "no matches"; return
@@ -1174,6 +1444,40 @@ proc searchPrev*(app: var App) =
 proc endSearch*(app: var App) =
   app.searchActive = false
   app.ed.clearMarkers()
+  # remember the queries for the panel's Up/Down history browsing
+  if app.searchQuery.len > 0 and
+      (app.searchHistory.len == 0 or app.searchQuery != app.searchHistory[0]):
+    app.searchHistory.insert app.searchQuery
+  if app.searchReplace.len > 0 and
+      (app.replaceHistory.len == 0 or app.searchReplace != app.replaceHistory[0]):
+    app.replaceHistory.insert app.searchReplace
+  app.searchHistIdx = -1; app.replaceHistIdx = -1
+
+proc browseSearchHistory*(app: var App; up: bool) =
+  ## Up/Down in a panel field walks that field's past queries (newest first);
+  ## stepping back below the newest restores what was being typed.
+  let isQuery = app.searchField == sfQuery
+  let hist = if isQuery: app.searchHistory else: app.replaceHistory
+  var idx = if isQuery: app.searchHistIdx else: app.replaceHistIdx
+  if hist.len == 0: return
+  var txt: string
+  if up:
+    if idx < 0:
+      if isQuery: app.searchDraft = app.searchQuery else: app.replaceDraft = app.searchReplace
+      idx = 0
+    elif idx < hist.high: inc idx
+    txt = hist[idx]
+  else:
+    if idx >= 0: dec idx
+    txt = if idx < 0: (if isQuery: app.searchDraft else: app.replaceDraft)
+          else: hist[idx]
+  if isQuery:
+    app.searchHistIdx = idx
+    app.searchQuery = txt
+    recomputeMatches(app); gotoCurrentMatch(app)
+  else:
+    app.replaceHistIdx = idx
+    app.searchReplace = txt
 
 proc openFind*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
@@ -1184,6 +1488,7 @@ proc openFind*(app: var App) =
   app.searchReplace = ""
   app.searchIdx = -1
   app.searchMatches.setLen 0
+  app.searchHistIdx = -1; app.replaceHistIdx = -1
   app.ed.clearMarkers()
 
 proc openReplace*(app: var App) =
@@ -1195,7 +1500,7 @@ proc replaceCurrent*(app: var App) =
   if app.searchIdx < 0 or app.searchIdx >= app.searchMatches.len:
     app.msg = "no match"; return
   let p = app.searchMatches[app.searchIdx]
-  app.ed.selectRange(p, p + app.searchQuery.len - 1)
+  app.ed.selectRange(p, app.searchMatchEnds[app.searchIdx] - 1)
   app.ed.deleteSelection()
   app.ed.gotoPos(p)
   app.ed.insertText(app.searchReplace)
@@ -1208,7 +1513,7 @@ proc replaceAll*(app: var App) =
   var n = 0
   while app.searchMatches.len > 0:
     let p = app.searchMatches[0]
-    app.ed.selectRange(p, p + app.searchQuery.len - 1)
+    app.ed.selectRange(p, app.searchMatchEnds[0] - 1)
     app.ed.deleteSelection()
     app.ed.gotoPos(p)
     app.ed.insertText(app.searchReplace)
@@ -1217,6 +1522,17 @@ proc replaceAll*(app: var App) =
   app.ed.markChanged()
   app.msg = "replaced " & $n
   app.endSearch()
+
+proc findAllMatches*(app: var App) =
+  ## The find panel's [Find All]: every match is already marker-highlighted
+  ## live; land on the first and report the total (the editor has no
+  ## multi-selection to grab them all at once like Sublime does).
+  if app.searchMatches.len == 0:
+    app.msg = "no matches"
+    return
+  app.searchIdx = 0
+  app.ed.gotoPos(app.searchMatches[0])
+  app.msg = $app.searchMatches.len & " matches"
 
 proc orgLinkAt(line: string; col: int): string =
   ## The TARGET of the [[TARGET]] / [[TARGET][DESC]] link under `col`, or "".
@@ -1794,6 +2110,147 @@ proc showDiff*(app: var App; oldText, newText, title: string; path = "") =
   for k in d.rk: (if k == '+': inc adds)
   app.msg = "diff: " & app.diffTitle & "  +" & $adds & " -" & $dels & "  (Esc to close)"
 
+# ---- document history: persistent undo + time-versioned snapshots ----------
+#
+# Layer 1: the session's undo stack persists to a per-file sidecar (written on
+# save, when the buffer matches the file) and reloads on open -- C-z reaches
+# back across sessions. Layer 2: full-text snapshots taken at moments the
+# user STOPPED (idle after edits, or a save), pruned to adaptive time density,
+# browsable via M-x history with a diff preview before restore; restoring is
+# itself one undoable edit, so a time-jump is never a trap. Snapshots also
+# feed cite-history: what we wrote about a citation over time.
+
+proc histDir(): string = getCacheDir() / "wkbenchless" / "history"
+
+proc histKey(app: App): string =
+  ## Sidecar names keyed by the sha1 of the absolute path: no collisions, and
+  ## nothing pollutes the manuscript's own (synced) folder.
+  ($secureHash(app.filePath)).toLowerAscii
+
+proc relTime*(t: float): string =
+  ## Human "how long ago" for the history palette.
+  let d = epochTime() - t
+  if d < 90: "just now"
+  elif d < 90 * 60: $(int(d / 60)) & " min ago"
+  elif d < 22 * 3600: format(fromUnix(t.int64).local, "HH:mm")
+  elif d < 2 * 86400: "yesterday " & format(fromUnix(t.int64).local, "HH:mm")
+  else: format(fromUnix(t.int64).local, "MMM d HH:mm")
+
+proc loadHistory*(app: var App) =
+  ## Read the sidecars for the open file. Snapshots always load (they are past
+  ## states of the text, valid whatever happened since); the undo stack only
+  ## when the file on disk still matches what it was when the records were
+  ## taken -- undoing against a changed file would corrupt the text.
+  app.snaps.setLen(0)
+  app.histPreview = -1
+  if app.filePath.len == 0 or not fileExists(app.filePath): return
+  try:
+    let sj = parseJson(readFile(histDir() / histKey(app) & ".snaps.json"))
+    for s in sj{"snaps"}:
+      app.snaps.add (s{"t"}.getFloat, s{"text"}.getStr)
+  except CatchableError: discard
+  try:
+    let uj = parseJson(readFile(histDir() / histKey(app) & ".undo.json"))
+    if abs(getLastModificationTime(app.filePath).toUnixFloat -
+           uj{"mtime"}.getFloat) < 0.5 and
+       getFileSize(app.filePath) == uj{"size"}.getInt:
+      var recs: seq[UndoRecord]
+      for u in uj{"undo"}:
+        recs.add UndoRecord(k: u{"k"}.getInt, pos: u{"pos"}.getInt,
+                            version: u{"version"}.getInt, word: u{"word"}.getStr,
+                            time: u{"time"}.getFloat)
+      app.ed.loadUndoRecords(recs, uj{"undoAt"}.getInt)
+      app.lastSeenDepth = app.ed.editStamp()
+  except CatchableError: discard
+
+proc persistUndo*(app: var App) =
+  ## Write the undo sidecar. Call with a SAVED buffer: the records replay
+  ## against the on-disk content, so the file's mtime/size are the guard a
+  ## reload checks.
+  if app.filePath.len == 0 or not fileExists(app.filePath): return
+  try:
+    createDir(histDir())
+    var undo = newJArray()
+    for r in app.ed.undoRecords():
+      undo.add %*{"k": r.k, "pos": r.pos, "version": r.version,
+                  "word": r.word, "time": r.time}
+    writeFile(histDir() / histKey(app) & ".undo.json", $ %*{
+      "file": app.filePath,
+      "mtime": getLastModificationTime(app.filePath).toUnixFloat,
+      "size": getFileSize(app.filePath),
+      "undoAt": app.ed.undoIndex(), "undo": undo})
+  except CatchableError: discard
+
+proc persistSnaps(app: var App) =
+  if app.filePath.len == 0: return
+  try:
+    createDir(histDir())
+    var arr = newJArray()
+    for s in app.snaps:
+      arr.add %*{"t": s.t, "text": s.text}
+    writeFile(histDir() / histKey(app) & ".snaps.json", $ %*{"snaps": arr})
+  except CatchableError: discard
+
+proc pruneSnaps(snaps: var seq[tuple[t: float; text: string]]) =
+  ## Adaptive density, Time-Machine style: keep everything from the last two
+  ## hours, then at most one per hour back to two days, then at most one per
+  ## day, capped at 60 snapshots (oldest dropped).
+  if snaps.len <= 1: return
+  snaps.sort() do (a, b: tuple[t: float; text: string]) -> int:
+    system.cmp(b.t, a.t)                    # newest first
+  var kept: seq[tuple[t: float; text: string]]
+  var lastHour = 0.0
+  var lastDay = 0.0
+  let now = epochTime()
+  for s in snaps:
+    let age = now - s.t
+    let keep = age < 2 * 3600 or
+               (age < 48 * 3600 and (lastHour == 0 or lastHour - s.t > 3600)) or
+               (lastDay == 0 or lastDay - s.t > 24 * 3600)
+    if keep:
+      kept.add s
+      if age >= 2 * 3600: lastHour = s.t
+      if age >= 48 * 3600: lastDay = s.t
+  if kept.len > 60: kept.setLen(60)
+  snaps = kept
+
+proc takeSnapshot*(app: var App) =
+  ## Capture the buffer at a moment the user stopped, prune, persist.
+  if app.filePath.len == 0: return
+  let now = epochTime()
+  app.snaps.add (now, app.ed.fullText())
+  pruneSnaps(app.snaps)
+  persistSnaps(app)
+  app.lastSnapAt = now
+
+proc historyCmd*(app: var App) =
+  ## M-x history: browse this file's time-versioned snapshots.
+  if app.snaps.len == 0:
+    app.msg = "history: no snapshots yet -- they accrue as you pause and save"; return
+  app.histPreview = -1
+  openPalette(app, pmHistory)
+
+proc citeHistory*(app: var App) =
+  ## What we wrote about the citekey at point, over time: every snapshot's
+  ## paragraphs citing it, newest first.
+  let key = keyAtPoint(app.ed.getLineText(app.ed.currentLine), app.ed.currentCol)
+  if key.len == 0:
+    app.msg = "cite-history: put the cursor on a [cite:@key] citation"; return
+  var outp = "Cite history: @" & key & "\n"
+  for i in countdown(app.snaps.high, 0):
+    var found = false
+    for para in app.snaps[i].text.split("\n\n"):
+      if ("@" & key) in para:
+        if not found:
+          outp.add "\n== " & relTime(app.snaps[i].t) & " ==\n"
+          found = true
+        outp.add para.strip & "\n\n"
+  if outp == "Cite history: @" & key & "\n":
+    app.msg = "cite-history: no mentions of @" & key & " in the snapshots"
+    return
+  showInfoBuffer(app, "cite-history", outp)
+  app.msg = "cite-history @" & key
+
 proc closeDiff*(app: var App) =
   ## Close the diff and, if it was about the active buffer, put the cursor on
   ## the change.
@@ -2170,8 +2627,16 @@ proc ensureSshMaster(app: var App; host: string): bool =
 
 const runningPrefix* = ": [running: job "   ## placeholder line while a block runs
 
-proc resultLines(outp, fileOut: string; rawResults: bool): seq[string] =
+proc resultLines(outp, fileOut: string; rawResults: bool; drawer = false): seq[string] =
   ## The body of a `#+RESULTS:` element for this output.
+  if fileOut.len == 0 and drawer:
+    # org's `:results drawer`: verbatim (tables render) inside a drawer, which
+    # also keeps blank lines from ending the element.
+    var lines = outp.split('\n')
+    while lines.len > 0 and strutils.strip(lines[0]).len == 0: lines.delete(0)
+    while lines.len > 0 and strutils.strip(lines[^1]).len == 0: lines.setLen(lines.len - 1)
+    result = @[":RESULTS:"] & lines & @[":END:"]
+    return
   if fileOut.len > 0:
     result.add "[[file:" & fileOut & "]]"
   elif strutils.strip(outp).len == 0:
@@ -2277,11 +2742,26 @@ proc noteRan(app: var App; aj: AppJob) =
   if aj.hash.len == 0 or aj.job.state != jsDone or hasErrorOutput(aj.job.output): return
   app.ranIn.mgetOrPut(aj.sessKey, initHashSet[string]()).incl aj.hash
 
+proc overstrikeCR(s: string): string =
+  ## What a terminal would leave on screen: progress meters (OpenMx's optimizer
+  ## lines, say) redraw one line with bare "\r"; keep only what follows the
+  ## last one on each line instead of every overwritten frame. A "\r\n" line
+  ## end is not a redraw.
+  var lines: seq[string]
+  for raw in s.split('\n'):
+    var ln = raw
+    if ln.len > 0 and ln[^1] == '\r': ln.setLen(ln.len - 1)
+    let cr = ln.rfind('\r')
+    lines.add(if cr >= 0: ln[cr + 1 .. ^1] else: ln)
+  lines.join("\n")
+
 proc finishBabelJob(app: var App; aj: var AppJob) =
   ## Write a finished block's results into its buffer -- the active one or a
   ## background buffer (the user may have switched files while it ran).
-  let outp = aj.job.output
-  let repl = resultLines(outp, aj.fileOut, aj.rawResults)
+  # A REPL on a real terminal (a remote tmux pane, say) colours its output --
+  # tibbles via pillar/cli -- and those escapes must not land in #+RESULTS.
+  let outp = stripAnsi(overstrikeCR(aj.job.output))
+  let repl = resultLines(outp, aj.fileOut, aj.rawResults, aj.drawerResults)
   var placed = false
   if app.filePath == aj.filePath:
     placed = replacePlaceholder(app.ed, aj.placeholder, repl)
@@ -2299,6 +2779,50 @@ proc finishBabelJob(app: var App; aj: var AppJob) =
     else: "babel: ran " & what
   app.runHooks("after-babel")
 
+const fetchTag = "WKBIMG"
+
+proc queueFetch(app: var App; aj: AppJob) =
+  ## A figure block that ran in a REMOTE R session wrote its :file on the host;
+  ## the [[file:...]] link points here. Bring the bytes back through the same
+  ## session (hex on one line) -- a scp would need another ssh channel, and the
+  ## host may refuse one (sessions per connection are capped).
+  if aj.fileOut.len == 0 or '@' notin aj.sessKey or not aj.sessKey.startsWith("r/"): return
+  if hasErrorOutput(aj.job.output) or not app.sessions.hasKey(aj.sessKey): return
+  let s = app.sessions[aj.sessKey]
+  if s == nil or not s.pty.alive: return
+  let f = aj.fileOut.replace("\\", "\\\\").replace("\"", "\\\"")
+  # hex in 4 KB lines: one huge line is hard on the live pane that shows it
+  let code = "local({ f <- \"" & f & "\"; if (!file.exists(f)) cat(\"" & fetchTag &
+    " missing\\n\") else { b <- readBin(f, \"raw\", file.size(f)); cat(\"" & fetchTag &
+    "\", length(b), \"\\n\"); h <- sprintf(\"%02x\", as.integer(b)); " &
+    "for (i in seq(1, length(h), by = 2048)) cat(paste(h[i:min(i + 2047, length(h))], " &
+    "collapse = \"\"), \"\\n\", sep = \"\") } })\n"
+  let j = s.submit(code)
+  let base = if aj.filePath.len > 0: aj.filePath.parentDir else: getCurrentDir()
+  app.jobs.add AppJob(kind: jkFetch, job: j, sessKey: aj.sessKey,
+                      label: "fetch " & aj.fileOut, filePath: aj.filePath,
+                      localPath: (if aj.fileOut.isAbsolute: aj.fileOut else: base / aj.fileOut),
+                      fromCtl: aj.fromCtl)
+
+proc finishFetch(app: var App; aj: AppJob) =
+  ## Decode a fetch job's hex line and write the file locally.
+  let outp = aj.job.output
+  let at = outp.find(fetchTag & " ")
+  var ok = false
+  if at >= 0:
+    let parts = outp[at + fetchTag.len + 1 .. ^1].splitWhitespace()
+    if parts.len >= 2 and parts[0] != "missing":
+      try:
+        let n = parseInt(parts[0])
+        let bytes = parseHexStr(parts[1 .. ^1].join(""))
+        if bytes.len == n:
+          createDir(aj.localPath.parentDir)
+          writeFile(aj.localPath, bytes)
+          ok = true
+      except CatchableError: discard
+  app.msg = (if ok: "fetched " else: "could not fetch ") & aj.localPath.extractFilename &
+            (if ok: "" else: " from the session's host")
+
 proc pollJobs*(app: var App): bool =
   ## Host loop, every frame: advance every session's runs without blocking and
   ## deliver finished ones. Returns true if anything finished (redraw).
@@ -2309,13 +2833,18 @@ proc pollJobs*(app: var App): bool =
   for j in done:
     for i in 0 ..< app.jobs.len:
       if app.jobs[i].job == j and not app.jobs[i].applied:
-        app.sess.appendOutput("# " & app.jobs[i].label & " [job " & $j.id & "]\n" &
-                              j.output & "\n")
+        if app.jobs[i].kind != jkFetch:       # (a fetch's hex isn't worth logging)
+          app.sess.appendOutput("# " & app.jobs[i].label & " [job " & $j.id & "]\n" &
+                                j.output & "\n")
         noteRan(app, app.jobs[i])
         if app.jobs[i].kind == jkBlock:
           var aj = app.jobs[i]
           finishBabelJob(app, aj)
           app.jobs[i] = aj
+          queueFetch(app, aj)
+        elif app.jobs[i].kind == jkFetch:
+          app.jobs[i].applied = true
+          finishFetch(app, app.jobs[i])
         else:
           app.jobs[i].applied = true
           if app.jobs[i].kind == jkCacheLoad:
@@ -2393,6 +2922,28 @@ proc runningJobsLabel*(app: App): string =
   if running + queued == 0: return ""
   $running & " running" & (if queued > 0: ", " & $queued & " queued" else: "")
 
+proc jobStrip*(app: App): string =
+  ## Session-panel tab-bar text: what is running (label, session, elapsed) and
+  ## how many runs wait behind it -- so runs queued from anywhere (C-c C-c,
+  ## `wkbctl`, an agent) are visible while they work, even when silent.
+  var queued = 0
+  var running: seq[string]
+  for aj in app.jobs:
+    case aj.job.state
+    of jsQueued: inc queued
+    of jsRunning:
+      let secs = int(epochTime() - aj.job.started)
+      let el = (if secs >= 3600: $(secs div 3600) & "h" & align($((secs mod 3600) div 60), 2, '0') & "m"
+                else: $(secs div 60) & ":" & align($(secs mod 60), 2, '0'))
+      let sess = aj.sessKey[aj.sessKey.find('/') + 1 .. ^1]
+      let at = sess.find('@')
+      let short = if at > 0: sess[0 ..< at] else: sess
+      running.add "▶ " & aj.label & " [" & short & "] " & el
+    else: discard
+  if running.len == 0 and queued == 0: return ""
+  result = running.join("  ")
+  if queued > 0: result.add (if result.len > 0: "  ·  " else: "") & $queued & " queued"
+
 proc interruptJob*(app: var App; id: int): string =
   ## Stop a queued or running job; a block's placeholder becomes the partial
   ## output plus "(interrupted)".
@@ -2447,9 +2998,9 @@ proc babelExecuteImpl(app: var App; force: bool) =
     # Rmd chunk header is ```{r ...}; the language is the token after the brace.
     lang = "r"
   var sessName, host, dir, meth, fileOut = ""
-  var gW, gH, gRes = 0
-  var gType = ""
-  var rawResults = false
+  var gRes = 0
+  var gW, gH, gType, gUnits = ""   # width/height kept as written: 9, 4.5, ...
+  var rawResults, drawerResults = false
   # Parse :session / :ssh / :dir / :file / :width / :height / :res / :type from
   # a token list; only fill unset fields (so the BLOCK header wins over document
   # #+PROPERTY defaults, applied after).
@@ -2468,10 +3019,12 @@ proc babelExecuteImpl(app: var App; force: bool) =
         dir = p
       elif toks[k] == ":file" and k + 1 < toks.len and fileOut.len == 0:
         fileOut = toks[k + 1]
-      elif toks[k] == ":width" and k + 1 < toks.len and gW == 0:
-        gW = (try: parseInt(toks[k + 1]) except: 0)
-      elif toks[k] == ":height" and k + 1 < toks.len and gH == 0:
-        gH = (try: parseInt(toks[k + 1]) except: 0)
+      elif toks[k] == ":width" and k + 1 < toks.len and gW.len == 0:
+        if (try: (discard parseFloat(toks[k + 1]); true) except: false): gW = toks[k + 1]
+      elif toks[k] == ":height" and k + 1 < toks.len and gH.len == 0:
+        if (try: (discard parseFloat(toks[k + 1]); true) except: false): gH = toks[k + 1]
+      elif toks[k] == ":units" and k + 1 < toks.len and gUnits.len == 0:
+        gUnits = toks[k + 1]
       elif toks[k] == ":res" and k + 1 < toks.len and gRes == 0:
         gRes = (try: parseInt(toks[k + 1]) except: 0)
       elif toks[k] == ":type" and k + 1 < toks.len and gType.len == 0:
@@ -2482,6 +3035,7 @@ proc babelExecuteImpl(app: var App; force: bool) =
         var j = k + 1
         while j < toks.len and not toks[j].startsWith(":"):
           if toks[j] == "raw" or toks[j] == "org": rawResults = true
+          if toks[j] == "drawer": rawResults = true; drawerResults = true
           inc j
       inc k
   # Per-block `#+header:` lines directly above `#+begin_src` carry args too --
@@ -2536,11 +3090,16 @@ proc babelExecuteImpl(app: var App; force: bool) =
       of ".tiff", ".tif": "tiff"
       else: "png"
     var devArgs = "\"" & fileOut & "\""
-    if gW > 0: devArgs.add ", width=" & $gW
-    if gH > 0: devArgs.add ", height=" & $gH
+    if gW.len > 0: devArgs.add ", width=" & gW
+    if gH.len > 0: devArgs.add ", height=" & gH
+    # Bitmap devices take `units` (default px: ":width 9 :units in" without it
+    # made a 9-PIXEL-wide image); pdf/svg are always inches and reject it.
+    if gUnits.len > 0 and dev notin ["pdf", "svg"]: devArgs.add ", units=\"" & gUnits & "\""
     if gRes > 0: devArgs.add ", res=" & $gRes
     if gType.len > 0: devArgs.add ", type=\"" & gType & "\""
-    body = dev & "(" & devArgs & ")\n" & body & "\ntry(dev.off(), silent=TRUE)\n"
+    body = (if lang.toLowerAscii == "r": "dir.create(dirname(\"" & fileOut &
+              "\"), recursive=TRUE, showWarnings=FALSE)\n" else: "") &
+           dev & "(" & devArgs & ")\n" & body & "\ntry(dev.off(), silent=TRUE)\n"
 
   # A block whose previous run is still going keeps its placeholder: queuing it
   # again would overwrite that line and leave the first run nowhere to land.
@@ -2602,10 +3161,16 @@ proc babelExecuteImpl(app: var App; force: bool) =
     # Remove the whole previous results element, not just `:`-prefixed lines, so
     # `[[file:...]]` links and raw org tables are replaced instead of stacking.
     # Stop at a blank line, the next block/heading, or EOF.
-    while p < total:
-      let t = strutils.strip(app.ed.getLineText(p))
-      if t.len == 0 or t.startsWith("#+") or t.startsWith("*"): break
-      inc p
+    if p < total and strutils.strip(app.ed.getLineText(p)).toUpperAscii == ":RESULTS:":
+      # a drawer: everything through its :END:, blank lines included
+      var q = p + 1
+      while q < total and strutils.strip(app.ed.getLineText(q)).toUpperAscii != ":END:": inc q
+      if q < total: p = q + 1
+    else:
+      while p < total:
+        let t = strutils.strip(app.ed.getLineText(p))
+        if t.len == 0 or t.startsWith("#+") or t.startsWith("*"): break
+        inc p
     removeTo = p
 
   var outLines: seq[string]
@@ -2621,7 +3186,7 @@ proc babelExecuteImpl(app: var App; force: bool) =
                       sessKey: lang.toLowerAscii & "/" & sessName,
                       label: (if lang.len > 0: lang else: "?") & " block @line " & $(b + 1),
                       filePath: app.filePath, placeholder: placeholder,
-                      fileOut: fileOut, rawResults: rawResults,
+                      fileOut: fileOut, rawResults: rawResults, drawerResults: drawerResults,
                       hash: (if haveInfo: bi.hash else: ""), fromCtl: app.ctlOrigin)
   app.lastJobIds.add job.id
   noteCtlJob(app, sessKey)
@@ -2820,7 +3385,9 @@ proc writeHandoff(app: var App): string =
   when defined(posix):
     var blob = ""
     for key, s in app.sessions:
-      if s != nil and s.pty.alive:
+      # Only ready sessions: the new image adopts them AS ready. One still
+      # logging in is dropped (a tmux one is just reattached on the next run).
+      if s != nil and s.pty.alive and s.phase == spReady:
         discard fcntl(s.pty.master, F_SETFD, 0.cint)     # clear CLOEXEC
         let parts = key.split('/')
         blob.add "S\t" & $s.pty.master & "\t" & $s.pty.pid & "\t" &
@@ -2862,6 +3429,11 @@ proc adoptHandoff*(app: var App): tuple[terminals: seq[Terminal]; active: int] =
       if f[0] == "S" and gRepls.hasKey(f[3]):
         let sess = Session(pty: Pty(master: fd, pid: Pid(parseInt(f[2]))),
                            spec: specFor(gRepls[f[3]], f[4]))   # remote: keeps its stager
+        if sess.spec.tmuxName.len > 0:
+          # The child is `tmux -CC`, already in control mode: without the
+          # adapter, the prime below would be sent to tmux AS commands.
+          sess.pty.tmuxTarget = sess.spec.tmuxName
+          sess.pty.ctlActive = true
         # Re-define the run driver so a reload also upgrades it in live sessions
         # (the REPL reads it once it is idle; its echo is filtered from the pane).
         sess.pty.feed(sess.spec.prime)
@@ -2936,7 +3508,7 @@ proc recompileConfig*(app: var App) =
     # persist the buffer so edits survive the exec
     var fileArg = app.filePath
     if fileArg.len == 0:
-      fileArg = getTempDir() / "wkbenchless-scratch.txt"
+      fileArg = getTempDir() / "wkbenchless-scratch.org"
       writeFile(fileArg, app.ed.fullText())
     elif app.ed.changed:
       app.ed.saveToFile(app.filePath); app.ed.markSaved()
@@ -3030,6 +3602,15 @@ proc openTerminal*(app: var App; cmd: string) =
   let label = cmd.splitWhitespace()[0]   # "claude", "bash", ...
   for i, t in app.terminals:
     if t.cmd == cmd:
+      # The earlier run of this exact command already ended (an ssh drop,
+      # say) -- respawn it instead of just focusing a dead pane. The auto-
+      # retire below only drops a dead tab once the user has moved off it, so
+      # reattaching (e.g. `ssh host tmux attach -t name` after the connection
+      # comes back) needs this: reopening the SAME command is how it retries.
+      if t.started and not t.pty.alive:
+        closePty(app.terminals[i].pty)
+        app.terminals[i].pty = notRunningPty()
+        app.terminals[i].started = false
       app.termActive = i
       app.sessionHidden = false
       app.focus = "session"
@@ -3254,6 +3835,8 @@ proc registerBuiltins*() =
   defcommand("quit", "Quit", quitCmd)
   defcommand("next-buffer", "Buffers: cycle to the next buffer", nextBuffer)
   defcommand("prev-buffer", "Buffers: cycle to the previous buffer", prevBuffer)
+  defcommand("history", "History: browse this file's time-versioned snapshots", historyCmd)
+  defcommand("cite-history", "References: what we wrote about this citation, over time", citeHistory)
   defcommand("run-line", "Run current line in R (default session), skip to next", runLine)
   defcommand("babel-execute", "Org-babel: run this src block", babelExecute)
   defcommand("babel-execute-force", "Org-babel: run this src block, ignoring :cache", babelExecuteForce)

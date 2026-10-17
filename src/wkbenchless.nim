@@ -70,6 +70,28 @@ proc langIdOf(ext: string): string =
   of ".js": "javascript"
   else: ""
 
+proc langLabel(app: App): string =
+  ## The status line's language tag, Sublime-style ("Org", "Nim", "R" ...).
+  case app.ed.lang
+  of langOrg: "Org"
+  of langNim: "Nim"
+  of langPython: "Python"
+  of langR: "R"
+  of langRust: "Rust"
+  of langMarkdown: "Markdown"
+  of langJs: "JavaScript"
+  of langC: "C"
+  of langCpp: "C++"
+  of langCsharp: "C#"
+  of langJava: "Java"
+  of langXml: "XML"
+  of langHtml: "HTML"
+  of langConsole: "Console"
+  else:
+    if app.docLang.len > 0: app.docLang.capitalizeAscii
+    elif app.filePath.len > 0: splitFile(app.filePath).ext.strip(chars = {'.'}).toUpperAscii
+    else: "Text"
+
 proc fitText(app: App; s: string; maxPx: int): string =
   ## Middle-ellipsize S to fit MAXPX pixels, keeping head + tail (so a long file
   ## name shows its distinguishing prefix and its extension). Prevents palette
@@ -105,6 +127,7 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     of pmOrg: "org: "
     of pmRecent: "recent: "
     of pmExport: "export: "
+    of pmHistory: "history: "
   # Scroll the visible window so the selection stays in view.
   var top = 0
   if app.paletteSel >= maxRows: top = app.paletteSel - maxRows + 1
@@ -125,37 +148,114 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
                      fitText(app, items[i][1], max(0, lblPx)) & suffix, app.theme.boxFg, rowBg)
     y += lineH
 
-proc drawSearch(app: App; sr: Rect; lineH: int) =
-  ## The find / replace minibuffer, drawn over the status bar row.
-  let bg = app.theme.boxBg
-  fillRect(sr, bg)
-  let count =
-    if app.searchQuery.len == 0: ""
-    elif app.searchMatches.len == 0: "  (no matches)"
-    else: "  " & $(app.searchIdx + 1) & "/" & $app.searchMatches.len
-  var line: string
-  if app.searchMode == smFind:
-    line = "find: " & app.searchQuery & "\u2503" & count
-  else:
-    let qCur = if app.searchField == sfQuery: "\u2503" else: ""
-    let rCur = if app.searchField == sfReplace: "\u2503" else: ""
-    line = "replace: " & app.searchQuery & qCur & "  \u2192  " &
-           app.searchReplace & rCur & count &
-           "   [Enter: replace  ! : all  Tab: field  Esc: done]"
-  discard drawText(app.font, sr.x + 6, sr.y, line, app.theme.boxFg, bg)
+# The find / replace panel, styled after Sublime Text's: docked to the bottom
+# over the status row, sharing its background; per row a right-aligned label,
+# a field, and a button pair -- [Find][Replace] on the find row, [Find All]
+# [Replace All] on the replace row, button columns aligned across rows. The
+# "Aa" / ".*" / "ab" toggles sit at the far left of the find row. Hit rects are
+# rebuilt every frame and consumed by the mouse handler in main().
+var searchHitRects: seq[tuple[r: Rect; kind: char; id: int]]
+var lastMouse = (x: 0, y: 0)          # live pointer position (hover hit-testing)
+
+proc blend(a, b: Color; t: int): Color =
+  ## Mix t% of b into a (per channel), for subtle diff/panel backgrounds.
+  proc mix(x, y: uint8): uint8 = uint8((x.int * (100 - t) + y.int * t) div 100)
+  color(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
+
+proc drawSearch(app: App; sr: Rect; lineH: int; uiFont: Font; uiLineH: int) =
+  let panelBg = app.theme.statusBg
+  let fieldBg = app.theme.windowBg
+  let btnBg = blend(panelBg, fieldBg, 50)
+  let fg = app.theme.statusFg
+  let dim = app.theme.dimFg
+  let rows = 2                    # like Sublime's panel: find + replace rows
+  let rowH = lineH + 12
+  let panelH = rows * rowH + 4
+  let pr = rect(sr.x, sr.y + sr.h - panelH, sr.w, panelH)
+  fillRect(pr, panelBg)
+  fillRect(rect(pr.x, pr.y, pr.w, 1), app.theme.dividerColor)
+  searchHitRects = @[]
+
+  let chipH = rowH - 8
+  proc chipY(i: int): int = pr.y + 2 + i * rowH + 4
+
+  # the ".*" / "Aa" / "ab" toggles, far left of the find row -- Sublime's
+  # own order and glyphs: regex, case, whole word
+  const togLabels = [".*", "Aa", "ab"]
+  var togEnd = pr.x + 8
+  for ti, tl in togLabels:
+    let on = case ti
+      of 0: app.searchRegex
+      of 1: app.searchCase
+      else: app.searchWord
+    let tw = measureText(uiFont, tl).w + 12
+    let tr = rect(togEnd, chipY(0), tw, chipH)
+    if on: fillRect(tr, blend(panelBg, fg, 22))
+    discard drawText(uiFont, tr.x + 6, tr.y + (chipH - uiLineH) div 2, tl,
+                     if on: fg else: dim, if on: blend(panelBg, fg, 22) else: panelBg)
+    searchHitRects.add (tr, 't', ti)
+    togEnd += tw + 2
+
+  # labels right-aligned at a shared field edge, fields, then the buttons
+  let findLbl = "Find:"
+  let replLbl = "Replace:"
+  let lblW = max(measureText(uiFont, findLbl).w, measureText(uiFont, replLbl).w)
+  let btn1W = max(measureText(uiFont, "Find").w,
+                  measureText(uiFont, "Find All").w) + 18
+  let btn2W = max(measureText(uiFont, "Replace").w,
+                  measureText(uiFont, "Replace All").w) + 18
+  let btn2X = pr.x + pr.w - 8 - btn2W
+  let btn1X = btn2X - 6 - btn1W
+  let fieldX = max(togEnd + lblW + 12, pr.x + 8 + lblW + 12)
+  let fieldW = btn1X - 8 - fieldX
+  if fieldW < 60: return                      # too narrow to be usable
+
+  for i in 0 ..< rows:
+    let isFindRow = i == 0
+    let lbl = if isFindRow: findLbl else: replLbl
+    discard drawText(uiFont, fieldX - 6 - measureText(uiFont, lbl).w,
+                     chipY(i) + (chipH - uiLineH) div 2, lbl, fg, panelBg)
+    # the field: query on row 0, replacement on row 1; a "\u2503" marks the
+    # one being typed in, and the find field carries the live match count
+    let fr = rect(fieldX, chipY(i), fieldW, chipH)
+    fillRect(fr, fieldBg)
+    let txt = if isFindRow: app.searchQuery else: app.searchReplace
+    let cur = if (isFindRow and app.searchField == sfQuery) or
+                 (not isFindRow and app.searchField == sfReplace): "\u2503" else: ""
+    discard drawText(uiFont, fr.x + 6, fr.y + (chipH - uiLineH) div 2,
+                     txt & cur, fg, fieldBg)
+    if isFindRow and app.searchQuery.len > 0:
+      let cnt = if app.searchMatches.len == 0: "no matches"
+                else: $(app.searchIdx + 1) & " of " & $app.searchMatches.len
+      discard drawText(uiFont, fr.x + fr.w - 8 - measureText(uiFont, cnt).w,
+                       fr.y + (chipH - uiLineH) div 2, cnt, dim, fieldBg)
+    searchHitRects.add (fr, 'f', if isFindRow: 0 else: 1)
+    # the button pair, columns aligned across rows like Sublime's 2x2 grid;
+    # each button gets Sublime's 1px darker rim so it reads as raised
+    for bi, bl in (if isFindRow: ["Find", "Replace"] else: ["Find All", "Replace All"]):
+      let bx = if bi == 0: btn1X else: btn2X
+      let bw = if bi == 0: btn1W else: btn2W
+      let br = rect(bx, chipY(i), bw, chipH)
+      let hover = lastMouse.x >= br.x and lastMouse.x < br.x + br.w and
+                  lastMouse.y >= br.y and lastMouse.y < br.y + br.h
+      let body = if hover: blend(btnBg, fieldBg, 60) else: btnBg
+      fillRect(br, blend(panelBg, body, 35))          # the 1px rim
+      fillRect(rect(br.x + 1, br.y + 1, br.w - 2, br.h - 2), body)
+      discard drawText(uiFont, br.x + 9, br.y + (chipH - uiLineH) div 2, bl, fg, body)
+      searchHitRects.add (br, 'b', (if isFindRow: 0 else: 2) + bi)
 
 proc handleSearch(app: var App; e: Event) =
   if e.kind == KeyDownEvent:
     case e.key
     of KeyEsc: app.endSearch()
     of KeyEnter:
-      if app.searchMode == smReplace and app.searchField == sfReplace:
-        replaceCurrent(app)
-      else:
-        searchNext(app)
+      if ShiftPressed in e.mods: searchPrev(app)
+      elif app.searchField == sfReplace: replaceCurrent(app)
+      else: searchNext(app)
     of KeyTab:
-      if app.searchMode == smReplace:
-        app.searchField = if app.searchField == sfQuery: sfReplace else: sfQuery
+      app.searchField = if app.searchField == sfQuery: sfReplace else: sfQuery
+    of KeyUp, KeyDown:
+      browseSearchHistory(app, e.key == KeyUp)
     of KeyBackspace:
       if app.searchField == sfReplace:
         if app.searchReplace.len > 0: app.searchReplace.setLen(app.searchReplace.len - 1)
@@ -208,6 +308,25 @@ proc paletteAccept(app: var App) =
     for t in gExportTargets:
       if t.id == id and gCommands.hasKey(t.cmd):
         gCommands[t.cmd].run(app); break
+  of pmHistory:
+    # First Enter: diff-preview the snapshot (palette stays open, entry
+    # marked). Second Enter on the same entry: restore -- one undoable edit,
+    # so C-z comes right back to the present.
+    let idx = parseInt(id)
+    if app.histPreview == idx:
+      app.paletteActive = false
+      let snap = app.snaps[idx]
+      app.ed.replaceTextUndoable(snap.text)
+      app.ed.markChanged()
+      app.histPreview = -1
+      if app.diffActive: closeDiff(app)      # the preview is now the buffer
+      app.msg = "history: restored " & relTime(snap.t) & " -- C-z returns to now"
+    else:
+      app.histPreview = idx
+      let snap = app.snaps[idx]
+      showDiff(app, snap.text, app.ed.fullText(),
+               "history " & relTime(snap.t) & "  (Enter again to restore)",
+               app.filePath)
   of pmSaveAs:
     if app.paletteQuery.len > 0 and not dirExists(app.paletteDir / app.paletteQuery):
       app.paletteActive = false
@@ -332,11 +451,6 @@ proc feedTerminalKey(t: var Pty; e: Event): bool =
         true
       else: false
   else: false
-
-proc blend(a, b: Color; t: int): Color =
-  ## Mix t% of b into a (per channel), for subtle diff line backgrounds.
-  proc mix(x, y: uint8): uint8 = uint8((x.int * (100 - t) + y.int * t) div 100)
-  color(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
 
 proc tabLabel(app: App; key: string): string =
   ## Display text for a bottom-pane tab key (a terminal tab shows its label).
@@ -483,6 +597,8 @@ proc main() =
     let invoked = extractFilename(paramStr(0)).changeFileExt("")
     if params.len > 0 and params[0] == "edit-diff":   # Claude Code hook entry point
       quit(editDiff(params[1 .. ^1]))
+    if params.len > 0 and params[0] == "install-desktop":   # icon + launcher (Linux)
+      quit(installDesktop())
     if asCtl or invoked == "wkbctl":
       when defined(windows):
         # A GUI-subsystem exe has no console; attach the parent terminal's so
@@ -508,6 +624,9 @@ proc main() =
   var italicFont = openFont(facePath("Italic"), fontSize, emMetrics)
   var boldItalicFont = openFont(facePath("BoldItalic"), fontSize, emMetrics)
   var captionFont = openFont(fontPath, fontSize + 2, emMetrics)
+  var uiMetrics: FontMetrics
+  var uiFont = openFont(fontPath, max(9, fontSize - 4), uiMetrics)  # chrome text
+  var uiLineH = uiMetrics.lineHeight
   proc applyEmphasisFonts(ed: var SynEdit) =
     ed.setEmphasisFonts(boldFont, italicFont, boldItalicFont, captionFont)
 
@@ -545,6 +664,7 @@ proc main() =
   app.ed.showLineNumbers = app.ed.lang != langOrg   # on for code/prose; off for org
   app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
   app.curBuf = 0
+  loadHistory(app)                       # snapshots + cross-session undo
   app.sess.setText("session output\n")
 
   # `--goto N`: restore the cursor line after a recompile re-exec.
@@ -593,12 +713,9 @@ proc main() =
   proc rebuildLayouts() =
     layPlain = parseLayout(layoutPlainStr(paneSessionH))
     laySrc   = parseLayout(layoutSrcStr(paneSessionH, paneRightW, paneObjectsH))
-  var lastMouse = (x: 0, y: 0)
   var toolbarMenuOpen = false             # the header [☰] menu is showing
   var toolbarMenuX = 0                    # its right edge (menu grows left from here)
   var ctrl = startControl()              # control socket for wkbctl / agents
-    if params.len > 0 and params[0] == "install-desktop":   # icon + launcher (Linux)
-      quit(installDesktop())
   let termGridPath = getTempDir() / "wkbenchless-termgrid"
   var termRepaintFrames = 0              # fallback nudge if no grid snapshot exists
   block:                                 # adopt sessions/terminals from a hot reload
@@ -645,6 +762,7 @@ proc main() =
   var needRedraw = true
   var lastBlink = epochTime()
   var lastDiffTick = 0.0
+  var lastJobTick = 0.0
   while app.running:
     let livePane = not app.sessionHidden and
                    (app.termActive >= 0 or currentSession(app) != nil)
@@ -653,6 +771,8 @@ proc main() =
       e = Event(kind: NoEvent)
     if e.kind in {WindowCloseEvent, QuitEvent}: break
     if e.kind != NoEvent: needRedraw = true   # any real input/resize/focus event
+    app.runHooks("tick")                      # extensions poll their worlds here
+                                       # (tox queues, LSP, ...) each wake
 
     # Start a freshly opened terminal (one the host hasn't spawned yet).
     for i in 0 ..< app.terminals.len:
@@ -677,11 +797,32 @@ proc main() =
     block:                                    # drain the live pane's pty each frame
       let ap = activePtyPtr()
       if ap != nil and pump(ap[]): needRedraw = true   # new terminal/session output
+    # ...and every background terminal tab. An undrained pty fills (a macOS pty
+    # holds ~1 KB) and its child blocks writing: harmless for a local shell, but
+    # an ssh login tab is usually the ControlMaster every remote session and
+    # stager rides on, so blocking it froze ALL of them until the tab was shown.
+    for i in 0 ..< app.terminals.len:
+      if i != app.termActive and app.terminals[i].started and app.terminals[i].pty.alive:
+        discard pump(app.terminals[i].pty)
     if pollJobs(app): needRedraw = true       # async babel/eval runs finished
     if diffAutoClose(app): needRedraw = true  # an untouched diff times out
     if app.diffActive and not app.diffPinned and epochTime() - lastDiffTick >= 1.0:
       needRedraw = true; lastDiffTick = epochTime()   # tick the countdown
+    if not app.sessionHidden and epochTime() - lastJobTick >= 1.0 and
+       runningJobsLabel(app).len > 0:
+      needRedraw = true; lastJobTick = epochTime()    # tick the job strip's clock
     if poll(ctrl, app): needRedraw = true     # a wkbctl / agent request touched state
+    # Document history: snapshot when the user PAUSES with unsaved edits -- a
+    # moment they stopped, not a dumb timer tick.
+    if app.filePath.len > 0 and app.ed.changed:
+      let stamp = app.ed.editStamp()
+      if stamp != app.lastSeenDepth:
+        app.lastSeenDepth = stamp
+        app.lastActivity = epochTime()
+      elif app.lastActivity > 0 and epochTime() - app.lastActivity > 10 and
+           epochTime() - app.lastSnapAt > 10:
+        takeSnapshot(app)
+        needRedraw = true
     if autoRevertActive(app): needRedraw = true  # buffer reloaded from disk
 
     # Blink the editor caret without pinning the CPU: force a repaint ~2x/sec
@@ -702,7 +843,9 @@ proc main() =
           writeFile(termGridPath, app.terminals[app.termActive].pty.vt.serialize())
           putEnv("WKB_TERMGRID", termGridPath)
         except CatchableError: discard
+      putEnv("WKB_CTL_KEEP", "1")             # the new image keeps our port + token
       execReload(app)                         # execv; only returns on failure
+      delEnv("WKB_CTL_KEEP")
       app.reloadPending = false
 
     var consumed = false
@@ -728,8 +871,10 @@ proc main() =
       suppressText = false
       if e.kind == TextInputEvent: consumed = true   # the char after e.g. "C-c e"
     if not consumed:
-      if app.searchActive:
+      if app.searchActive and e.kind in {KeyDownEvent, TextInputEvent}:
         handleSearch(app, e); consumed = true
+        # mouse events fall through: the panel's own handler (toggles, fields,
+        # buttons) and the click-in-buffer-ends-search rule live further down
       elif app.paletteActive:
         handlePalette(app, e); consumed = true
       elif app.completionActive:
@@ -779,6 +924,8 @@ proc main() =
       italicFont = openFont(facePath("Italic"), fontSize, emMetrics)
       boldItalicFont = openFont(facePath("BoldItalic"), fontSize, emMetrics)
       captionFont = openFont(fontPath, fontSize + 2, emMetrics)
+      uiFont = openFont(fontPath, max(9, fontSize - 4), uiMetrics)
+      uiLineH = uiMetrics.lineHeight
       lineH = metrics.lineHeight
       app.font = font; app.bigFont = bigFont
       app.ed.setFont(font); app.sess.setFont(font)
@@ -829,12 +976,16 @@ proc main() =
       toolbarRects.add (rect(screen.width - mw - 6 - aw - 4, 4, aw, toolbarH - 8),
                         "next-buffer", "▶")
       toolbarRects.add (rect(screen.width - mw - 6, 4, mw, toolbarH - 8), "__menu__", "")
-      # buffer tabs (optional): one per open buffer -- click to switch, [x] to close
+      # buffer tabs (optional): one per open buffer -- click to switch, [x] to
+      # close. A tab that would overflow the line SHRINKS (middle-ellipsized
+      # name) instead of vanishing, so every buffer always has a tab.
       if gBufferTabs:
         for i, b in app.buffers:
-          let lw = measureText(app.font, " " & bufName(b) & " ").w + 4
+          let full = " " & (if b.ed.changed: "*" else: "") & bufName(b) & " "
           let xw = toolbarH - 8
-          if x + lw + xw > tabsRight: break   # overflowed: reach the rest via ◀/▶
+          let avail = tabsRight - x - xw - 4
+          if avail < 40: break                  # not even a stub fits
+          let lw = min(measureText(app.font, full).w + 4, avail)
           bufferTabRects.add (rect(x, 4, lw + xw, toolbarH - 8), i,
                               rect(x + lw, 4, xw, toolbarH - 8))
           x += lw + xw + 4
@@ -889,6 +1040,31 @@ proc main() =
         chromeHit = hit
       if chromeHit: consumed = true
 
+    # --- find/replace panel: its toggles, fields and buttons -----------------
+    if app.searchActive and e.kind == MouseDownEvent and e.button == LeftButton and
+       not consumed:
+      for h in searchHitRects:
+        if e.x >= h.r.x and e.x < h.r.x + h.r.w and
+           e.y >= h.r.y and e.y < h.r.y + h.r.h:
+          case h.kind
+          of 't':
+            case h.id
+            of 0: app.searchRegex = not app.searchRegex
+            of 1: app.searchCase = not app.searchCase
+            else: app.searchWord = not app.searchWord
+            recomputeMatches(app); gotoCurrentMatch(app)
+          of 'f':
+            app.searchField = if h.id == 0: sfQuery else: sfReplace
+          of 'b':
+            case h.id
+            of 0: searchNext(app)
+            of 1: replaceCurrent(app)
+            of 2: findAllMatches(app)
+            else: replaceAll(app)
+          else: discard
+          consumed = true
+          break
+
     # --- Draggable panel dividers -------------------------------------------
     # Grab a divider (with a few px of tolerance around the 2px hairline), drag
     # to resize the fixed pane, and persist the sizes on release. `cells` still
@@ -924,6 +1100,12 @@ proc main() =
       consumed = true
 
     if e.kind == MouseDownEvent and dragDiv.len == 0 and not consumed:  # click a pane to focus it
+      # Clicking back into the buffer dismisses the find panel (like Esc);
+      # panel clicks were consumed above, so this only catches the buffer.
+      if app.searchActive and cells.hasKey("editor"):
+        let er = cells["editor"]
+        if e.x >= er.x and e.x < er.x + er.w and e.y >= er.y and e.y < er.y + er.h:
+          app.endSearch()
       for nm in ["editor", "session", "objects", "help"]:
         if cells.hasKey(nm):
           let r = cells[nm]
@@ -1090,9 +1272,17 @@ proc main() =
                          color(255, 255, 255), app.theme.closeBg)
         cx += lw + xw + 4
       let mr = rect(r.x + r.w - bh, r.y, bh, bh)   # [_] minimize button
+      block jobStripDraw:            # right-aligned: the run(s) in flight + queue
+        let strip = jobStrip(app)
+        if strip.len == 0: break jobStripDraw
+        let sw = measureText(app.font, strip).w
+        let sx = max(cx + 8, mr.x - sw - 8)
+        if sx + 40 < mr.x:           # (drop it rather than overlap the chips)
+          discard drawText(app.font, sx, r.y, strip, app.theme.chipActiveFg, app.theme.tabBarBg)
       fillRect(mr, app.theme.minBg)
-      discard drawText(boldFont, mr.x + bh div 3, r.y, "_",
-                       color(0, 0, 0), app.theme.minBg)
+      # the "_" as a drawn underline, one pixel clear of the button's floor
+      let uw = bh div 2
+      fillRect(rect(mr.x + (bh - uw) div 2, r.y + bh - 3, uw, 2), color(0, 0, 0))
       let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
       let rows = max(1, body.h div lineH)
       let charW = max(1, measureText(app.font, "0").w)
@@ -1227,10 +1417,14 @@ proc main() =
       if cells.hasKey(dn):
         fillRect(cells[dn], if dn == dragDiv: statusFg else: app.theme.dividerColor)
     if cells.hasKey("status") and app.searchActive:
-      drawSearch(app, cells["status"], lineH)
+      drawSearch(app, cells["status"], lineH, uiFont, uiLineH)
     elif cells.hasKey("status"):
+      # Sublime's status line: "Line X, Column Y" leads on the left, the
+      # indentation ("Spaces: N") sits at the right edge, in the smaller UI
+      # font; the file name, vim tag, jobs and messages ride along in between.
       let sr = cells["status"]
       fillRect(sr, statusBg)
+      let ty = sr.y + (sr.h - uiLineH) div 2
       let name = if app.filePath.len > 0: extractFilename(app.filePath) else: "*scratch*"
       let dirty = if app.ed.changed: " [+]" else: ""
       let vimTag =
@@ -1238,12 +1432,24 @@ proc main() =
         elif app.vimMode == vmInsert: "-- INSERT --   "
         else: "-- NORMAL --   "
       let jobsTag = runningJobsLabel(app)
-      discard drawText(app.font, sr.x + 6, sr.y,
-        vimTag & name & dirty & "   " &
-        $(app.ed.currentLine + 1) & ":" & $(app.ed.currentCol + 1) &
+      let left = "Line " & $(app.ed.currentLine + 1) & ", Column " & $(app.ed.currentCol + 1)
+      discard drawText(uiFont, sr.x + 6, ty,
+        left & vimTag &
         (if jobsTag.len > 0: "   [jobs: " & jobsTag & "]" else: "") &
-        "   " & app.msg,
+        (if app.msg.len > 0: "   " & app.msg else: ""),
         statusFg, statusBg)
+      # right side, outward from the edge: the language, "Spaces: N", and
+      # (only when buffer tabs are off) the file name -- Sublime's ordering
+      let lang = langLabel(app)
+      let langW = measureText(uiFont, lang).w
+      discard drawText(uiFont, sr.x + sr.w - 8 - langW, ty, lang, statusFg, statusBg)
+      let spaces = "Spaces: " & $app.ed.tabSize
+      let spW = measureText(uiFont, spaces).w
+      discard drawText(uiFont, sr.x + sr.w - 18 - langW - spW, ty, spaces, statusFg, statusBg)
+      if not gBufferTabs:            # with tabs on, the tab shows the name
+        let nameW = measureText(uiFont, name & dirty).w
+        discard drawText(uiFont, sr.x + sr.w - 26 - langW - spW - nameW, ty, name & dirty,
+                         statusFg, statusBg)
 
     if app.completionActive:
       drawCompletion(app, editorRect, lineH)
@@ -1281,8 +1487,12 @@ proc main() =
         let cbg = if active or hover: app.theme.chipActiveBg else: app.theme.chipBg
         let cfg = if active or hover: app.theme.chipActiveFg else: app.theme.chipFg
         fillRect(bt.r, cbg)
+        if active:   # fill the gap down to the buffer so the tab reads as part of it
+          fillRect(rect(bt.r.x, bt.r.y + bt.r.h, bt.r.w,
+                        toolbarH - (bt.r.y + bt.r.h)), cbg)
         let nm = (if app.buffers[bt.idx].ed.changed: "*" else: "") & bufName(app.buffers[bt.idx])
-        discard drawText(app.font, bt.r.x + 2, bt.r.y, " " & nm & " ", cfg, cbg)
+        discard drawText(app.font, bt.r.x + 2, bt.r.y,
+                         " " & fitText(app, nm, bt.r.w - bt.xr.w - 8) & " ", cfg, cbg)
         fillRect(bt.xr, app.theme.closeBg)
         discard drawText(boldFont, bt.xr.x + bt.xr.w div 3, bt.r.y, "X",
                          color(255, 255, 255), app.theme.closeBg)
@@ -1300,6 +1510,7 @@ proc main() =
 
     refresh()
 
+  stopControl()                          # a real quit: drop instances/<pid>
   for t in app.terminals.mitems: closePty(t.pty)
   for s in app.sessions.values: closeSession(s)
   for c in app.lsp.values: shutdownLsp(c)

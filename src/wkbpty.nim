@@ -26,6 +26,10 @@ type
     vt*: VTerm            ## screen-grid emulator (standalone terminal); nil for sessions
     tapping*: bool        ## an async session job is in flight: `drain` also feeds `tap`
     tap*: string          ## raw output since the in-flight job started (wkbsession)
+    tmuxTarget*: string   ## non-empty: the child is `tmux -CC` and this names the
+                          ## session to type into (see the control-mode adapter)
+    ctlActive*: bool      ## control mode has started (its DCS was seen)
+    ctlScan, ctlLine, ctlOut, ctlPreIn: string
     when defined(windows):
       hpc: Handle         ## pseudo-console
       hproc: Handle       ## child process
@@ -275,7 +279,19 @@ else:
   proc ptAlive(t: Pty): bool = t.master >= 0
   proc ptSetSize(t: var Pty; rows, cols: int) = setSizeFd(t.master, rows, cols)
   proc ptWrite(t: var Pty; s: string) =
-    if t.master >= 0 and s.len > 0: discard write(t.master, unsafeAddr s[0], s.len)
+    # The master is non-blocking and a macOS pty buffers only ~1 KB: a single
+    # write() of a large chunk (staged code) is routinely partial, and dropping
+    # the rest silently corrupts what the REPL receives. Loop until it's all in.
+    if t.master < 0 or s.len == 0: return
+    var off, waited = 0
+    while off < s.len:
+      let w = write(t.master, unsafeAddr s[off], s.len - off)
+      if w > 0:
+        off += w; waited = 0
+      elif w < 0 and (errno == EAGAIN or errno == EWOULDBLOCK or errno == EINTR):
+        if waited >= 10_000: return            # the child stopped reading
+        sleep(1); inc waited
+      else: return
   proc ptReadAvail(t: var Pty; b: var array[8192, char]): int =
     if t.master < 0: return -1
     let n = read(t.master, addr b[0], b.len)
@@ -327,7 +343,122 @@ proc notRunningPty*(): Pty =
 
 proc alive*(t: Pty): bool = ptAlive(t)
 
-proc feed*(t: var Pty; s: string) = ptWrite(t, s)
+# ======================== tmux control-mode adapter =========================
+# A remote session can live in a tmux session on the host, so it survives the
+# ssh connection (or this app) going away and is reattached on reconnect. The
+# child is then `tmux -CC` -- a line protocol, not a terminal: input is tmux
+# commands, output arrives as `%output %<pane> <octal-escaped bytes>` lines.
+# With `tmuxTarget` set, `feed` and the readers below translate both ways, so
+# everything above the Pty (markers, jobs, staging, the session pane) sees the
+# same plain byte stream a directly-attached REPL would give it.
+
+const ctlDcs = "\eP1000p"   ## what `tmux -CC` prints when control mode starts
+
+proc tmuxQuote(s: string): string =
+  ## One tmux-parser argument: single-quoted, a literal ' spliced in as "'".
+  result = "'"
+  for c in s:
+    if c == '\'': result.add "'\"'\"'"
+    else: result.add c
+  result.add "'"
+
+proc tmuxKeys(target, s: string): string =
+  ## Control-mode commands that type `s` into the target pane: printable runs
+  ## literally (send-keys -l), the rest as tmux key names. `s` comes from two
+  ## writers -- the session driver ("\n" line ends) and the session pane's
+  ## keyboard (terminal bytes: "\r" Enter, "\b"/DEL backspace, CSI arrows) --
+  ## so both conventions must map to the keys a terminal would have sent.
+  let pre = "send-keys -t " & target & " "
+  var run = ""
+  template flush() =
+    if run.len > 0:
+      result.add pre & "-l -- " & tmuxQuote(run) & "\n"
+      run.setLen(0)
+  template key(name: string) =
+    flush(); result.add pre & name & "\n"
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    case c
+    of '\r':
+      key("Enter")
+      if i + 1 < s.len and s[i + 1] == '\n': inc i   # "\r\n" is one Enter
+    of '\n': key("Enter")
+    of '\b', '\x7f': key("BSpace")       # tmux sends the pane's erase char
+    of '\e':
+      let rest = s[i + 1 .. min(i + 6, s.high)]
+      if rest.startsWith("[A"): key("Up"); i += 2
+      elif rest.startsWith("[B"): key("Down"); i += 2
+      elif rest.startsWith("[C"): key("Right"); i += 2
+      elif rest.startsWith("[D"): key("Left"); i += 2
+      elif rest.startsWith("[200~") or rest.startsWith("[201~"):
+        flush(); i += 5                 # bracketed-paste markers: text goes -l
+      else: key("Escape")
+    of '\0', '\x1c'..'\x1f': discard
+    of '\x01'..'\x07', '\x0b', '\x0c', '\x0e'..'\x1a':
+      key("C-" & chr(ord(c) + 96))
+    else:
+      run.add c
+      if run.len >= 1024 and ord(c) < 128: flush()   # never split a UTF-8 char
+    inc i
+  flush()
+
+proc tmuxCommand*(t: var Pty; cmd: string) =
+  ## Send a raw control-mode command (queued until control mode is up).
+  if t.ctlActive: ptWrite(t, cmd & "\n") else: t.ctlPreIn.add cmd & "\n"
+
+proc feed*(t: var Pty; s: string) =
+  if t.tmuxTarget.len == 0: ptWrite(t, s)
+  elif t.ctlActive: ptWrite(t, tmuxKeys(t.tmuxTarget, s))
+  else: t.ctlPreIn.add tmuxKeys(t.tmuxTarget, s)
+
+proc ctlUnescape(s: string; dst: var string) =
+  var i = 0
+  while i < s.len:
+    if s[i] == '\\' and i + 3 < s.len and s[i+1] in {'0'..'7'} and s[i+2] in {'0'..'7'} and s[i+3] in {'0'..'7'}:
+      dst.add chr((ord(s[i+1]) - 48) * 64 + (ord(s[i+2]) - 48) * 8 + (ord(s[i+3]) - 48))
+      i += 4
+    else:
+      dst.add s[i]; inc i
+
+proc ctlTranslate(t: var Pty; raw: openArray[char]) =
+  ## Raw bytes from `tmux -CC` -> the pane's output, appended to `ctlOut`.
+  ## Before control mode starts, text passes through a line at a time (the
+  ## remote command's own banner, e.g. the attach/new probe).
+  for c in raw:
+    if not t.ctlActive:
+      t.ctlScan.add c
+      if t.ctlScan.endsWith(ctlDcs):
+        t.ctlOut.add t.ctlScan[0 ..< t.ctlScan.len - ctlDcs.len]
+        t.ctlScan = ""
+        t.ctlActive = true
+        if t.ctlPreIn.len > 0:
+          ptWrite(t, t.ctlPreIn); t.ctlPreIn = ""
+      elif c == '\n':
+        t.ctlOut.add t.ctlScan; t.ctlScan = ""
+    elif c == '\n':
+      var line = t.ctlLine
+      t.ctlLine = ""
+      if line.len > 0 and line[^1] == '\r': line.setLen(line.len - 1)
+      if line.startsWith("%output "):
+        let sp = line.find(' ', 8)          # after "%output %<pane>"
+        if sp > 0: ctlUnescape(line[sp + 1 .. ^1], t.ctlOut)
+      # %begin/%end/%exit/%window-* ...: protocol chatter, not pane output
+    else:
+      t.ctlLine.add c
+
+proc readAvail(t: var Pty; b: var array[8192, char]): int =
+  ## `ptReadAvail`, through the control-mode adapter when there is one.
+  if t.tmuxTarget.len == 0: return ptReadAvail(t, b)
+  var raw {.noinit.}: array[8192, char]
+  let n = ptReadAvail(t, raw)
+  if n > 0: ctlTranslate(t, raw.toOpenArray(0, n - 1))
+  if t.ctlOut.len > 0:
+    let m = min(t.ctlOut.len, b.len)
+    copyMem(addr b[0], addr t.ctlOut[0], m)
+    t.ctlOut = t.ctlOut[m .. ^1]
+    return m
+  if n < 0: -1 else: 0
 
 proc drain*(t: var Pty): int =
   ## Non-blocking: consume everything available. A screen-grid terminal (vt !=
@@ -336,7 +467,7 @@ proc drain*(t: var Pty): int =
   var b {.noinit.}: array[8192, char]
   var total = 0
   while true:
-    let n = ptReadAvail(t, b)
+    let n = readAvail(t, b)
     if n > 0:
       total += n
       if t.vt != nil:
@@ -361,18 +492,30 @@ proc pump*(t: var Pty): bool =
     t.outbuf = t.outbuf[^120_000 .. ^1]
   n > 0
 
+proc pollOnce*(t: var Pty; acc: var string; mirror = true): int =
+  ## One non-blocking read: appends whatever is available right now to `acc`
+  ## (and `outbuf` if `mirror`). Returns bytes read (>0), 0 if nothing is
+  ## available this instant, or -1 if the child is gone. Never sleeps -- the
+  ## shared primitive behind the blocking `readUntil` below and an async,
+  ## per-frame waiter (a session's login handshake) that must not block the
+  ## single-threaded host while it waits.
+  var b {.noinit.}: array[8192, char]
+  let n = readAvail(t, b)
+  if n > 0:
+    for i in 0 ..< n:
+      acc.add b[i]
+      if mirror: t.outbuf.add b[i]
+    return n
+  elif n < 0: return -1
+  else: return 0
+
 proc readUntil*(t: var Pty; token: string; timeoutMs = 15_000; mirror = true): string =
   ## Block until `token` appears or we time out (poll, so it works on both the
   ## non-blocking fd and the Windows pipe). `mirror` also feeds `outbuf`.
-  var b {.noinit.}: array[8192, char]
   var waited = 0
   while token notin result:
-    let n = ptReadAvail(t, b)
-    if n > 0:
-      for i in 0 ..< n:
-        result.add b[i]
-        if mirror: t.outbuf.add b[i]
-      waited = 0
+    let n = pollOnce(t, result, mirror)
+    if n > 0: waited = 0
     elif n < 0: break                           # child gone
     else:
       if waited >= timeoutMs: break

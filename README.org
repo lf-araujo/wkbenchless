@@ -233,18 +233,23 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
   - [X] Export (~otdExport~): embed fallback via docProps — the org also goes
     in as a base64 ~OrgTrackedSource~ custom document property (Word/OneDrive
     strip ~customXml/~ on save), and import reads whichever survived.
-- [ ] *Document history: infinite undo + time-versioned browsing*
+- [X] *Document history: infinite undo + time-versioned browsing*
   (src/vendor/uirelays/widgets/synedit.nim) — chosen model: linear + persist +
   timestamps (deliberately not a branching tree).
-  - Layer 1 — make ~C-z~ infinite and cross-session: timestamp each version
-    group; persist ~actions~ to a per-file sidecar (serialize on save/idle,
-    reload on open, guard against the file changing on disk underneath);
-    keep the linear model (new edit still truncates redo).
-  - Layer 2 — ~M-x history~ time-versioned browser: timestamped buffer
-    snapshots on idle/save; a palette listing versions with adaptive time
-    density (recent dense → hours coarser → a couple per day), Time-Machine
-    style; diff preview before restore (reuse the diff panel); restoring
-    seeds the undo stack so a time-jump is just another edit, never a trap.
+  - [X] Layer 1 — ~C-z~ is infinite and cross-session: every version group
+    carries a timestamp; the undo stack persists to a per-file sidecar in
+    the cache (sha1-keyed, so nothing pollutes the manuscript folder),
+    written on save and reloaded on open — guarded by the file's
+    mtime+size, so undoing against an externally changed file never
+    happens. The linear model stays: a new edit still truncates redo.
+  - [X] Layer 2 — ~M-x history~ time-versioned browser: buffer snapshots on
+    idle-pause (a moment you stopped, not a timer tick) and on save, pruned
+    to adaptive time density (all < 2h, hourly to 2 days, daily beyond, cap
+    60); the palette lists versions with age + line-delta labels; Enter
+    previews the diff in the diff panel, Enter again restores — as ONE
+    undoable edit, so C-z comes right back to the present, never a trap.
+  - [X] ~M-x cite-history~ — what we wrote about the citation at point, over
+    time: every snapshot's paragraphs citing the key, newest first.
 
 * Changelog (recent)
 
