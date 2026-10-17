@@ -195,25 +195,61 @@ proc findBlockFor(d: Doc, id: CrdtId): int =
       result = mid; lo = mid + 1
     else: hi = mid - 1
 
+proc insertSplitting(d: var Doc; base: CrdtId; startOff: uint16;
+                    text: string; at: int): int =
+  ## Insert `text` as one or more blocks sharing `base` starting at
+  ## offset `startOff`, splitting around any already-present deeper
+  ## blocks of that base (unordered delivery: a descendant may arrive
+  ## before the text it descends into). Returns the first char's position.
+  var
+    rest = text
+    restOff = startOff
+    at = at
+    pos = -1
+  while rest.len > 0:
+    # skip deeper blocks of ours that sort before the remaining text
+    while at < d.blocks.len:
+      let N = d.blocks[at]
+      if N.id.len > base.len + 1 and N.id[0 ..< base.len] == base and
+         N.id[base.len].int < restOff.int: inc at
+      else: break
+    var cut = rest.len
+    if at < d.blocks.len:
+      let N = d.blocks[at]
+      if N.id.len > base.len + 1 and N.id[0 ..< base.len] == base and
+         N.id[base.len].int >= restOff.int and
+         N.id[base.len].int < restOff.int + rest.len:
+        cut = N.id[base.len].int - restOff.int + 1
+    var pieceId = base
+    pieceId.add restOff
+    d.blocks.insert(Block(id: pieceId, eob: cut >= rest.len,
+                          text: rest[0 ..< cut]), at)
+    if pos < 0: pos = blockStart(d, at)
+    if cut >= rest.len: break
+    inc at, 2                    # the piece + the deeper block it split for
+    rest = rest[cut ..^ 1]
+    restOff = restOff + cut.uint16
+  pos
+
 proc remoteInsert*(d: var Doc; id: CrdtId; text: string): tuple[pos: int, text: string] =
   ## Apply a remote insert; returns where it landed (pos < 0: dropped as
-  ## a duplicate). Merges into the left block when the ID extends it, and
-  ## splits a block when the ID descends into it (a deeper ID carries
-  ## the split offset in the pair right after the block's base -- the
-  ## local split that generated it is never sent as an op).
+  ## a duplicate). Same-base siblings merge or drop; a deeper ID splits
+  ## the block it descends into; and any insertion splits around deeper
+  ## blocks already sitting inside its range.
   let i = findBlockFor(d, id)
   if i >= 0:
     let B = d.blocks[i]
     if cmpId(B.id, id) == 0: return (-1, "")          # same first char
-    if id.len == B.id.len:
-      # sibling in the same base: duplicate, merge, or fall through
-      if B.id[0 ..< B.id.len - 1] == id[0 ..< id.len - 1]:
-        if id[^1].int < B.id[^1].int + B.text.len:
-          return (-1, "")                              # char already exists
-        if id[^1].int == B.id[^1].int + B.text.len:
-          let pos = blockStart(d, i) + B.text.len      # extends: merge
-          d.blocks[i].text.add text
-          return (pos, text)
+    if id.len == B.id.len and
+       B.id[0 ..< B.id.len - 1] == id[0 ..< id.len - 1]:
+      # sibling in the same base
+      if id[^1].int < B.id[^1].int + B.text.len:
+        return (-1, "")                              # char already exists
+      if id[^1].int == B.id[^1].int + B.text.len:
+        # extends the block: same base, starting at its end offset
+        let pos = insertSplitting(d, id[0 ..< id.len - 1], id[^1],
+                                  text, i + 1)
+        return (pos, text)
     elif id.len > B.id.len and
          id[0 ..< B.id.len - 1] == B.id[0 ..< B.id.len - 1] and
          id[B.id.len - 1].int >= B.id[^1].int and
@@ -228,36 +264,7 @@ proc remoteInsert*(d: var Doc; id: CrdtId; text: string): tuple[pos: int, text: 
       d.blocks.insert(Block(id: id, eob: true, text: text), i + 1)
       d.blocks.insert(right, i + 2)
       return (blockStart(d, i + 1), text)
-  # generic placement -- but with unordered delivery the new block's
-  # range may already contain deeper blocks (descendants of its base
-  # that arrived earlier): split the text around them, piece by piece
-  var
-    rest = text
-    restOff = id[^1]
-    at = i + 1
-    pos = -1
-  let base = id[0 ..< id.len - 1]
-  while rest.len > 0:
-    # skip deeper blocks of ours that sort before the remaining text
-    while at < d.blocks.len:
-      let N = d.blocks[at]
-      if N.id.len > id.len and N.id[0 ..< id.len - 1] == base and
-         N.id[id.len - 1].int < restOff.int: inc at
-      else: break
-    var cut = rest.len
-    if at < d.blocks.len:
-      let N = d.blocks[at]
-      if N.id.len > id.len and N.id[0 ..< id.len - 1] == base and
-         N.id[id.len - 1].int >= restOff.int and
-         N.id[id.len - 1].int < restOff.int + rest.len:
-        cut = N.id[id.len - 1].int - restOff.int + 1
-    d.blocks.insert(Block(id: withOffset(id, restOff), eob: cut >= rest.len,
-                          text: rest[0 ..< cut]), at)
-    if pos < 0: pos = blockStart(d, at)
-    if cut >= rest.len: break
-    inc at, 2                    # the piece + the deeper block it split for
-    rest = rest[cut ..^ 1]
-    restOff = restOff + cut.uint16
+  let pos = insertSplitting(d, id[0 ..< id.len - 1], id[^1], text, i + 1)
   (pos, text)
 
 proc remoteDelete*(d: var Doc; runs: seq[IdRun]): tuple[

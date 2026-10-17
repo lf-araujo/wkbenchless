@@ -18,7 +18,3 @@ spike/*
 !spike/*.nim
 !spike/*.md
 *.exe
-# compiled src/ test probes -- keep the sources, not the binaries
-src/test_*
-!src/test_*.nim
-src/shrink_tmp
