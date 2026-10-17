@@ -17,6 +17,7 @@ macro importConfig(path: static string): untyped =
 when wkbUserConfig.len > 0: importConfig(wkbUserConfig)
 else: import wkbconfig
 import wkbextensions
+import wkbdesktop
 import wkbpty
 import wkbctrl
 import wkbctlclient       # so `wkbenchless ctl <verb>` == the wkbctl client
@@ -596,6 +597,8 @@ proc main() =
   var toolbarMenuOpen = false             # the header [☰] menu is showing
   var toolbarMenuX = 0                    # its right edge (menu grows left from here)
   var ctrl = startControl()              # control socket for wkbctl / agents
+    if params.len > 0 and params[0] == "install-desktop":   # icon + launcher (Linux)
+      quit(installDesktop())
   let termGridPath = getTempDir() / "wkbenchless-termgrid"
   var termRepaintFrames = 0              # fallback nudge if no grid snapshot exists
   block:                                 # adopt sessions/terminals from a hot reload

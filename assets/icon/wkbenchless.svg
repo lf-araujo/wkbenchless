@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3d3d40"/><stop offset="1" stop-color="#262628"/>
+    </linearGradient>
+    <linearGradient id="liquid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5fb0b0"/><stop offset="1" stop-color="#3f8a8a"/>
+    </linearGradient>
+    <!-- inside of the flask (the stroke is drawn on top, so the fill can run to the centre line) -->
+    <clipPath id="inside">
+      <path d="M452 266 L452 430 L262 760 Q240 800 285 800 L739 800 Q784 800 762 760 L572 430 L572 266 Z"/>
+    </clipPath>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#tile)"/>
+  <rect x="70" y="70" width="884" height="884" rx="194" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="12"/>
+  <!-- liquid with a gentle surface -->
+  <g clip-path="url(#inside)">
+    <path d="M200 572 Q300 548 400 568 T600 566 T840 560 L840 840 L200 840 Z" fill="url(#liquid)"/>
+  </g>
+  <!-- code lines in the liquid + orange cursor -->
+  <g stroke-linecap="round" stroke-width="26" fill="none">
+    <line x1="392" y1="628" x2="560" y2="628" stroke="#f9f9f9" stroke-opacity="0.95"/>
+    <line x1="358" y1="686" x2="470" y2="686" stroke="#f09642"/>
+    <line x1="500" y1="686" x2="612" y2="686" stroke="#f9f9f9" stroke-opacity="0.95"/>
+    <line x1="322" y1="744" x2="486" y2="744" stroke="#9dbf42"/>
+  </g>
+  <rect x="512" y="722" width="22" height="46" rx="5" fill="#f09642"/>
+  <!-- bubbles -->
+  <circle cx="496" cy="508" r="17" fill="none" stroke="#f9f9f9" stroke-width="12"/>
+  <circle cx="540" cy="452" r="11" fill="none" stroke="#f9f9f9" stroke-width="10"/>
+  <!-- flask outline + lip -->
+  <path d="M452 266 L452 430 L262 760 Q240 800 285 800 L739 800 Q784 800 762 760 L572 430 L572 266"
+        fill="none" stroke="#f9f9f9" stroke-width="40" stroke-linejoin="round" stroke-linecap="round"/>
+  <line x1="414" y1="256" x2="610" y2="256" stroke="#f9f9f9" stroke-width="40" stroke-linecap="round"/>
+</svg>

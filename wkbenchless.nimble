@@ -90,6 +90,7 @@ when hostOS == "macosx":
   <key>CFBundleExecutable</key><string>wkbenchless</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleIconFile</key><string>wkbenchless</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>10.15</string>
 </dict>
@@ -97,6 +98,8 @@ when hostOS == "macosx":
 """)
     cpFile(built, macosDir / "wkbenchless")
     exec "chmod +x \"" & (macosDir / "wkbenchless") & "\""
+    # the binary embeds its icon; put it in Resources/ before codesigning
+    exec "\"" & built & "\" install-desktop"
     exec "codesign --force -s - \"" & appDir & "\""
     echo "macOS app bundle refreshed: " & appDir
 
@@ -105,3 +108,12 @@ when hostOS == "macosx":
 
   after install:
     refreshMacApp()
+
+# -- Linux desktop entry + icon --------------------------------------------------
+# `wkbenchless install-desktop` (src/wkbdesktop.nim) installs the app icon and a
+# .desktop launcher for the current user; the icon files are embedded in the
+# binary, so the hook only has to run it.
+when hostOS == "linux":
+  after install:
+    let exe = thisDir() / "wkbenchless"
+    if fileExists(exe): exec quoteShell(exe) & " install-desktop"

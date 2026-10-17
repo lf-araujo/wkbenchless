@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs><clipPath id="inside"><path d="M440 250 L440 430 L232 770 Q210 816 262 816 L762 816 Q814 816 792 770 L584 430 L584 250 Z"/></clipPath></defs>
+  <rect x="32" y="32" width="960" height="960" rx="200" fill="#303032"/>
+  <rect x="44" y="44" width="936" height="936" rx="188" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="24"/>
+  <g clip-path="url(#inside)"><rect x="150" y="560" width="760" height="300" fill="#4d9d9d"/></g>
+  <rect x="440" y="240" width="144" height="210" fill="#f9f9f9"/>
+  <rect x="520" y="640" width="60" height="120" rx="14" fill="#f09642"/>
+  <path d="M440 250 L440 430 L232 770 Q210 816 262 816 L762 816 Q814 816 792 770 L584 430 L584 250"
+        fill="none" stroke="#f9f9f9" stroke-width="72" stroke-linejoin="round" stroke-linecap="round"/>
+  <line x1="392" y1="240" x2="632" y2="240" stroke="#f9f9f9" stroke-width="72" stroke-linecap="round"/>
+</svg>

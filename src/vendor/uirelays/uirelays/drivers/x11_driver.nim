@@ -395,6 +395,10 @@ proc XFlush(dpy: pointer): cint
   {.cdecl, dynlib: libX11, importc.}
 proc XStoreName(dpy: pointer; w: XID; name: cstring): cint
   {.cdecl, dynlib: libX11, importc.}
+type XClassHint = object
+  resName, resClass: cstring
+proc XSetClassHint(dpy: pointer; w: XID; hint: ptr XClassHint): cint
+  {.cdecl, dynlib: libX11, importc.}
 proc XInternAtom(dpy: pointer; name: cstring; onlyIfExists: XBool): Atom
   {.cdecl, dynlib: libX11, importc.}
 proc XSetWMProtocols(dpy: pointer; w: XID; protocols: ptr Atom; count: cint): XStatus
@@ -789,6 +793,12 @@ proc x11CreateWindow(layout: var ScreenLayout) =
   gClipProperty = XInternAtom(gDisplay, "NIMEDIT_CLIP", 0)
 
   discard XStoreName(gDisplay, gWindow, "NimEdit")
+  # WM_CLASS = the program's own name, so docks/taskbars can match the window to
+  # its .desktop entry (StartupWMClass) and show the app icon. Without it the
+  # window has no class and desktops fall back to a generic icon.
+  let appName = splitFile(getAppFilename()).name
+  var classHint = XClassHint(resName: cstring(appName), resClass: cstring(appName))
+  discard XSetClassHint(gDisplay, gWindow, addr classHint)
   discard XMapWindow(gDisplay, gWindow)
 
   gGC = XCreateGC(gDisplay, gWindow, 0, nil)
