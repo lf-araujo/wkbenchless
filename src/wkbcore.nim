@@ -216,6 +216,7 @@ proc takeSnapshot*(app: var App)
 proc relTime*(t: float): string
 var gExportTargets*: seq[ExportTarget]   ## registered Export-button targets
 var gPromptHandler*: proc(app: var App; text: string)  ## pmPrompt accept callback
+var gStatusCircle*: Color = color(0xb0, 0xb0, 0xb0)  ## status circle: gray=offline
 proc registerExport*(id, label, cmd: string) =
   ## Add a target to the Export button's palette ("Export…" opens it).
   gExportTargets.add (id, label, cmd)

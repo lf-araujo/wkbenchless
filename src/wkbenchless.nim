@@ -21,7 +21,7 @@ import wkbdesktop
 import wkbpty
 import wkbctrl
 import wkbctlclient       # so `wkbenchless ctl <verb>` == the wkbctl client
-import std/[os, tables, strutils]
+import std/[os, tables, strutils, math]
 from std/times import epochTime   # blink pacing for the redraw gate
 
 const fontPath =
@@ -1443,18 +1443,31 @@ proc main() =
         (if jobsTag.len > 0: "   [jobs: " & jobsTag & "]" else: "") &
         (if app.msg.len > 0: "   " & app.msg else: ""),
         statusFg, statusBg)
-      # right side, outward from the edge: the language, "Spaces: N", and
-      # (only when buffer tabs are off) the file name -- Sublime's ordering
+      # right side, outward from the edge: the status circle, the language,
+      # "Spaces: N", and (only when buffer tabs are off) the file name
+      let circleR = 6
+      let circleGap = 10              # padding on each side of the circle
+      let circleW = circleR * 2 + circleGap
+      block:
+        let circleColor = gStatusCircle
+        let cx = sr.x + sr.w - circleGap - circleR
+        let cy = ty + uiLineH div 2
+        for dy in -circleR .. circleR:
+          let dx = sqrt(float(circleR*circleR - dy*dy)).int
+          fillRect(rect(cx - dx, cy + dy, dx * 2, 1), circleColor)
       let lang = langLabel(app)
       let langW = measureText(uiFont, lang).w
-      discard drawText(uiFont, sr.x + sr.w - 8 - langW, ty, lang, statusFg, statusBg)
+      discard drawText(uiFont, sr.x + sr.w - circleW - 8 - langW, ty, lang,
+                       statusFg, statusBg)
       let spaces = "Spaces: " & $app.ed.tabSize
       let spW = measureText(uiFont, spaces).w
-      discard drawText(uiFont, sr.x + sr.w - 18 - langW - spW, ty, spaces, statusFg, statusBg)
+      discard drawText(uiFont, sr.x + sr.w - circleW - 18 - langW - spW, ty,
+                       spaces, statusFg, statusBg)
       if not gBufferTabs:            # with tabs on, the tab shows the name
         let nameW = measureText(uiFont, name & dirty).w
-        discard drawText(uiFont, sr.x + sr.w - 26 - langW - spW - nameW, ty, name & dirty,
-                         statusFg, statusBg)
+        discard drawText(uiFont,
+                         sr.x + sr.w - circleW - 26 - langW - spW - nameW, ty,
+                         name & dirty, statusFg, statusBg)
 
     if app.completionActive:
       drawCompletion(app, editorRect, lineH)

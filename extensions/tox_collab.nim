@@ -467,6 +467,9 @@ proc extend*(app: var App) =
       $session.peers.len & " peer(s), " & $session.doc.docLen & " chars"
      else: "guest (site " & $session.site & "), " & $session.doc.docLen & " chars"))
   addHook("tick", proc(a: var App) =
+    # status circle: gray = offline, green = connected/idle
+    gStatusCircle = if session == nil: color(0xb0, 0xb0, 0xb0)
+                     else: color(0x40, 0xc0, 0x40)
     if session != nil:
       try: tick(a, session)
       except CatchableError as e:
