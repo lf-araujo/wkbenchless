@@ -19,7 +19,8 @@
 ##   - The genesis registry maps DOIs to DAG IDs for papers imported
 ##     from the traditional publishing system.
 
-import std/[tables, strutils, sha1, sequtils]
+import std/[tables, strutils, sequtils]
+import checksums/sha1         # std/sha1 is deprecated (moves out of stdlib)
 import wkbbib
 
 const
@@ -78,6 +79,8 @@ proc paperHash*(title: string; authors: seq[string];
 proc makePaper*(title: string; authors: seq[string];
                 citations: seq[Citation];
                 fee = defaultFee): Paper =
+  ## Build a Paper with its self-certifying ID (the hash covers title +
+  ## authors + citations, so the same content always yields the same node).
   Paper(id: paperHash(title, authors, citations),
         title: title, authors: authors, citations: citations, fee: fee)
 
@@ -97,6 +100,7 @@ proc validate*(l: Ledger; p: Paper): string =
   if l.balances.getOrDefault(p.authors[0], 0) < p.fee:
     return "insufficient coins: need " & $p.fee
 
+## True if a paper with this ID is already on the DAG.
 proc isCommitted*(l: Ledger; id: PaperId): bool = l.papers.hasKey(id)
 
 proc citedBy*(l: Ledger; id: PaperId): seq[PaperId] =
@@ -107,6 +111,8 @@ proc citedBy*(l: Ledger; id: PaperId): seq[PaperId] =
 
 # -- registration lifecycle ---------------------------------------------------
 proc submit*(l: var Ledger; p: Paper) =
+  ## Queue a paper for review. Raises LedgerError if it does not validate
+  ## (empty fields, unregistered citations, duplicate ID, ...).
   let err = l.validate(p)
   if err.len > 0: raise newException(LedgerError, err)
   l.pending.add Registration(paper: p)
@@ -122,6 +128,8 @@ proc hasStake*(l: Ledger; identity: string): bool =
   false
 
 proc addReview*(l: var Ledger; paperId: PaperId; r: Review) =
+  ## Record a review on a pending paper. Raises LedgerError if the reviewer
+  ## has no stake, reviews their own paper, or has already reviewed it.
   if not l.hasStake(r.reviewerId):
     raise newException(LedgerError,
       "reviewer has no stake (no committed papers, no balance): " & r.reviewerId)
@@ -138,10 +146,13 @@ proc addReview*(l: var Ledger; paperId: PaperId; r: Review) =
   raise newException(LedgerError, "no pending registration for " & paperId)
 
 proc acceptCount*(reg: Registration): int =
+  ## How many reviews carry an accepting verdict.
   for r in reg.reviews:
     if r.verdict == rvAccept: inc result
 
 proc readyToCommit*(l: Ledger; reg: Registration): bool =
+  ## True once at least `minReviewers` DISTINCT reviewers accepted (one
+  ## reviewer reviewing twice still counts once).
   var accepted: seq[string]
   for r in reg.reviews:
     if r.verdict == rvAccept and r.reviewerId notin accepted:
@@ -149,6 +160,9 @@ proc readyToCommit*(l: Ledger; reg: Registration): bool =
   accepted.len >= minReviewers
 
 proc commit*(l: var Ledger; reg: var Registration) =
+  ## Accept a paper onto the DAG: burn the fee from the first author, split
+  ## it between the cited authors and the accepting reviewers, and drop the
+  ## pending registration. Raises LedgerError on too few acceptances.
   if not l.readyToCommit(reg):
     raise newException(LedgerError,
       "not enough acceptances: " & $reg.acceptCount & "/" & $minReviewers)
@@ -183,6 +197,8 @@ proc commit*(l: var Ledger; reg: var Registration) =
 
 # -- genesis -------------------------------------------------------------------
 proc newLedger*(initialSupply = 0; identities: seq[string] = @[]): Ledger =
+  ## A fresh ledger; a genesis supply is split evenly among the founding
+  ## identities (their starting stake against sybil reviewers).
   result.supply = initialSupply
   if identities.len > 0 and initialSupply > 0:
     let share = initialSupply div identities.len
@@ -277,6 +293,8 @@ proc transfer*(l: var Ledger; fromId, toId: string; amount: int) =
 
 proc retraction*(l: var Ledger; retractedId: PaperId; authors: seq[string];
                  reason: string): Paper =
+  ## Create and commit a retraction node citing the retracted paper; the
+  ## citation's DOI field carries the reason.
   let retracted = l.papers[retractedId]
   result = makePaper("RETRACTION: " & retracted.title, authors,
                      @[Citation(paperId: retractedId, doi: reason)])
