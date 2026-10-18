@@ -211,6 +211,17 @@ proc extend*(app: var App) =
       let e = ledger.bibEntryFor(p)
       result = e.toBib())
 
+  registerCtlVerb("dag-faucet", "bootstrap a new identity: <toId>",
+    proc(a: var App; args: seq[string]; body: string): string =
+      if not dagReady: return "dag: no ledger"
+      if args.len < 1: return "usage: dag-faucet <toId>"
+      try:
+        ledger.faucet(args[0])
+        a.msg = "dag: faucet gave " & $faucetAmount & " coins to " & args[0]
+        result = a.msg
+      except LedgerError as e:
+        result = "dag: " & e.msg)
+
   registerCtlVerb("dag-transfer", "invite a new author: <from> <to> <amount>",
     proc(a: var App; args: seq[string]; body: string): string =
       if not dagReady: return "dag: no ledger"

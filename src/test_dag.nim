@@ -114,7 +114,7 @@ block:
   l.commit(reg)
   check "committed", l.isCommitted(p1.id)
   check "alice paid", l.balances["alice@tox"] == aliceBefore - 10
-  check "elder earned", l.balances["elder@tox"] == elderBefore + 10
+  check "elder earned", l.balances["elder@tox"] == elderBefore + 7
 
   # generate the BibTeX entry for alice's paper (with its dagid)
   let bibOut = l.bibEntryFor(p1)
@@ -137,7 +137,7 @@ block:
   let aliceMid = l.balances["alice@tox"]
   l.commit(reg)
   check "alice earned from bob's citation",
-    l.balances["alice@tox"] == aliceMid + 10
+    l.balances["alice@tox"] == aliceMid + 8
 
   # the DAG: foundational <- p1 <- p2 (topological order)
   check "DAG has 3 papers", l.papers.len == 3
@@ -181,6 +181,62 @@ block:
 """)
   let mixedCites = l.citationsFromBib(bib4)
   check "mixed: only DAG-citable found", mixedCites.len == 1
+
+# -- reviewer reward: the fee splits between cited authors and reviewers ----
+block:
+  var l = newLedger(1000, @["alice@tox", "bob@tox", "carol@tox", "dave@tox"])
+  l.importPaper("10.1/genesis", "Genesis Paper", @["elder@tox"])
+  let p1 = makePaper("Test Paper", @["alice@tox"],
+                     @[Citation(paperId: l.genesisDoi["10.1/genesis"],
+                                doi: "10.1/genesis")])
+  l.submit(p1)
+  for r in ["bob@tox", "carol@tox", "dave@tox"]:
+    l.addReview(p1.id, Review(paperId: p1.id, reviewerId: r, accept: true))
+  var reg = l.pending[0]
+  let aliceBefore = l.balances["alice@tox"]
+  let bobBefore = l.balances["bob@tox"]
+  let elderBefore = l.balances.getOrDefault("elder@tox", 0)
+  l.commit(reg)
+  # fee = 10; citedPortion = 7 (70%), reviewPortion = 3 (30%)
+  # elder gets 7 (the only cited author)
+  # bob, carol, dave each get 1 (3 split among 3 reviewers)
+  check "alice paid full fee", l.balances["alice@tox"] == aliceBefore - 10
+  check "elder earned cited portion", l.balances["elder@tox"] == elderBefore + 7
+  check "bob earned reviewer reward", l.balances["bob@tox"] == bobBefore + 1
+
+# -- faucet: new author bootstrap ----------------------------------------------
+block:
+  var l = newLedger(1000, @["alice@tox"])
+  l.faucet("newbie@tox")
+  check "faucet gives coins", l.balances["newbie@tox"] == faucetAmount
+  try:
+    l.faucet("newbie@tox")
+    check "faucet is once-only", false
+  except LedgerError:
+    check "faucet is once-only", true
+
+# -- anti-gaming: reviewer must have stake --------------------------------------
+block:
+  var l = newLedger(1000, @["alice@tox", "bob@tox"])
+  l.importPaper("10.2/genesis", "G2", @["system"])
+  let p = makePaper("Stake Test", @["alice@tox"],
+                    @[Citation(paperId: l.genesisDoi["10.2/genesis"])])
+  l.submit(p)
+  # nobody@tox has no coins and no papers -- no stake
+  try:
+    l.addReview(p.id, Review(paperId: p.id, reviewerId: "nobody@tox", accept: true))
+    check "no-stake reviewer rejected", false
+  except LedgerError:
+    check "no-stake reviewer rejected", true
+  # alice is the author -- can't review her own paper
+  try:
+    l.addReview(p.id, Review(paperId: p.id, reviewerId: "alice@tox", accept: true))
+    check "self-review rejected", false
+  except LedgerError:
+    check "self-review rejected", true
+  # bob has coins (genesis) -- has stake
+  l.addReview(p.id, Review(paperId: p.id, reviewerId: "bob@tox", accept: true))
+  check "staked reviewer accepted", true
 
 if fails > 0:
   echo $fails, " FAILURES"

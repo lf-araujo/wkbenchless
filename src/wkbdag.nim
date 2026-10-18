@@ -25,6 +25,8 @@ import wkbbib
 const
   minReviewers* = 3            ## the consensus threshold
   defaultFee* = 10             ## coins to register a paper
+  reviewerShare* = 30          ## % of the fee that goes to reviewers
+  faucetAmount* = 5           ## coins given to a new identity (once)
 
 type
   PaperId* = string            ## SHA-1 hex digest (upgrade target: SHA-256)
@@ -150,12 +152,25 @@ proc commit*(l: var Ledger; reg: var Registration) =
       "not enough acceptances: " & $reg.acceptCount & "/" & $minReviewers)
   let p = reg.paper
   l.balances[p.authors[0]] = l.balances.getOrDefault(p.authors[0], 0) - p.fee
-  if p.citations.len > 0:
-    let share = p.fee div p.citations.len
+  # split the fee: (100 - reviewerShare)% to cited authors,
+  #                reviewerShare% to the accepting reviewers
+  let citedPortion = p.fee * (100 - reviewerShare) div 100
+  let reviewPortion = p.fee - citedPortion
+  if p.citations.len > 0 and citedPortion > 0:
+    let share = citedPortion div p.citations.len
     for c in p.citations:
       let cited = l.papers[c.paperId]
       for a in cited.authors:
         l.balances[a] = l.balances.getOrDefault(a, 0) + share
+  # reward the accepting reviewers (incentivizes participation)
+  var reviewers: seq[string]
+  for r in reg.reviews:
+    if r.accept and r.reviewerId notin reviewers:
+      reviewers.add r.reviewerId
+  if reviewers.len > 0 and reviewPortion > 0:
+    let rShare = reviewPortion div reviewers.len
+    for r in reviewers:
+      l.balances[r] = l.balances.getOrDefault(r, 0) + rShare
   l.papers[p.id] = p
   l.order.add p.id
   for i in 0 ..< l.pending.len:
@@ -181,6 +196,15 @@ proc importPaper*(l: var Ledger; doi: string; title: string;
   l.papers[p.id] = p
   l.order.add p.id
   l.genesisDoi[doi] = p.id
+
+proc faucet*(l: var Ledger; toId: string) =
+  ## Give a small amount to a new identity (once). This is the bootstrap
+  ## mechanism so new authors can pay their first registration fee without
+  ## needing an invitation. Rate-limited by social norms (the faucet amount
+  ## is small enough that sybil attacks are not profitable).
+  if l.balances.hasKey(toId):
+    raise newException(LedgerError, "identity already exists: " & toId)
+  l.balances[toId] = faucetAmount
 
 proc transfer*(l: var Ledger; fromId, toId: string; amount: int) =
   ## An existing member invites a new author by transferring coins.
