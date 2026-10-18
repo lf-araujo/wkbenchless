@@ -306,6 +306,31 @@ proc applyPending*(d: var Doc): seq[tuple[pos, len: int]] =
   if still.len > 0:
     d.pending.add Op(kind: opDelete, runs: still)
 
+# -- cursor lookup ------------------------------------------------------------
+proc posToId*(d: Doc, pos: int): CrdtId =
+  ## The ID of the char at buffer position `pos` (the last char's ID if
+  ## past the end). For broadcasting cursor positions as stable IDs.
+  var start = 0
+  for b in d.blocks:
+    if pos < start + b.text.len:
+      return withOffset(b.id, b.id[^1] + (pos - start).uint16)
+    start += b.text.len
+  if d.blocks.len > 0:
+    let b = d.blocks[^1]
+    return withOffset(b.id, b.id[^1] + b.text.len.uint16 - 1)
+  @[]
+
+proc findCharPos*(d: Doc, id: CrdtId): int =
+  ## Buffer position of the char with this ID, or where it would sit.
+  let i = findBlockFor(d, id)
+  if i < 0: return 0
+  let B = d.blocks[i]
+  if B.id[0 ..< B.id.len - 1] == id[0 ..< id.len - 1] and
+     id[^1].int >= B.id[^1].int and
+     id[^1].int < B.id[^1].int + B.text.len:
+    return blockStart(d, i) + (id[^1].int - B.id[^1].int)
+  blockStart(d, i) + B.text.len
+
 # -- initial sync ------------------------------------------------------------
 proc dumpBlocks*(d: Doc): seq[Block] = d.blocks
 

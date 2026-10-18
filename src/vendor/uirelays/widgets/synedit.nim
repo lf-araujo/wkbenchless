@@ -266,6 +266,8 @@ type
 proc currentLine*(s: SynEdit): int {.inline.} = s.currentLine.int
 proc currentCol*(s: SynEdit): int {.inline.} = s.desiredCol.int
 proc changed*(s: SynEdit): bool {.inline.} = s.changed
+proc editVersion*(s: SynEdit): int {.inline.} = s.version
+  ## Monotonic edit counter; extensions poll it to detect buffer edits.
 proc markChanged*(s: var SynEdit) = s.changed = true
 proc markSaved*(s: var SynEdit) = s.changed = false
   ## Clear the changed flag without writing a file, for buffers whose content

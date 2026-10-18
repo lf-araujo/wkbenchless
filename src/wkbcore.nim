@@ -75,6 +75,7 @@ type
     paletteQuery*: string
     paletteSel*: int
     paletteDir*: string                   ## current directory in pmFiles mode
+    palettePrompt*: string                ## pmPrompt: the prompt text to show
     completionActive*: bool
     completionItems*: seq[string]
     completionSel*: int
@@ -145,7 +146,7 @@ type
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
   PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent,
-                   pmSaveAs, pmExport, pmHistory
+                   pmSaveAs, pmExport, pmHistory, pmPrompt
   ExportTarget* = tuple[id, label, cmd: string]   ## palette entry: id -> command
   SearchMode* = enum smFind, smReplace
   SearchField* = enum sfQuery, sfReplace
@@ -208,12 +209,13 @@ var
 proc defcommand*(name, label: string; run: proc(app: var App)) =
   gCommands[name] = Command(label: label, run: run)
 proc bindkey*(chord, name: string) = gKeymap[chord] = name
-proc openPalette(app: var App; mode: PaletteMode)   # defined below; fwd for openExportPalette
+proc openPalette*(app: var App; mode: PaletteMode)   # defined below; fwd for openExportPalette
 proc loadHistory*(app: var App)               # fwd: document history, below
 proc persistUndo*(app: var App)
 proc takeSnapshot*(app: var App)
 proc relTime*(t: float): string
 var gExportTargets*: seq[ExportTarget]   ## registered Export-button targets
+var gPromptHandler*: proc(app: var App; text: string)  ## pmPrompt accept callback
 proc registerExport*(id, label, cmd: string) =
   ## Add a target to the Export button's palette ("Export…" opens it).
   gExportTargets.add (id, label, cmd)
@@ -867,6 +869,8 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
       let nm = extractFilename(p)
       if q.len == 0 or q in p.toLowerAscii:
         result.add (p, nm & "    " & p.parentDir)
+  of pmPrompt:
+    discard   # free-text: the typed query is the answer, no list to filter
   of pmExport:
     # registered export targets (docx, notebook-html, ...): id -> command.
     # No match -> still show the list (the query is not a filter here), so the
