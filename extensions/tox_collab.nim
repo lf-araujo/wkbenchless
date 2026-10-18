@@ -20,6 +20,8 @@
 
 import wkbcore
 import wkbcrdt
+import dag_ledger
+import wkbdag
 import std/[net, json, selectors, strutils, os, tables, sequtils]
 from std/nativesockets import setBlocking
 import std/nativesockets except `\$`
@@ -300,6 +302,76 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
     if s.isHost:                       # relay to the other guests
       for ofd, p in s.peers.mpairs:
         if ofd != fd: p.sendLine(j)
+  of "dag-paper":
+    # a paper submitted for review -- relay to all peers and review locally
+    if s.isHost:
+      for ofd, p in s.peers.mpairs:
+        if ofd != fd: p.sendLine(j)
+    app.msg = "dag: paper received for review -- wkbctl dag-review <id> accept"
+  of "dag-review":
+    # a review response -- apply locally and relay
+    if s.isHost:
+      for ofd, p in s.peers.mpairs:
+        if ofd != fd: p.sendLine(j)
+    let pid = j["paperId"].getStr()
+    let reviewer = j["reviewer"].getStr()
+    let accept = j["accept"].getBool()
+    try:
+      ledger.addReview(pid, Review(paperId: pid, reviewerId: reviewer,
+                                   accept: accept, comment: ""))
+      for i in 0 ..< ledger.pending.len:
+        if ledger.pending[i].paper.id == pid:
+          if ledger.readyToCommit(ledger.pending[i]):
+            var reg = ledger.pending[i]
+            ledger.commit(reg)
+            app.msg = "dag: committed '" & reg.paper.title & "'"
+          else:
+            app.msg = "dag: review (" & $ledger.pending[i].acceptCount &
+                      "/" & $minReviewers & ")"
+          break
+    except LedgerError as e:
+      app.msg = "dag review: " & e.msg
+  of "dag-sync-request":
+    # send the full ledger state
+    if s.isHost:
+      var papers = newJArray()
+      for pid, p in ledger.papers:
+        papers.add %*{"id": p.id, "title": p.title,
+                      "authors": p.authors, "fee": p.fee,
+                      "citations": p.citations.mapIt(
+                        %*{"paperId": it.paperId, "doi": it.doi})}
+      var balances = newJObject()
+      for id, bal in ledger.balances:
+        balances[id] = newJInt(bal)
+      var genesis = newJObject()
+      for doi, pid in ledger.genesisDoi:
+        genesis[doi] = newJString(pid)
+      s.peers[fd].sendLine(%*{"t": "dag-ledger",
+        "papers": papers, "balances": balances, "genesis": genesis,
+        "order": ledger.order.mapIt(newJString(it))})
+  of "dag-ledger":
+    # receive the full ledger state
+    if not s.isHost:
+      var l = Ledger(supply: 0)
+      for p in j["papers"]:
+        var cites: seq[Citation]
+        for c in p["citations"]:
+          cites.add Citation(paperId: c["paperId"].getStr(),
+                              doi: c["doi"].getStr())
+        let paper = Paper(id: p["id"].getStr(),
+                          title: p["title"].getStr(),
+                          authors: p["authors"].mapIt(it.getStr()),
+                          citations: cites, fee: p["fee"].getInt())
+        l.papers[paper.id] = paper
+      for k, v in j["balances"]:
+        l.balances[k] = v.getInt()
+      for k, v in j["genesis"]:
+        l.genesisDoi[k] = v.getStr()
+      for o in j["order"]:
+        l.order.add o.getStr()
+      ledger = l
+      dagReady = true
+      app.msg = "dag: synced (" & $l.papers.len & " papers)"
   of "bye":
     dropPeer(s, fd)
     if s.isHost: app.msg = "collab: peer left"
