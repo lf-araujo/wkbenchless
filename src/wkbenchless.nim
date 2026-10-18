@@ -1448,8 +1448,6 @@ proc main() =
         (if jobsTag.len > 0: "   [jobs: " & jobsTag & "]" else: "") &
         (if app.msg.len > 0: "   " & app.msg else: ""),
         statusFg, statusBg)
-      # right side, outward from the edge: the language, "Spaces: N", and
-      # (only when buffer tabs are off) the file name -- Sublime's ordering
       # right side, outward from the edge: the status circle, the language,
       # "Spaces: N", and (only when buffer tabs are off) the file name
       let circleR = 6

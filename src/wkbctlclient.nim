@@ -5,7 +5,8 @@
 ## Reads <cache>/wkbenchless/control.port ("port\ntoken"), connects, and sends
 ## "token\n<request>"; the token authenticates to the running editor.
 
-import std/[net, os, strutils, nativesockets, json, md5]
+import std/[net, os, strutils, nativesockets, json]
+import checksums/md5          # std/md5 is deprecated (moves out of stdlib)
 
 when defined(windows):
   # winsock's shutdown(SD_SEND) to half-close the write side after the request.

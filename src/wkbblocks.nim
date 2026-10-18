@@ -8,7 +8,8 @@
 ## editing a block makes everything downstream stale -- make-style. The hash is
 ## stored org-style in `#+RESULTS[<hash>]:`.
 
-import std/[strutils, tables, md5, osproc, os, tempfiles, sets, algorithm, sequtils]
+import std/[strutils, tables, osproc, os, tempfiles, sets, algorithm, sequtils]
+import checksums/md5          # std/md5 is deprecated (moves out of stdlib)
 
 type
   BlockInfo* = object

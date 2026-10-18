@@ -53,7 +53,7 @@ languages, and themes are data, and ~C-c r~ recompiles and restarts /in place/,
   own dimensions by default; size a figure with a preceding ~#+ATTR_ORG: :width
   N~ (aspect ratio preserved) or set a default with ~gInlineImageWidth~. Toggle
   with ~M-x toggle-inline-images~. PNG/JPG/GIF/… decode natively with
-  [[https://github.com/treeform/pixie][pixie]] (pure Nim, vendored — *no
+  [[https://github.com/treeform/pixie][pixie]] (pure Nim, a nimble dependency — *no
   ImageMagick needed*); BMP decodes directly.
 - *LaTeX previews*: ~M-x latex-preview~ renders whole-line display math —
   ~$$…$$~, ~\[…\]~, ~\(…\)~, ~$…$~ — to images shown in place (org-latex-preview

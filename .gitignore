@@ -18,3 +18,4 @@ spike/*
 !spike/*.nim
 !spike/*.md
 *.exe
+build/
