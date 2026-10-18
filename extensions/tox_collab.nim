@@ -462,7 +462,11 @@ proc tick(app: var App; s: CollabSession) =
       if nl < 0: break
       let line = s.peers[fd].buf[0 ..< nl]
       s.peers[fd].buf = s.peers[fd].buf[nl + 1 ..^ 1]
-      app.handleLine(s, fd, line)
+      # The wire is a trust boundary: a peer's malformed message (missing /
+      # wrongly-typed fields) must not escape into the tick hook, whose handler
+      # ends the session on any error. Drop the message, keep the connection.
+      try: app.handleLine(s, fd, line)
+      except CatchableError: app.msg = "collab: dropped a malformed message"
   for fd in closed:
     if s.isHost: app.msg = "collab: peer disconnected"
     dropPeer(s, fd)

@@ -129,6 +129,7 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     of pmExport: "export: "
     of pmHistory: "history: "
     of pmPrompt: app.palettePrompt
+    of pmDagPending: "pending: "
   # Scroll the visible window so the selection stays in view.
   var top = 0
   if app.paletteSel >= maxRows: top = app.paletteSel - maxRows + 1
@@ -343,6 +344,10 @@ proc paletteAccept(app: var App) =
     app.paletteActive = false
     if gPromptHandler != nil:
       gPromptHandler(app, app.paletteQuery)
+  of pmDagPending:
+    app.paletteActive = false
+    if gDagPendingAccept != nil:
+      gDagPendingAccept(app, id)
 
 proc handlePalette(app: var App; e: Event) =
   if e.kind == KeyDownEvent:
