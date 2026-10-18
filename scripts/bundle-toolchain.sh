@@ -42,5 +42,26 @@ else
   echo "note: no zig given -- bundling Nim only; C-c r will use the system C compiler."
 fi
 
+# 3. Nimble packages the build needs that are NOT vendored in-tree (pixie and
+#    its deps; zippy and uirelays are vendored). A release install has no
+#    ~/.nimble, so C-c r resolves them from here -- config.nims puts
+#    toolchain/nim-pkgs on the path.
+pkgs_dest="$dest/nim-pkgs"
+rm -rf "$pkgs_dest"; mkdir -p "$pkgs_dest"
+for base in "${HOME}/.nimble/pkgs2" "${HOME}/.nimble/pkgs"; do
+  [ -d "$base" ] || continue
+  for name in pixie bumpy chroma crunchy flatty nimsimd vmath; do
+    for d in "$base/$name"-*; do
+      [ -d "$d" ] || continue
+      [ -d "$pkgs_dest/$(basename "$d")" ] || cp -a "$d" "$pkgs_dest/"
+    done
+  done
+done
+if [ -n "$(ls -A "$pkgs_dest" 2>/dev/null)" ]; then
+  echo "nimble packages copied to $pkgs_dest"
+else
+  echo "warning: no nimble packages found -- run 'nimble install' first, or C-c r on a release install will not resolve pixie."
+fi
+
 echo "done. toolchain assembled at $dest"
 echo "wkbenchless's C-c r will now prefer it (see detectRebuildCmd)."

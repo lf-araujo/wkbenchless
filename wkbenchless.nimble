@@ -8,6 +8,7 @@ srcDir        = "src"
 bin           = @["wkbenchless"]   # `wkbenchless ctl <verb>` drives a running editor (no separate wkbctl)
 
 requires "nim >= 2.0.0"
+requires "pixie == 6.1.0"   # inline image decode (was vendored; never edited locally)
 # uirelays is vendored in src/vendor/uirelays (patched for inline images), so
 # there is no external UI dependency to fetch -- config.nims puts it on the path.
 

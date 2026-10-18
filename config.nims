@@ -28,20 +28,26 @@ block:
 
 ## zippy (pure-Nim zip, dependency-free) vendored in-tree -- the org-tracked
 ## extension uses it to embed the canonical .org into the exported .docx as a
-## conformant OPC package (no python / shell `zip` needed). Also used by pixie
-## (below) for PNG inflate, so there is a single zippy on the path.
+## conformant OPC package (no python / shell `zip` needed). Carries one local
+## patch (write a classic non-ZIP64 archive when it fits -- pandoc cannot
+## re-import ZIP64 docx); offered upstream as treeform/zippy#3 -- drop the
+## vendored copy once that merges and a release carries it.
 switch("path", "src/vendor/zippy")
 
-## pixie (pure-Nim 2D graphics) + its dependency tree, vendored in-tree so inline
-## images (PNG/JPG/GIF/…) decode natively with NO ImageMagick shell-out -- the
-## `convert`/`magick` approach failed on machines without ImageMagick. synedit's
-## toLoadableBmp reads with pixie and writes a 24-bit BMP the drivers already
-## decode. pixie reuses the vendored zippy above.
+## pixie (pure-Nim 2D graphics) is a nimble dependency ("pixie == 6.1.0" in
+## wkbenchless.nimble), fetched with `nimble install` -- it was vendored only
+## to be self-contained and was never edited locally. synedit's toLoadableBmp
+## reads with pixie and writes a 24-bit BMP the drivers already decode (no
+## ImageMagick shell-out). Nimble's pkgs dir goes on the path so plain `nim c`
+## (and C-c r's rebuild, which does not go through nimble) still resolve pixie
+## after one `nimble install`; a toolchain bundled by `nimble bundle` carries
+## its own copy under toolchain/nim-pkgs (scripts/bundle-toolchain.sh).
 ## NB: use a literal "/" here, not the `/` os-path operator -- under a cross
 ## target (`--os:windows`) that operator emits the target separator ("\"), which
 ## is not a valid path on the Linux build host, so pixie would fail to resolve.
-for p in ["pixie", "chroma", "flatty", "nimsimd", "vmath", "bumpy", "crunchy"]:
-  switch("path", "src/vendor/" & p)
+for pkgsDir in [getHomeDir() & ".nimble/pkgs2", getHomeDir() & ".nimble/pkgs",
+                getCurrentDir() & "/toolchain/nim-pkgs"]:
+  if dirExists(pkgsDir): switch("path", pkgsDir)
 
 ## GTK4/libadwaita here come from a conda-forge env (this network's Zscaler
 ## proxy blocks gnu.org, which brew's from-source build of these needs --
