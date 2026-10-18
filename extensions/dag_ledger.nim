@@ -127,12 +127,18 @@ proc extend*(app: var App) =
       except LedgerError as e:
         result = "dag: " & e.msg)
 
-  registerCtlVerb("dag-review", "review: <paperId> <accept|reject> <reviewerId>",
+  registerCtlVerb("dag-review", "review: <paperId> <accept|reject|sendback|abstain> <reviewerId>",
     proc(a: var App; args: seq[string]; body: string): string =
       if not dagReady: return "dag: no ledger"
-      if args.len < 3: return "usage: dag-review <paperId> <accept|reject> <reviewerId>"
+      if args.len < 3:
+        return "usage: dag-review <paperId> <accept|reject|sendback|abstain> <reviewerId>"
       var pid = args[0]
-      let accept = args[1].toLowerAscii() == "accept"
+      let verdict = case args[1].toLowerAscii()
+        of "accept": rvAccept
+        of "reject": rvReject
+        of "sendback": rvSendBack
+        of "abstain": rvAbstain
+        else: rvAccept
       let reviewer = args[2]
       # accept a prefix: expand short IDs against pending papers
       if pid.len < 40:
@@ -141,11 +147,11 @@ proc extend*(app: var App) =
             pid = reg.paper.id; break
       try:
         ledger.addReview(pid, Review(paperId: pid, reviewerId: reviewer,
-                                     accept: accept, comment: ""))
+                                     verdict: verdict, comment: ""))
         # broadcast the review to collab peers
         if gDagSend != nil:
           gDagSend(%*{"t": "dag-review", "paperId": pid,
-                      "reviewer": reviewer, "accept": accept})
+                      "reviewer": reviewer, "verdict": $verdict})
         # check if ready to commit
         for i in 0 ..< ledger.pending.len:
           if ledger.pending[i].paper.id == pid:
@@ -159,6 +165,9 @@ proc extend*(app: var App) =
                 a.ed.gotoPos(0)
                 a.ed.insertText("#+DAG_ID: " & reg.paper.id & "\n")
               result = "committed"
+            elif verdict == rvSendBack:
+              a.msg = "dag: sent back for amendments"
+              result = a.msg
             else:
               a.msg = "dag: review recorded (" & $ledger.pending[i].acceptCount &
                       "/" & $minReviewers & " accepts)"
@@ -210,6 +219,40 @@ proc extend*(app: var App) =
       let p = ledger.papers[args[0]]
       let e = ledger.bibEntryFor(p)
       result = e.toBib())
+
+  registerCtlVerb("dag-suggest", "suggest reviewers for a pending paper: <paperId>",
+    proc(a: var App; args: seq[string]; body: string): string =
+      if not dagReady: return "dag: no ledger"
+      if args.len < 1: return "usage: dag-suggest <paperId>"
+      var pid = args[0]
+      if pid.len < 40:
+        for reg in ledger.pending:
+          if reg.paper.id.startsWith(pid):
+            pid = reg.paper.id; break
+      for reg in ledger.pending:
+        if reg.paper.id == pid:
+          let suggestions = ledger.suggestReviewers(reg.paper)
+          if suggestions.len == 0: return "dag: no reviewers found in field"
+          var lines: seq[string]
+          for s in suggestions:
+            lines.add s.id & "  (score: " & $s.score & ")"
+          return lines.join("\n")
+      return "dag: paper not pending")
+
+  registerCtlVerb("dag-blind", "show the blind review copy of a pending paper",
+    proc(a: var App; args: seq[string]; body: string): string =
+      if not dagReady: return "dag: no ledger"
+      if args.len < 1: return "usage: dag-blind <paperId>"
+      var pid = args[0]
+      if pid.len < 40:
+        for reg in ledger.pending:
+          if reg.paper.id.startsWith(pid):
+            pid = reg.paper.id; break
+      for reg in ledger.pending:
+        if reg.paper.id == pid:
+          return "dag: blind copy is " & $blindCopy(a.ed.fullText()).len &
+                 " chars (original: " & $a.ed.fullText().len & ")"
+      return "dag: paper not pending")
 
   registerCtlVerb("dag-faucet", "bootstrap a new identity: <toId>",
     proc(a: var App; args: seq[string]; body: string): string =

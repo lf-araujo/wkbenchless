@@ -21,7 +21,7 @@ import wkbdesktop
 import wkbpty
 import wkbctrl
 import wkbctlclient       # so `wkbenchless ctl <verb>` == the wkbctl client
-import std/[os, tables, strutils]
+import std/[os, tables, strutils, math]
 from std/times import epochTime   # blink pacing for the redraw gate
 
 const fontPath =
@@ -1448,6 +1448,16 @@ proc main() =
       let lang = langLabel(app)
       let langW = measureText(uiFont, lang).w
       discard drawText(uiFont, sr.x + sr.w - 8 - langW, ty, lang, statusFg, statusBg)
+      # DAG/collab status circle: green=idle, yellow=invitations, red=action
+      # needed, gray=offline. Drawn just left of the language tag.
+      block:
+        let circleColor = gStatusCircle
+        let cx = sr.x + sr.w - 14 - langW
+        let cy = ty + uiLineH div 2
+        let r = 4
+        for dy in -r .. r:
+          let dx = sqrt(float(r*r - dy*dy)).int
+          fillRect(rect(cx - dx, cy + dy, dx * 2, 1), circleColor)
       let spaces = "Spaces: " & $app.ed.tabSize
       let spW = measureText(uiFont, spaces).w
       discard drawText(uiFont, sr.x + sr.w - 18 - langW - spW, ty, spaces, statusFg, statusBg)

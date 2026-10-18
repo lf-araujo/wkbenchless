@@ -42,10 +42,12 @@ type
     citations*: seq[Citation]
     fee*: int                 ## coins burned to register
 
+  ReviewVerdict* = enum rvAccept, rvReject, rvSendBack, rvAbstain
+
   Review* = object
     paperId*: PaperId
     reviewerId*: string       ## reviewer's Tox ID
-    accept*: bool
+    verdict*: ReviewVerdict
     comment*: string
 
   Registration* = object
@@ -137,12 +139,12 @@ proc addReview*(l: var Ledger; paperId: PaperId; r: Review) =
 
 proc acceptCount*(reg: Registration): int =
   for r in reg.reviews:
-    if r.accept: inc result
+    if r.verdict == rvAccept: inc result
 
 proc readyToCommit*(l: Ledger; reg: Registration): bool =
   var accepted: seq[string]
   for r in reg.reviews:
-    if r.accept and r.reviewerId notin accepted:
+    if r.verdict == rvAccept and r.reviewerId notin accepted:
       accepted.add r.reviewerId
   accepted.len >= minReviewers
 
@@ -165,7 +167,7 @@ proc commit*(l: var Ledger; reg: var Registration) =
   # reward the accepting reviewers (incentivizes participation)
   var reviewers: seq[string]
   for r in reg.reviews:
-    if r.accept and r.reviewerId notin reviewers:
+    if r.verdict == rvAccept and r.reviewerId notin reviewers:
       reviewers.add r.reviewerId
   if reviewers.len > 0 and reviewPortion > 0:
     let rShare = reviewPortion div reviewers.len
@@ -196,6 +198,62 @@ proc importPaper*(l: var Ledger; doi: string; title: string;
   l.papers[p.id] = p
   l.order.add p.id
   l.genesisDoi[doi] = p.id
+
+proc suggestReviewers*(l: Ledger; p: Paper): seq[tuple[id: string, score: int]] =
+  ## Rank potential reviewers by citation-graph proximity:
+  ##   +3 for each direct citation (author of a paper this paper cites)
+  ##   +1 for each co-citation (author of a paper citing the same refs)
+  ## Excludes the paper's own authors. Higher score = closer to the field.
+  var scores: Table[string, int]
+  for c in p.citations:
+    if l.papers.hasKey(c.paperId):
+      let cited = l.papers[c.paperId]
+      for a in cited.authors:
+        if a notin p.authors:
+          scores[a] = scores.getOrDefault(a, 0) + 3   # direct expertise
+  # co-citation: authors of papers citing the same references
+  for c in p.citations:
+    for pid, other in l.papers:
+      if pid != p.id and other.citations.anyIt(it.paperId == c.paperId):
+        for a in other.authors:
+          if a notin p.authors:
+            scores[a] = scores.getOrDefault(a, 0) + 1   # co-citation
+  # rank by score (descending): simple insertion into the right slot
+  for id, score in scores:
+    var inserted = false
+    for i in 0 ..< result.len:
+      if score > result[i].score:
+        result.insert (id, score), i
+        inserted = true
+        break
+    if not inserted:
+      result.add (id, score)
+
+proc blindCopy*(text: string): string =
+  ## Strip identifying sections for blind review: author, email, funding,
+  ## acknowledgments, CRedit. The reviewer sees the science, not the lab.
+  var lines: seq[string]
+  var skipping = false
+  for ln in text.splitLines():
+    let low = ln.toLowerAscii()
+    # stop skipping when we hit the next top-level heading
+    if skipping and ln.startsWith("*") and not ln.startsWith("* "):
+      skipping = false
+    if skipping and ln.startsWith("* "):
+      skipping = false
+    # skip identifying headers
+    if low.startsWith("#+author:") or low.startsWith("#+email:"):
+      continue
+    # skip funding/acknowledgment/credit sections
+    if ln.startsWith("* ") and (
+       low.contains("funding") or low.contains("acknowledg") or
+       low.contains("credit") or low.contains("acknowledgement")):
+      skipping = true
+      continue
+    if skipping:
+      continue
+    lines.add ln
+  lines.join("\n")
 
 proc faucet*(l: var Ledger; toId: string) =
   ## Give a small amount to a new identity (once). This is the bootstrap

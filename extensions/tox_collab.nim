@@ -358,10 +358,15 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
         if ofd != fd: p.sendLine(j)
     let pid = j["paperId"].getStr()
     let reviewer = j["reviewer"].getStr()
-    let accept = j["accept"].getBool()
+    let verdict = case j["verdict"].getStr()
+      of "rvAccept": rvAccept
+      of "rvReject": rvReject
+      of "rvSendBack": rvSendBack
+      of "rvAbstain": rvAbstain
+      else: rvAccept
     try:
       ledger.addReview(pid, Review(paperId: pid, reviewerId: reviewer,
-                                   accept: accept, comment: ""))
+                                   verdict: verdict, comment: ""))
       for i in 0 ..< ledger.pending.len:
         if ledger.pending[i].paper.id == pid:
           if ledger.readyToCommit(ledger.pending[i]):
@@ -590,6 +595,17 @@ proc extend*(app: var App) =
         for fd, p in session.peers.mpairs: p.sendLine(j); break
 
   addHook("tick", proc(a: var App) =
+    # update the status circle color
+    if session == nil and (not dagReady or ledger.pending.len == 0):
+      gStatusCircle = color(0xb0, 0xb0, 0xb0)   # gray: offline
+    elif session != nil and (not dagReady or ledger.pending.len == 0):
+      gStatusCircle = color(0x40, 0xc0, 0x40)   # green: connected, idle
+    elif dagReady and ledger.pending.len > 0:
+      gStatusCircle = color(0xe0, 0xc0, 0x00)   # yellow: papers to review
+      for reg in ledger.pending:
+        for r in reg.reviews:
+          if r.verdict == rvSendBack or r.verdict == rvReject:
+            gStatusCircle = color(0xe0, 0x40, 0x40)  # red: action needed
     if session != nil:
       try: tick(a, session)
       except CatchableError as e:

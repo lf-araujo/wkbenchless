@@ -104,7 +104,7 @@ block:
 
   # 3 reviewers accept
   for r in ["bob@tox", "carol@tox", "dave@tox"]:
-    l.addReview(p1.id, Review(paperId: p1.id, reviewerId: r, accept: true))
+    l.addReview(p1.id, Review(paperId: p1.id, reviewerId: r, verdict: rvAccept))
   var reg = l.pending[0]
   check "ready to commit", l.readyToCommit(reg)
 
@@ -132,7 +132,7 @@ block:
 
   # 3 reviewers accept bob's paper
   for r in ["alice@tox", "carol@tox", "dave@tox"]:
-    l.addReview(p2.id, Review(paperId: p2.id, reviewerId: r, accept: true))
+    l.addReview(p2.id, Review(paperId: p2.id, reviewerId: r, verdict: rvAccept))
   reg = l.pending[0]
   let aliceMid = l.balances["alice@tox"]
   l.commit(reg)
@@ -191,7 +191,7 @@ block:
                                 doi: "10.1/genesis")])
   l.submit(p1)
   for r in ["bob@tox", "carol@tox", "dave@tox"]:
-    l.addReview(p1.id, Review(paperId: p1.id, reviewerId: r, accept: true))
+    l.addReview(p1.id, Review(paperId: p1.id, reviewerId: r, verdict: rvAccept))
   var reg = l.pending[0]
   let aliceBefore = l.balances["alice@tox"]
   let bobBefore = l.balances["bob@tox"]
@@ -224,19 +224,110 @@ block:
   l.submit(p)
   # nobody@tox has no coins and no papers -- no stake
   try:
-    l.addReview(p.id, Review(paperId: p.id, reviewerId: "nobody@tox", accept: true))
+    l.addReview(p.id, Review(paperId: p.id, reviewerId: "nobody@tox", verdict: rvAccept))
     check "no-stake reviewer rejected", false
   except LedgerError:
     check "no-stake reviewer rejected", true
   # alice is the author -- can't review her own paper
   try:
-    l.addReview(p.id, Review(paperId: p.id, reviewerId: "alice@tox", accept: true))
+    l.addReview(p.id, Review(paperId: p.id, reviewerId: "alice@tox", verdict: rvAccept))
     check "self-review rejected", false
   except LedgerError:
     check "self-review rejected", true
   # bob has coins (genesis) -- has stake
-  l.addReview(p.id, Review(paperId: p.id, reviewerId: "bob@tox", accept: true))
+  l.addReview(p.id, Review(paperId: p.id, reviewerId: "bob@tox", verdict: rvAccept))
   check "staked reviewer accepted", true
+
+if fails > 0:
+  echo $fails, " FAILURES"
+  quit 1
+echo "all ok"
+
+# -- blind copy: strips identifying sections ------------------------------------
+block:
+  let paper = """#+TITLE: A Great Paper
+#+AUTHOR: Alice Smith, Bob Jones
+#+EMAIL: alice@university.edu
+
+* Introduction
+We study the thing.
+
+* Methods
+We used the method.
+
+* Funding
+This work was funded by Grant #12345.
+
+* Acknowledgments
+Thanks to the lab.
+
+* CRedit
+Alice: Conceptualization. Bob: Writing.
+"""
+  let blind = blindCopy(paper)
+  check "blind strips author", not blind.contains("Alice Smith")
+  check "blind strips email", not blind.contains("alice@university.edu")
+  check "blind strips funding", not blind.contains("Grant #12345")
+  check "blind strips acknowledgments", not blind.contains("Thanks to the lab")
+  check "blind strips credit", not blind.contains("Conceptualization")
+  check "blind keeps title", blind.contains("A Great Paper")
+  check "blind keeps methods", blind.contains("We used the method")
+
+# -- reviewer suggestion: citation-graph proximity ------------------------------
+block:
+  var l = newLedger(1000, @["alice@tox", "bob@tox", "carol@tox", "dave@tox"])
+  l.importPaper("10.1/genesis", "Genesis", @["system"])
+  # alice's paper cites genesis
+  let p1 = makePaper("P1", @["alice@tox"],
+                     @[Citation(paperId: l.genesisDoi["10.1/genesis"])])
+  l.submit(p1)
+  for r in ["bob@tox", "carol@tox", "dave@tox"]:
+    l.addReview(p1.id, Review(paperId: p1.id, reviewerId: r, verdict: rvAccept))
+  var reg = l.pending[0]
+  l.commit(reg)
+  # bob's paper also cites genesis (co-citation with alice's)
+  let p2 = makePaper("P2", @["bob@tox"],
+                     @[Citation(paperId: l.genesisDoi["10.1/genesis"])])
+  l.submit(p2)
+  for r in ["alice@tox", "carol@tox", "dave@tox"]:
+    l.addReview(p2.id, Review(paperId: p2.id, reviewerId: r, verdict: rvAccept))
+  reg = l.pending[0]
+  l.commit(reg)
+  # carol's paper cites both p1 and p2 -- who should review it?
+  let p3 = makePaper("P3", @["carol@tox"],
+                     @[Citation(paperId: p1.id), Citation(paperId: p2.id)])
+  let suggestions = l.suggestReviewers(p3)
+  check "suggests reviewers", suggestions.len > 0
+  # alice and bob are authors of cited papers (score 3 each)
+  # dave is a co-citing author (score 1)
+  var found = false
+  for s in suggestions:
+    if s.id == "alice@tox" and s.score >= 3: found = true
+  check "alice suggested with high score", found
+  # carol (the author) is not suggested
+  for s in suggestions:
+    check "author not suggested", s.id != "carol@tox"
+
+# -- send-back: reviewer requests amendments -------------------------------------
+block:
+  var l = newLedger(1000, @["alice@tox", "bob@tox", "carol@tox", "dave@tox"])
+  l.importPaper("10.2/genesis", "G", @["system"])
+  let p = makePaper("Needs Work", @["alice@tox"],
+                    @[Citation(paperId: l.genesisDoi["10.2/genesis"])])
+  l.submit(p)
+  # bob sends back for amendments
+  l.addReview(p.id, Review(paperId: p.id, reviewerId: "bob@tox",
+                           verdict: rvSendBack, comment: "fix the stats"))
+  # carol accepts anyway
+  l.addReview(p.id, Review(paperId: p.id, reviewerId: "carol@tox",
+                           verdict: rvAccept))
+  # dave accepts
+  l.addReview(p.id, Review(paperId: p.id, reviewerId: "dave@tox",
+                           verdict: rvAccept))
+  # 2 accepts (bob sent back, doesn't count) -- not enough
+  var reg = l.pending[0]
+  check "send-back doesn't count as accept", not l.readyToCommit(reg)
+  check "accept count is 2", reg.acceptCount() == 2
 
 if fails > 0:
   echo $fails, " FAILURES"
