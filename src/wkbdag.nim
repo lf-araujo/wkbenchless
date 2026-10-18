@@ -107,9 +107,25 @@ proc submit*(l: var Ledger; p: Paper) =
   if err.len > 0: raise newException(LedgerError, err)
   l.pending.add Registration(paper: p)
 
+proc hasStake*(l: Ledger; identity: string): bool =
+  ## Anti-gaming: a reviewer must have at least one committed paper on
+  ## the DAG (or be a founding member with a genesis balance). This
+  ## prevents sybil attacks -- fake identities created just to review
+  ## the attacker's own papers.
+  if l.balances.getOrDefault(identity, 0) > 0: return true
+  for _, p in l.papers:
+    if identity in p.authors: return true
+  false
+
 proc addReview*(l: var Ledger; paperId: PaperId; r: Review) =
+  if not l.hasStake(r.reviewerId):
+    raise newException(LedgerError,
+      "reviewer has no stake (no committed papers, no balance): " & r.reviewerId)
+  # a reviewer cannot review their own paper
   for i in 0 ..< l.pending.len:
     if l.pending[i].paper.id == paperId:
+      if r.reviewerId in l.pending[i].paper.authors:
+        raise newException(LedgerError, "cannot review your own paper")
       for existing in l.pending[i].reviews:
         if existing.reviewerId == r.reviewerId:
           raise newException(LedgerError, "duplicate review from " & r.reviewerId)
@@ -165,6 +181,17 @@ proc importPaper*(l: var Ledger; doi: string; title: string;
   l.papers[p.id] = p
   l.order.add p.id
   l.genesisDoi[doi] = p.id
+
+proc transfer*(l: var Ledger; fromId, toId: string; amount: int) =
+  ## An existing member invites a new author by transferring coins.
+  ## This is the onboarding mechanism: you need coins to register a
+  ## paper, and you get coins by being cited or by invitation.
+  if amount <= 0: raise newException(LedgerError, "amount must be positive")
+  let bal = l.balances.getOrDefault(fromId, 0)
+  if bal < amount:
+    raise newException(LedgerError, "insufficient balance: " & $bal & " < " & $amount)
+  l.balances[fromId] = bal - amount
+  l.balances[toId] = l.balances.getOrDefault(toId, 0) + amount
 
 proc retraction*(l: var Ledger; retractedId: PaperId; authors: seq[string];
                  reason: string): Paper =

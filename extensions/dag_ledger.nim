@@ -27,6 +27,7 @@ import std/[strutils, tables, json, sequtils]
 
 var ledger*: Ledger
 var dagReady* = false
+var gDagSend*: proc(j: JsonNode) = nil   ## set by tox_collab: send a DAG message to peers
 
 # -- org header extraction -----------------------------------------------------
 proc orgHeader*(text: string; name: string): string =
@@ -130,12 +131,21 @@ proc extend*(app: var App) =
     proc(a: var App; args: seq[string]; body: string): string =
       if not dagReady: return "dag: no ledger"
       if args.len < 3: return "usage: dag-review <paperId> <accept|reject> <reviewerId>"
-      let pid = args[0]
+      var pid = args[0]
       let accept = args[1].toLowerAscii() == "accept"
       let reviewer = args[2]
+      # accept a prefix: expand short IDs against pending papers
+      if pid.len < 40:
+        for reg in ledger.pending:
+          if reg.paper.id.startsWith(pid):
+            pid = reg.paper.id; break
       try:
         ledger.addReview(pid, Review(paperId: pid, reviewerId: reviewer,
                                      accept: accept, comment: ""))
+        # broadcast the review to collab peers
+        if gDagSend != nil:
+          gDagSend(%*{"t": "dag-review", "paperId": pid,
+                      "reviewer": reviewer, "accept": accept})
         # check if ready to commit
         for i in 0 ..< ledger.pending.len:
           if ledger.pending[i].paper.id == pid:
@@ -143,6 +153,11 @@ proc extend*(app: var App) =
               var reg = ledger.pending[i]
               ledger.commit(reg)
               a.msg = "dag: committed '" & reg.paper.title & "'"
+              # inject the #+DAG_ID: header into the org file
+              let text = a.ed.fullText()
+              if text.orgHeader("DAG_ID").len == 0:
+                a.ed.gotoPos(0)
+                a.ed.insertText("#+DAG_ID: " & reg.paper.id & "\n")
               result = "committed"
             else:
               a.msg = "dag: review recorded (" & $ledger.pending[i].acceptCount &
@@ -195,6 +210,18 @@ proc extend*(app: var App) =
       let p = ledger.papers[args[0]]
       let e = ledger.bibEntryFor(p)
       result = e.toBib())
+
+  registerCtlVerb("dag-transfer", "invite a new author: <from> <to> <amount>",
+    proc(a: var App; args: seq[string]; body: string): string =
+      if not dagReady: return "dag: no ledger"
+      if args.len < 3: return "usage: dag-transfer <from> <to> <amount>"
+      let amount = try: parseInt(args[2]) except: 0
+      try:
+        ledger.transfer(args[0], args[1], amount)
+        a.msg = "dag: transferred " & $amount & " from " & args[0] & " to " & args[1]
+        result = a.msg
+      except LedgerError as e:
+        result = "dag: " & e.msg)
 
   registerCtlVerb("dag-sync", "request the full ledger from the collab host",
     proc(a: var App; args: seq[string]; body: string): string =

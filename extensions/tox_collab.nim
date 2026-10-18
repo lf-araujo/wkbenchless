@@ -229,6 +229,30 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
       s.peers[fd] = p
       p.sendLine(%*{"t": "welcome", "site": p.site.int})
       s.sendSync(p, app.sessionName(s))
+      # auto-sync the DAG ledger to the new peer
+      if dagReady:
+        var papers = newJArray()
+        for pid, pp in ledger.papers:
+          papers.add %*{"id": pp.id, "title": pp.title,
+                        "authors": pp.authors, "fee": pp.fee,
+                        "citations": pp.citations.mapIt(
+                          %*{"paperId": it.paperId, "doi": it.doi})}
+        var balances = newJObject()
+        for id, bal in ledger.balances:
+          balances[id] = newJInt(bal)
+        var genesis = newJObject()
+        for doi, pid in ledger.genesisDoi:
+          genesis[doi] = newJString(pid)
+        p.sendLine(%*{"t": "dag-ledger",
+          "papers": papers, "balances": balances, "genesis": genesis,
+          "order": ledger.order.mapIt(newJString(it))})
+        # also send pending registrations so the peer can review them
+        for reg in ledger.pending:
+          p.sendLine(%*{"t": "dag-paper", "id": reg.paper.id,
+                        "title": reg.paper.title,
+                        "authors": reg.paper.authors,
+                        "citations": reg.paper.citations.mapIt(
+                          %*{"paperId": it.paperId, "doi": it.doi})})
       app.msg = "collab: peer joined (site " & $p.site & ")"
   of "welcome":
     if not s.isHost:
@@ -303,11 +327,30 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
       for ofd, p in s.peers.mpairs:
         if ofd != fd: p.sendLine(j)
   of "dag-paper":
-    # a paper submitted for review -- relay to all peers and review locally
+    # a paper submitted for review -- add to the local pending list
     if s.isHost:
       for ofd, p in s.peers.mpairs:
         if ofd != fd: p.sendLine(j)
-    app.msg = "dag: paper received for review -- wkbctl dag-review <id> accept"
+    # reconstruct the paper and add it to our pending list
+    try:
+      var cites: seq[Citation]
+      for c in j["citations"]:
+        cites.add Citation(paperId: c["paperId"].getStr(),
+                            doi: c["doi"].getStr())
+      let p = Paper(id: j["id"].getStr(),
+                    title: j["title"].getStr(),
+                    authors: j["authors"].mapIt(it.getStr()),
+                    citations: cites, fee: defaultFee)
+      if not ledger.isCommitted(p.id):
+        var already = false
+        for reg in ledger.pending:
+          if reg.paper.id == p.id: already = true; break
+        if not already:
+          ledger.pending.add Registration(paper: p)
+          app.msg = "dag: paper for review -- '" & p.title &
+                    "' -- wkbctl dag-review " & p.id[0 ..< 8] & " accept <your-id>"
+    except CatchableError:
+      app.msg = "dag: malformed dag-paper message"
   of "dag-review":
     # a review response -- apply locally and relay
     if s.isHost:
@@ -538,6 +581,14 @@ proc extend*(app: var App) =
     (if session.isHost: "host site " & $session.site & ", " &
       $session.peers.len & " peer(s), " & $session.doc.docLen & " chars"
      else: "guest (site " & $session.site & "), " & $session.doc.docLen & " chars"))
+  # DAG messages travel over the collab channel
+  gDagSend = proc(j: JsonNode) =
+    if session != nil:
+      if session.isHost:
+        for fd, p in session.peers.mpairs: p.sendLine(j)
+      else:
+        for fd, p in session.peers.mpairs: p.sendLine(j); break
+
   addHook("tick", proc(a: var App) =
     if session != nil:
       try: tick(a, session)
