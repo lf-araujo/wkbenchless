@@ -1,5 +1,7 @@
 # wkbenchless.nimble
 
+import std/os
+
 version       = "0.4.4"
 author        = "Luis F. Araujo"
 description   = "A native, deeply Nim-configurable literate editor: org-babel, LSP, interactive REPL sessions, org-src fontification -- a workbench-less alternative to heavier IDEs."
@@ -9,8 +11,14 @@ bin           = @["wkbenchless"]   # `wkbenchless ctl <verb>` drives a running e
 
 requires "nim >= 2.0.0"
 requires "pixie == 6.1.0"   # inline image decode (was vendored; never edited locally)
+requires "checksums"        # sha1/md5, extracted out of the stdlib (std/sha1, std/md5 deprecated)
 # uirelays is vendored in src/vendor/uirelays (patched for inline images), so
 # there is no external UI dependency to fetch -- config.nims puts it on the path.
+
+task test, "Build and run the deterministic test suite (src/test_*.nim)":
+  # src/tester.nim discovers every self-contained test and fails the task if
+  # any of them fail. Binaries land in build/ (gitignored).
+  exec "nim c -r --hints:off -o:" & thisDir() / "build" / "tester" & " src/tester.nim"
 
 task run, "Build and run wkbenchless":
   exec "nim c -r -o:wkbenchless src/wkbenchless.nim"

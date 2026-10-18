@@ -50,7 +50,7 @@ pkgs_dest="$dest/nim-pkgs"
 rm -rf "$pkgs_dest"; mkdir -p "$pkgs_dest"
 for base in "${HOME}/.nimble/pkgs2" "${HOME}/.nimble/pkgs"; do
   [ -d "$base" ] || continue
-  for name in pixie bumpy chroma crunchy flatty nimsimd vmath; do
+  for name in pixie bumpy chroma crunchy flatty nimsimd vmath checksums; do
     for d in "$base/$name"-*; do
       [ -d "$d" ] || continue
       [ -d "$pkgs_dest/$(basename "$d")" ] || cp -a "$d" "$pkgs_dest/"

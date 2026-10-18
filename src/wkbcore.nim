@@ -12,7 +12,8 @@ import wkblsp                    # pure std/json LSP client -- portable, no GTK
 import wkbref                    # reference context: prose/notes/paper by citekey
 import wkbblocks                 # src blocks as a dependency graph (hashes, :depends)
 import std/[tables, strutils, os, osproc, algorithm, times, sets, sequtils,
-           json, sha1]
+           json]
+import checksums/sha1         # std/sha1 is deprecated (moves out of stdlib)
 when defined(posix): import std/posix
 
 export uirelays, synedit, wkbsession, wkblsp, wkbref, wkbblocks   # config sees Event/SynEdit/ReplSpec/LspClient/gCorpusRoots/...
@@ -394,7 +395,12 @@ proc setState*(key, val: string) =
     var s = ""
     for k, v in gState: s.add k & " = " & v & "\n"
     writeFile(statePath(), s)
-  except CatchableError: discard
+  except CatchableError as e:
+    # In-memory state still holds the value for this session, but it will not
+    # survive a restart -- say so instead of failing silently (a GUI has no
+    # other channel here; stderr shows when run from a terminal).
+    stderr.writeLine("wkbenchless: could not save state (" & e.msg & "): " &
+      statePath())
 
 proc sshControlPath*(): string =
   ## A per-user/host/port master socket shared by the interactive login and the
