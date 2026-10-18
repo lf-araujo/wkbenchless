@@ -5,33 +5,33 @@
 ## and the registration fee gives the DAG an economic layer. No editorial
 ## board, no platform, no server -- just a 3-reviewer threshold.
 ##
+## The DAG ID lives inside the BibTeX entry (a `dagid` field), so the
+## citation graph extracts itself from the .bib file. Authors write
+## papers in LaTeX as usual; the DAG parses their bibliography and
+## builds the edges automatically.
+##
 ## Structure:
 ##   - Papers are committed in order; citations must point to already-
 ##     committed papers, so the graph is acyclic by construction.
-##   - A paper is committed when >= 3 distinct reviewers (each with a
-##     registered identity) accept it. Reviews travel over Tox (the
-##     editor's collab channel), not through this module.
-##   - The registration fee is distributed to the cited papers' authors,
-##     creating a self-reinforcing citation economy.
-##   - Retractions are new nodes linked to the retracted paper (the DAG
-##     is append-only; nothing is ever mutated or removed).
-##
-## STATUS: investigation -- data model + validation + tests. The network
-## layer (Tox transport, peer sync) and the economic model (coin supply,
-## inflation, anti-gaming) are the next phases.
+##   - A paper is committed when >= 3 distinct reviewers accept it.
+##   - The registration fee is distributed to the cited papers' authors.
+##   - Retractions are new nodes linked to the retracted paper.
+##   - The genesis registry maps DOIs to DAG IDs for papers imported
+##     from the traditional publishing system.
 
-import std/[tables, strutils, hashes, sequtils]
+import std/[tables, strutils, sha1, sequtils]
+import wkbbib
 
 const
   minReviewers* = 3            ## the consensus threshold
   defaultFee* = 10             ## coins to register a paper
 
 type
-  PaperId* = string            ## SHA-256 hex digest of the paper content
+  PaperId* = string            ## SHA-1 hex digest (upgrade target: SHA-256)
 
   Citation* = object
     paperId*: PaperId         ## the cited paper (must already be committed)
-    doi*: string              ## optional: the DOI for external lookup
+    doi*: string              ## the DOI (for external lookup / genesis)
 
   Paper* = object
     id*: PaperId              ## hash of title + authors + citations
@@ -41,7 +41,7 @@ type
     fee*: int                 ## coins burned to register
 
   Review* = object
-    paperId*: PaperId         ## which paper
+    paperId*: PaperId
     reviewerId*: string       ## reviewer's Tox ID
     accept*: bool
     comment*: string
@@ -54,23 +54,22 @@ type
 
   Ledger* = object
     papers*: Table[PaperId, Paper]        ## committed papers (the DAG)
-    order*: seq[PaperId]                 ## commitment order (the topological sort)
+    order*: seq[PaperId]                 ## commitment order (topological)
     balances*: Table[string, int]        ## Tox ID -> coin balance
     pending*: seq[Registration]          ## submitted, awaiting reviews
-    supply*: int                         ## total coins minted so far
+    supply*: int                         ## total coins minted
+    genesisDoi*: Table[string, PaperId]  ## DOI -> DAG ID (imported papers)
 
-# -- paper identity -----------------------------------------------------------
+# -- paper identity (SHA-1; upgrade target: SHA-256) ---------------------------
 proc paperHash*(title: string; authors: seq[string];
                 citations: seq[Citation]): PaperId =
-  ## A deterministic ID: the same paper content always hashes to the same
-  ## ID, so peers that see the same paper agree on its identity.
-  var h: Hash = 0
-  h = h !& title.hash
-  for a in authors: h = h !& a.hash
-  for c in citations:
-    h = h !& c.paperId.hash
-    h = h !& c.doi.hash
-  result = $h
+  ## A deterministic, self-certifying ID: the same content always hashes
+  ## to the same ID, so peers independently verify identity.
+  var content = title & "\n"
+  for a in authors: content.add a & "\n"
+  for c in citations: content.add c.paperId & "\n"
+  let h = secureHash(content)
+  $h
 
 proc makePaper*(title: string; authors: seq[string];
                 citations: seq[Citation];
@@ -104,16 +103,13 @@ proc citedBy*(l: Ledger; id: PaperId): seq[PaperId] =
 
 # -- registration lifecycle ---------------------------------------------------
 proc submit*(l: var Ledger; p: Paper) =
-  ## Submit a paper for review. The fee is held (not yet distributed).
   let err = l.validate(p)
   if err.len > 0: raise newException(LedgerError, err)
   l.pending.add Registration(paper: p)
 
 proc addReview*(l: var Ledger; paperId: PaperId; r: Review) =
-  ## Attach a review to a pending registration.
   for i in 0 ..< l.pending.len:
     if l.pending[i].paper.id == paperId:
-      # a reviewer can only review once
       for existing in l.pending[i].reviews:
         if existing.reviewerId == r.reviewerId:
           raise newException(LedgerError, "duplicate review from " & r.reviewerId)
@@ -126,7 +122,6 @@ proc acceptCount*(reg: Registration): int =
     if r.accept: inc result
 
 proc readyToCommit*(l: Ledger; reg: Registration): bool =
-  ## True when >= `minReviewers` distinct reviewers have accepted.
   var accepted: seq[string]
   for r in reg.reviews:
     if r.accept and r.reviewerId notin accepted:
@@ -134,46 +129,93 @@ proc readyToCommit*(l: Ledger; reg: Registration): bool =
   accepted.len >= minReviewers
 
 proc commit*(l: var Ledger; reg: var Registration) =
-  ## Commit a registration to the DAG. Distributes the fee to the cited
-  ## papers' authors. The paper becomes citable by others.
   if not l.readyToCommit(reg):
     raise newException(LedgerError,
       "not enough acceptances: " & $reg.acceptCount & "/" & $minReviewers)
   let p = reg.paper
-  # burn the fee from the first author
   l.balances[p.authors[0]] = l.balances.getOrDefault(p.authors[0], 0) - p.fee
-  # distribute to cited papers' authors (split evenly)
   if p.citations.len > 0:
     let share = p.fee div p.citations.len
     for c in p.citations:
       let cited = l.papers[c.paperId]
       for a in cited.authors:
         l.balances[a] = l.balances.getOrDefault(a, 0) + share
-  # commit
   l.papers[p.id] = p
   l.order.add p.id
-  # remove from pending
   for i in 0 ..< l.pending.len:
     if l.pending[i].paper.id == p.id:
       l.pending.delete i
       break
-  reg.reviews.setLen 0   # consumed
+  reg.reviews.setLen 0
 
 # -- genesis -------------------------------------------------------------------
 proc newLedger*(initialSupply = 0; identities: seq[string] = @[]): Ledger =
-  ## Create a fresh ledger. `identities` are the founding members who
-  ## receive the initial coin supply (split evenly).
   result.supply = initialSupply
   if identities.len > 0 and initialSupply > 0:
     let share = initialSupply div identities.len
     for id in identities:
       result.balances[id] = share
 
+proc importPaper*(l: var Ledger; doi: string; title: string;
+                  authors: seq[string]) =
+  ## Import a traditional paper into the DAG by DOI. Creates a committed
+  ## node with no citations (it predates the DAG). The DOI → ID mapping
+  ## goes into the genesis registry so .bib entries with this DOI resolve.
+  let p = makePaper(title, authors, @[], fee = 0)
+  l.papers[p.id] = p
+  l.order.add p.id
+  l.genesisDoi[doi] = p.id
+
 proc retraction*(l: var Ledger; retractedId: PaperId; authors: seq[string];
                  reason: string): Paper =
-  ## A retraction is a new node linked to the retracted paper. The DAG
-  ## is append-only -- nothing is removed, but the retraction marks the
-  ## original as no longer citable in good faith.
   let retracted = l.papers[retractedId]
   result = makePaper("RETRACTION: " & retracted.title, authors,
                      @[Citation(paperId: retractedId, doi: reason)])
+
+# -- BibTeX integration: the citation graph extracts itself --------------------
+proc citationsFromBib*(l: Ledger; bib: BibFile): seq[Citation] =
+  ## Walk a .bib file and build citation edges. For each entry:
+  ##   - If it has a `dagid`, cite that DAG paper directly.
+  ##   - If it has a `doi` but no `dagid`, look up the genesis registry.
+  ##   - If neither, it's a dangling edge (cites outside the DAG) -- skip.
+  for e in bib:
+    let dagid = e.bibDagId()
+    if dagid.len > 0:
+      if l.isCommitted(dagid):
+        result.add Citation(paperId: dagid, doi: e.bibDoi())
+    else:
+      let doi = e.bibDoi()
+      if doi.len > 0 and l.genesisDoi.hasKey(doi):
+        result.add Citation(paperId: l.genesisDoi[doi], doi: doi)
+
+proc submitFromBib*(l: var Ledger; title: string; authors: seq[string];
+                    bib: BibFile; fee = defaultFee): Paper =
+  ## Submit a paper whose citations are auto-extracted from its .bib file.
+  ## This is the main entry point: authors write LaTeX, include a .bib
+  ## with `dagid` fields, and the DAG builds the citation edges.
+  let citations = l.citationsFromBib(bib)
+  if citations.len == 0:
+    raise newException(LedgerError,
+      "no DAG-citable references found in the .bib file")
+  result = makePaper(title, authors, citations, fee)
+  l.submit(result)
+
+proc bibEntryFor*(l: Ledger; p: Paper): BibEntry =
+  ## Generate the BibTeX entry for a committed paper, including its
+  ## `dagid` -- so others can cite it and the citation graph grows.
+  result = BibEntry(typ: "article", key: p.id[0 ..< 8])
+  result.fields["title"] = p.title
+  result.fields["author"] = p.authors.join(" and ")
+  result.fields["dagid"] = p.id
+  if p.citations.len > 0:
+    result.fields["doi"] = p.citations[0].doi
+
+proc retractionFromBib*(l: var Ledger; bib: BibFile;
+                        authors: seq[string]): Paper =
+  ## Detect a retraction entry in a .bib file (has a `retracts` field)
+  ## and create the retraction node.
+  for e in bib:
+    let retracts = e.bibRetracts()
+    if retracts.len > 0 and l.isCommitted(retracts):
+      return l.retraction(retracts, authors, e.bibDoi())
+  raise newException(LedgerError, "no valid retraction entry in .bib file")
