@@ -250,6 +250,44 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
     undoable edit, so C-z comes right back to the present, never a trap.
   - [X] ~M-x cite-history~ — what we wrote about the citation at point, over
     time: every snapshot's paragraphs citing the key, newest first.
+- [ ] *Matter as the highlight engine* — port the hand-rolled Org+CriticMarkup
+  highlighter (~highlightOrg~, synedit.nim) onto [[https://github.com/elcritch/matter][matter]], elcritch's synchronous
+  TextMate grammar engine for native Nim (JSON/plist ~.tmLanguage~ in, scope
+  tokens with UTF-8 byte offsets out; line-based with a ~ruleStack~ threaded
+  between lines; embedded-language dispatch; bundled VS Code grammar catalog).
+  The criticmarkup accept/reject commands (wkbcore.nim) work on raw text and
+  are untouched.
+  - [ ] Phase 1 — *spike* (go/no-go gate): vendor matter + the ~elcritch/reni~
+    fork (~feat/textmate-compat~, PR #84 pending upstream) like zippy/pixie;
+    ~parseRawGrammar~ a minimal grammar (headlines + directives), tokenize a
+    repo ~.org~ file, print scopes. Confirms Nim 2.2.0 compat, binary-size
+    cost, cold-start time.
+  - [ ] Phase 2 — *grammar*: author ~org.tmLanguage.json~ covering everything
+    ~highlightOrg~ does, with a scope convention built for the adapter:
+    ~critic.insertion/deletion/substitution/comment/highlight~ (substitution
+    splits old/new via captures), ~punctuation.definition.*~ for the markers
+    we hide, standard names (~markup.bold~, ~string.other.org~, …) elsewhere.
+    Snapshot tests (pinned token ranges + scopes) plus a golden test diffing
+    old vs new cell styles over the repo's own ~.org~ files.
+  - [ ] Phase 3 — *adapter* (~matterhl.nim~ in the vendored widget): scope →
+    ~TokenClass~ + ~cfHidden/cfBold/cfItalic~ mapping table; byte→cell offset
+    conversion (matter emits UTF-8 byte ranges, cells are per-grapheme);
+    rebuild ~srcBlockRanges~ from line states so folding is unchanged.
+  - [ ] Phase 4 — *incremental*: per-line token cache keyed on ~ruleStack~ —
+    re-tokenize from the edited line until the stack converges with the cache,
+    replacing today's full-buffer re-run on every keystroke. Extend
+    ~test_highlight_perf.nim~ to benchmark old vs new on manuscript-sized
+    files before trusting it.
+  - [ ] Phase 5 — *cleanup*: delete ~highlightOrg~ once the golden test passes;
+    Markdown/Rmd (matter ships a real Markdown grammar; our Rmd ~```{r}~
+    fences need the same embedded-dispatch treatment) is a separable
+    follow-up.
+  - Decisions: src-block *bodies* stay on stdlib ~GeneralTokenizer~ at first
+    (hybrid — matter marks the block boundaries only); upgrading to matter's
+    bundled VS Code grammars (ZIP-embedded, richer but heavier) is a later
+    step. Theme keeps the ~TokenClass~ mapping rather than adopting matter's
+    tmTheme pipeline. Main risk: the reni fork is a moving target on an
+    unmerged branch — vendoring pins it, updates are on us.
 
 * Changelog (recent)
 

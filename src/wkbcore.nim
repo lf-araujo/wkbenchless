@@ -146,7 +146,7 @@ type
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
   PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent,
-                   pmSaveAs, pmExport, pmHistory, pmPrompt
+                   pmSaveAs, pmExport, pmHistory, pmPrompt, pmDagPending
   ExportTarget* = tuple[id, label, cmd: string]   ## palette entry: id -> command
   SearchMode* = enum smFind, smReplace
   SearchField* = enum sfQuery, sfReplace
@@ -217,6 +217,9 @@ proc relTime*(t: float): string
 var gExportTargets*: seq[ExportTarget]   ## registered Export-button targets
 var gPromptHandler*: proc(app: var App; text: string)  ## pmPrompt accept callback
 var gStatusCircle*: Color = color(0xb0, 0xb0, 0xb0)  ## status circle: gray=offline
+var gStatusCircleRect*: Rect = rect(0, 0, 0, 0)  ## clickable bounds (set during draw)
+var gDagPendingEntries*: proc(app: App): seq[tuple[id, label: string]]  ## palette items
+var gDagPendingAccept*: proc(app: var App; id: string)  ## palette accept action
 proc registerExport*(id, label, cmd: string) =
   ## Add a target to the Export button's palette ("Export…" opens it).
   gExportTargets.add (id, label, cmd)
@@ -872,6 +875,9 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
         result.add (p, nm & "    " & p.parentDir)
   of pmPrompt:
     discard   # free-text: the typed query is the answer, no list to filter
+  of pmDagPending:
+    if gDagPendingEntries != nil:
+      return gDagPendingEntries(app)
   of pmExport:
     # registered export targets (docx, notebook-html, ...): id -> command.
     # No match -> still show the list (the query is not a filter here), so the
