@@ -1,0 +1,126 @@
+#+TITLE: The Citation DAG: A Serverless Ledger for Scientific Publishing
+#+AUTHOR: Luis F. Araujo
+#+STARTUP: nohideblocks
+
+Draft outline for the paper. The working system is in src/wkbdag.nim
+(ledger), extensions/dag_ledger.nim (editor verbs), extensions/tox_collab.nim
+(review channel), src/wkbbib.nim (BibTeX bridge).
+
+* Abstract (one paragraph)
+
+A citation graph is a directed acyclic graph, so the ledger's topology
+can mirror the content's topology: papers are nodes, citations are
+edges, and the registration fee gives the DAG an economic layer. We
+present a working system -- written in Nim, integrated into a literate
+editor -- where papers are committed to a DAG ledger after a
+three-reviewer threshold, citations flow from the .bib file (the
+citation graph extracts itself), and coins reward both cited authors
+and reviewers. No editorial board, no platform, no server.
+
+* 1. Introduction: the editorial bottleneck
+
+- The current system: submit to a journal, wait for an editor to find
+  reviewers, wait for reviews, wait for a decision. Months to years.
+- The cost is not the review -- it's the coordination overhead.
+- Prior alternatives (DAP, Tenorio, Mackey, ScienceMatters, eLife, PCI)
+  all replace the editor with a DAO, a platform, or a central
+  authority. None remove the intermediary.
+- Our contribution: the citation graph IS the ledger. No intermediary
+  because the infrastructure is the content.
+
+* 2. The DAG-citation isomorphism
+
+- A citation graph is a DAG by construction (papers cite earlier papers).
+- The ledger's topology mirrors the content's topology:
+  - Nodes = papers (identified by content hash)
+  - Edges = citations (verified against committed papers)
+  - Consensus = 3-reviewer threshold (not PoW/PoS)
+  - Economic layer = registration fees flow to cited authors
+- Acyclicity is guaranteed by construction: citations must point to
+  already-committed papers. No cycle detection needed.
+- Retractions are append-only: a new node linked to the retracted one.
+  Nothing is mutated or removed.
+
+* 3. The BibTeX bridge: the citation graph extracts itself
+
+- The key insight: the .bib file IS the citation graph.
+- Each committed paper gets a `dagid` field in its BibTeX entry.
+- When another author cites it, the DAG parses their .bib and builds
+  the edge automatically. No manual citation registration.
+- The genesis registry maps DOIs to DAG IDs for papers imported from
+  the traditional system. Dangling edges (non-DAG citations) are skipped.
+- Authors write papers in LaTeX/org as usual. The DAG is invisible
+  infrastructure.
+
+* 4. The economic model
+
+- Registration fee: the author pays F coins to submit.
+- Fee split: 70% to cited authors (split evenly), 30% to reviewers
+  (split evenly among accepters). This incentivizes both citation
+  and review participation.
+- Faucet: new identities receive a small amount (5 coins) once, so
+  they can pay their first registration fee. Sybil-resistant because
+  the amount is too small to be profitable.
+- Anti-gaming:
+  - Reviewers must have stake (a committed paper or a coin balance).
+  - Reviewers cannot review their own paper.
+  - The faucet is once-only per identity.
+- Coin supply: fixed at genesis. No inflation. Coins circulate from
+  authors to cited authors to reviewers. The economy is deflationary
+  (coins concentrate with highly-cited authors), which is a feature:
+  it rewards sustained contribution.
+
+* 5. The review channel
+
+- Reviews travel over Tox (a serverless, encrypted P2P network).
+- The editor (wkbenchless) wraps Tox as a contact list + inbox --
+  structurally identical to email, but without the SMTP layer.
+- The author submits from their editor; the paper travels to
+  reviewers' editors; they accept or reject; the review travels back.
+- Reviewer discovery: initially manual (the author contacts reviewers
+  via Tox). As the DAG grows, the citation graph itself provides
+  recommendations (co-citation, bibliographic coupling).
+
+* 6. Implementation
+
+- Written in Nim: compiled, low-level, C-interop, no runtime.
+  The first DAG blockchain in Nim (a notable gap in the ecosystem).
+- ~500 lines of core ledger code (wkbdag.nim), ~120 lines of BibTeX
+  parser (wkbbib.nim), ~200 lines of editor integration.
+- 49 unit tests covering the full lifecycle, coin flow, anti-gaming.
+- Integrated into wkbenchless, a literate Nim editor with org-babel,
+  REPL sessions, and P2P collaborative editing (also built on Tox).
+
+* 7. Related work
+
+| System | Approach | Key difference |
+|--------|----------|---------------|
+| DAP | Blockchain + smart contracts | Centralised virtual editor, Ethereum |
+| Tenorio et al. (2021) | Blockchain + IPFS | IPFS storage, no DAG, no coin economy |
+| Mackey et al. | DAO governance | Voting, not 3-reviewer threshold |
+| ScienceMatters | Centralised platform | Not P2P, no DAG |
+| eLife Reviewed Preprints | Single organisation | No blockchain, no coin economy |
+| Peer Community In | Human governance | No blockchain, no Tox |
+| Philica (2001) | Author finds 3 reviewers | No blockchain, no coin economy |
+
+Our novelty: (1) DAG-as-citation-graph (semantic ledger structure),
+(2) coin flow on citation edges, (3) Tox as the review channel,
+(4) no editorial board, no DAO, no platform.
+
+* 8. Discussion: hard problems
+
+- Reviewer discovery: bootstraps manually, transitions to DAG-based
+  recommendation as the graph grows.
+- Rubber-stamping: mitigated by stake requirements and the economic
+  cost of reviewing (time spent, not coins).
+- Adoption: the discoverability system (separate work) is the critical
+  dependency. Without indexing, the citation economy never starts.
+- Key loss: social recovery (k-of-n trusted contacts) or hardware
+  keys, same as crypto wallets.
+
+* 9. Conclusion
+
+The citation DAG replaces the editorial system with a data structure.
+The ledger is the content; the consensus is the review; the economy
+is the citation. No server, no platform, no intermediary -- just
+scientists, their papers, and a graph.
