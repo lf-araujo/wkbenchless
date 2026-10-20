@@ -196,7 +196,7 @@ no manual `--passL` flag needed for normal builds.
   and pushed. Active development is on **wkbenchless** (see the planned
   work below).
 
-## Planned: babel robustness + block-by-name invocation (wkbenchless)
+## DONE: babel robustness + block-by-name invocation (wkbenchless)
 
 Two issues found 2026-10-20 while running the fastsem JSS benchmark
 blocks through `wkbctl`:
@@ -221,6 +221,12 @@ blocks through `wkbctl`:
    and callers must re-list blocks before each run.  Fix: in
    `wkbctrl.nim`'s `run-block`, resolve `parts[1]` against the name
    table before falling back to `parseInt`.
+
+*Fixed 2026-10-20 (commit e8fd140):* `run-block <name>` resolves the
+name to its `#+begin_src` line; `restart-session [lang [name]]` kills
+a wedged REPL (retiring in-flight jobs as interrupted) and lets it
+respawn fresh.  The babel timeout/heartbeat remains open — the
+restart verb makes hangs recoverable rather than detected.
 
 ## Planned: reference management (wkbenchless)
 
