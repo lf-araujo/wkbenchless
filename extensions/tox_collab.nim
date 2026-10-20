@@ -1,13 +1,20 @@
 ## tox_collab.nim -- serverless collaborative editing, CRDT.el-style.
 ##
 ## The editing model is wkbcrdt.nim (Logoot split, ported from CRDT.el);
-## the transport is plain TCP (stdlib net), so it works over LAN as-is, or
-## P2P anywhere by tunneling that TCP over Tox with tuntox:
+## the transport is plain TCP (stdlib net) -- over LAN as-is, or P2P
+## anywhere by tunneling that TCP over Tox. tox_transport.nim spawns and
+## supervises the tuntox child on BOTH sides, so neither user runs
+## anything by hand:
 ##
-##   host:  M-x tox-share            (listens on :6543, prints the hint)
-##   peer:  tuntox -i <host's tox ID> -L 6543:127.0.0.1:6543
-##   peer:  M-x tox-join  (with host:port at the cursor), or
-##          wkbctl tox-join 127.0.0.1:6543
+##   host:  M-x tox-share   (listens on :6543, spawns tuntox, copies the
+##                          Tox ID to the clipboard once it appears)
+##   peer:  M-x tox-join <host's Tox ID>   (spawns tuntox -L, joins through
+##                                          the local forward when it's up)
+##     or:  M-x tox-join <host:port>       (plain LAN TCP, no tox at all)
+##
+## Set TUNTOX_SHARED_SECRET in the environment (or gToxSecret) on both
+## sides: without it, anyone holding the host's Tox ID can tunnel to ANY
+## local port, not just the collab one.
 ##
 ## Phase 1 is CRDT.el's host-relayed star: the host owns the session,
 ## assigns site IDs, sends the initial sync dump, and relays every op to
@@ -15,14 +22,15 @@
 ## not a correctness requirement -- the peers' docs converge under any
 ## delivery order (see src/test_logoot.nim).
 ##
-## STATUS: text sync + relay; remote cursors, tuntox spawn management and
-## the crdt.el sexp protocol (Emacs interop) are the next phases.
+## STATUS: text sync + relay + remote cursors + tuntox transport; the
+## crdt.el sexp protocol (Emacs interop) is the next phase.
 
 import wkbcore
 import wkbcrdt
 import dag_ledger
 import wkbdag
-import std/[net, json, selectors, strutils, os, tables, sequtils]
+import wkbtox
+import std/[net, json, selectors, strutils, os, tables, sequtils, times]
 from std/nativesockets import setBlocking
 import std/nativesockets except `\$`
 
@@ -49,6 +57,9 @@ type
     listen: Socket                ## host only
     peers: Table[int, Peer]       ## fd -> peer (host: guests; guest: the host)
     sel: Selector[int]
+    tox: ToxChild                 ## the tuntox child (nil: plain LAN TCP)
+    pendingToxPort: int           ## guest: local forward port while it comes up
+    joinDeadline: float           ## guest: epoch seconds to give up at
 
 var session: CollabSession        ## the one live session, or nil
 
@@ -432,6 +443,35 @@ proc tick(app: var App; s: CollabSession) =
   if app.findBuffer(s.filePath) < 0:
     endSession(app)              # the shared buffer was closed
     return
+  # supervise the tuntox child: pick up our Tox ID (host), notice it dying
+  if s.tox != nil and s.tox.poll():
+    if s.tox.id.len > 0:
+      putClipboardText(s.tox.id)
+      app.msg = "collab: tox ID " & s.tox.id & " (copied) -- peer: M-x tox-join <ID>" &
+        (if gToxSecret.len == 0: "  [no shared secret!]" else: "")
+    elif s.tox.dead:
+      app.msg = "collab: tuntox exited -- log: " & s.tox.logPath & " (LAN still up)"
+      s.tox = nil
+  # guest: the tox forward is coming up -- try the local connect each tick
+  if s.pendingToxPort > 0:
+    if epochTime() > s.joinDeadline:
+      app.msg = "collab: the tox tunnel never came up -- tuntox log: " &
+        (if s.tox != nil: s.tox.logPath else: "?")
+      endSession(app)
+      return
+    var sock = newSocket()
+    try:
+      sock.connect("127.0.0.1", Port(s.pendingToxPort))
+      sock.getFd().setBlocking(false)
+      let fd = sock.getFd().int
+      s.sel.registerHandle(fd, {selectors.Event.Read}, 0)
+      s.peers[fd] = Peer(sock: sock, site: 1, buf: "")
+      s.peers[fd].sendLine(%*{"t": "hello", "v": wireVersion})
+      s.pendingToxPort = 0
+      app.msg = "collab: tox tunnel up -- syncing ..."
+    except CatchableError:
+      try: sock.close()          # forward not listening yet; retry next tick
+      except OSError, IOError: discard
   var closed: seq[int]
   for ready in s.sel.select(0):
     if selectors.Event.Read notin ready.events: continue
@@ -485,6 +525,8 @@ proc endSession*(app: var App) =
     except CatchableError: discard
     try: session.listen.close()
     except OSError, IOError: discard
+  if session.tox != nil:
+    session.tox.stop()
   session = nil
   app.msg = "collab: session ended"
 
@@ -510,16 +552,48 @@ proc startShare*(app: var App) =
   s.shadow = text
   s.lastVersion = app.ed.editVersion()
   session = s
-  app.msg = "collab: sharing on :" & $gToxPort &
-    " -- peer: M-x tox-join <host>:" & $gToxPort &
-    "  (over tox: tuntox -i <your ID> -L " & $gToxPort & ":127.0.0.1:" & $gToxPort & ")"
+  # the tox transport: spawn tuntox so peers behind NATs can reach :PORT too.
+  # LAN sharing works either way -- tox is additive.
+  s.tox = spawnServer()
+  if s.tox == nil:
+    app.msg = "collab: sharing on :" & $gToxPort & " (LAN) -- peer: M-x tox-join <host>:" &
+      $gToxPort & "  (no tuntox on PATH; install tuntox for P2P over Tox)"
+  else:
+    app.msg = "collab: sharing on :" & $gToxPort & " (LAN) + tox -- waiting for the Tox ID..."
 
-proc joinSession*(app: var App; hostport: string) =
-  if session != nil:
-    app.msg = "collab: already in a session (M-x tox-leave first)"; return
+proc joinOverTox(app: var App; toxId: string; remotePort: int) =
+  ## Join through a tuntox tunnel: spawn the client forward, then connect
+  ## through it once it accepts (the tick hook retries; DHT traversal can
+  ## take a minute).
   if app.ed.changed:
     app.msg = "collab: save or discard this buffer first"; return
-  let parts = hostport.rsplit(":", 1)
+  let localPort = if gToxLocalPort > 0: gToxLocalPort else: gToxPort
+  let child = spawnClient(toxId, localPort, remotePort)
+  if child == nil:
+    app.msg = "collab: no tuntox on PATH (or $WKB_TUNTOX) -- cannot tunnel over tox"; return
+  let s = CollabSession(
+    isHost: false, site: 0, sel: newSelector[int](), filePath: app.filePath,
+    tox: child, pendingToxPort: localPort, joinDeadline: epochTime() + 120)
+  s.shadow = app.ed.fullText()      # don't broadcast pre-sync content
+  s.lastVersion = app.ed.editVersion()
+  session = s
+  app.msg = "collab: opening a tox tunnel to " & toxId[0 ..< 8] &
+    "... (can take a minute over the DHT)"
+
+proc joinSession*(app: var App; target: string) =
+  if session != nil:
+    app.msg = "collab: already in a session (M-x tox-leave first)"; return
+  # a Tox ID (optionally "<id>:<port>") goes through tuntox; host:port is
+  # plain LAN TCP.
+  let parts = target.rsplit(":", 1)
+  if parts.len == 2:
+    let port = try: parts[1].parseInt except ValueError: 0
+    if port > 0 and isToxId(parts[0]):
+      joinOverTox(app, parts[0], port)
+      return
+  if isToxId(target):
+    joinOverTox(app, target, gToxPort)
+    return
   let host = if parts.len == 2: parts[0] else: "127.0.0.1"
   let port = if parts.len == 2: parts[1].parseInt.Port else: Port(gToxPort)
   var sock = newSocket()
@@ -527,7 +601,7 @@ proc joinSession*(app: var App; hostport: string) =
     sock.connect(host, port)
     sock.getFd().setBlocking(false)
   except OSError, IOError, CatchableError:
-    app.msg = "collab: cannot connect to " & hostport; return
+    app.msg = "collab: cannot connect to " & target; return
   let s = CollabSession(
     isHost: false, site: 0, sel: newSelector[int](), filePath: app.filePath)
   s.sel.registerHandle(sock.getFd().int, {selectors.Event.Read}, 0)
@@ -536,11 +610,11 @@ proc joinSession*(app: var App; hostport: string) =
   s.lastVersion = app.ed.editVersion()
   session = s
   s.peers[sock.getFd().int].sendLine(%*{"t": "hello", "v": wireVersion})
-  app.msg = "collab: connecting to " & hostport & " ..."
+  app.msg = "collab: connecting to " & target & " ..."
 
 proc extend*(app: var App) =
   defcommand("tox-share", "Share this buffer for collaborative editing", startShare)
-  defcommand("tox-join", "Join a collaborative session (prompts for host:port)",
+  defcommand("tox-join", "Join a collab session (host:port or the host's tox ID)",
              proc(a: var App) =
     # 1. an org header: #+TOX_ADDRESS: host:port
     for i in 0 ..< min(a.ed.getLineCount(), 30):
@@ -552,14 +626,14 @@ proc extend*(app: var App) =
           try: joinSession(a, hostAddr)
           except CatchableError as e: a.msg = "tox-join: " & e.msg
           return
-    # 2. a host:port word at the cursor
+    # 2. a host:port or Tox-ID word at the cursor
     let target = wordAtCursor(a)
-    if target.contains(":") and target.contains("."):
+    if (target.contains(":") and target.contains(".")) or isToxId(target):
       try: joinSession(a, target)
       except CatchableError as e: a.msg = "tox-join: " & e.msg
       return
     # 3. prompt in the status line
-    a.palettePrompt = "join host:port: "
+    a.palettePrompt = "join host:port or tox ID: "
     gPromptHandler = proc(app: var App; text: string) =
       if text.len > 0:
         try: joinSession(app, text)
@@ -568,9 +642,9 @@ proc extend*(app: var App) =
   defcommand("tox-leave", "Leave the collaborative session", endSession)
   bindkey("C-c j", "tox-share")
   bindkey("C-c n", "tox-join")
-  registerCtlVerb("tox-join", "join a collab session: <host:port>",
+  registerCtlVerb("tox-join", "join a collab session: <host:port | tox ID>",
                   proc(a: var App; args: seq[string]; body: string): string =
-    if args.len < 1: return "usage: tox-join <host:port>"
+    if args.len < 1: return "usage: tox-join <host:port | tox ID>"
     joinSession(a, args[0])
     a.msg)
   registerCtlVerb("tox-share", "share the current buffer for collab",
@@ -587,9 +661,14 @@ proc extend*(app: var App) =
   registerCtlVerb("tox-status", "collab session status",
                   proc(a: var App; args: seq[string]; body: string): string =
     if session == nil: return "no session"
+    var tox = ""
+    if session.tox != nil:
+      if session.tox.id.len > 0: tox = ", tox " & session.tox.id[0 ..< 8]
+      elif session.pendingToxPort > 0: tox = ", tox tunnel opening"
+      else: tox = ", tox"
     (if session.isHost: "host site " & $session.site & ", " &
-      $session.peers.len & " peer(s), " & $session.doc.docLen & " chars"
-     else: "guest (site " & $session.site & "), " & $session.doc.docLen & " chars"))
+      $session.peers.len & " peer(s), " & $session.doc.docLen & " chars" & tox
+     else: "guest (site " & $session.site & "), " & $session.doc.docLen & " chars" & tox))
   # DAG messages travel over the collab channel
   gDagSend = proc(j: JsonNode) =
     if session != nil:

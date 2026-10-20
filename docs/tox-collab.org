@@ -61,16 +61,23 @@ wkbenchless A (host)                     wkbenchless B (guest)
 The transport insight (proven in the wild by an HN commenter who pairs
 Emacs CRDT.el sessions over tuntox): tuntox already IS the daemon -- a
 mature GPLv3 single binary that tunnels TCP over Tox. wkbenchless only
-needs a TCP socket (stdlib =net=, zero new deps); the extension spawns
-and manages tuntox as a child process, the same way the editor already
-spawns terminals and REPL sessions. License-clean (process boundary),
-no wkbtoxd to write, and LAN mode is free (plain TCP, no tox).
+needs a TCP socket (stdlib =net=, zero new deps); src/wkbtox.nim spawns
+and supervises tuntox as a child process on BOTH sides (host: =-C <cache>
++ =-I= for a stable identity and the printable Tox ID; guest: =-i <ID> -L=
+for the forward), the same way the editor already spawns terminals and
+REPL sessions. License-clean (process boundary), no wkbtoxd to write,
+and LAN mode is free (plain TCP, no tox).
 
 - The extension owns the CRDT doc (the idmap), buffer glue, remote
-cursors, and the TCP server/client for the session.
-- =M-x tox-share= starts listening and prints the tuntox command line
-for the peer; =M-x tox-join <host:port>= connects (localhost when
-behind tuntox).
+cursors, and the TCP server/client for the session; src/wkbtox.nim owns
+the tuntox children (spawn, ID pickup, death detection, stop).
+- =M-x tox-share= starts listening AND spawns tuntox; once the Tox ID
+file appears it is copied to the clipboard with the join hint.
+- =M-x tox-join <tox ID>= (or =<id>:<port>=) spawns the guest's tuntox
+=-L= forward and connects through it once it accepts; =M-x tox-join
+<host:port>= is plain LAN TCP with no tox at all.
+- Set =TUNTOX_SHARED_SECRET= (or =gToxSecret=) on both sides: without it
+anyone holding the host's Tox ID can tunnel to ANY local port.
 - Phase 5: speak crdt.el's own protocol over the same tunnel for Emacs
 interop (their HACKING.org documents both the primary sexp protocol and
 the cross-editor bridge protocol).
@@ -133,8 +140,10 @@ convergence replace the relay -- no server, no relay, two addresses.
 * Phases
 
 1. [X] design
-2. [ ] =_logoot.nim= + tests -- the riskiest part proven first
-3. [ ] TCP session: sync + ops + remote cursors (host-relayed star)
-4. [ ] tuntox spawn/manage: the tox transport
+2. [X] =wkbcrdt.nim= + tests -- the riskiest part proven first
+3. [X] TCP session: sync + ops + remote cursors (host-relayed star)
+4. [X] tuntox spawn/manage: the tox transport (src/wkbtox.nim +
+   src/test_tox_transport.nim against a fake tuntox; POSIX-only for now,
+   Windows/macOS packaging is the next step)
 5. [ ] crdt.el protocol adapter: Emacs interop over the same tunnel
 6. [ ] org folding sync, shared babel, binary wire format
