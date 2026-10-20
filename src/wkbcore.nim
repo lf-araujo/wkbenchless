@@ -2772,7 +2772,7 @@ proc overstrikeCR(s: string): string =
     lines.add(if cr >= 0: ln[cr + 1 .. ^1] else: ln)
   lines.join("\n")
 
-proc finishBabelJob(app: var App; aj: var AppJob) =
+proc finishBabelJob*(app: var App; aj: var AppJob) =
   ## Write a finished block's results into its buffer -- the active one or a
   ## background buffer (the user may have switched files while it ran).
   # A REPL on a real terminal (a remote tmux pane, say) colours its output --

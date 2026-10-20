@@ -56,7 +56,7 @@ proc buildRequest(args: seq[string]; req: var string): string =
   if args.len == 0:
     return "usage: ctl [--file PATH] buffer|buffers|blocks|command <name>|open-terminal <cmd...>|eval [lang] [session]|\n" &
            "           set-buffer|insert <line>|replace <from> <to>|goto <line>|\n" &
-           "           run-block [line]|run-all|diff <old> <new> [title]|bib <query>\n" &
+           "           run-block [line|name]|restart-session [lang [name]]|run-all|diff <old> <new> [title]|bib <query>\n" &
            "           cite-goto <key>|open <path>|where|selection\n" &
            "           jobs|status <id>|wait <id>...|interrupt <id>\n" &
            "           run-block [line] [--deps] [--force]|run-stale|infer-deps\n" &

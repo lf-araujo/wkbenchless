@@ -16,7 +16,7 @@
 ## 127.0.0.1:<port> and sends "token\n<request>". The token keeps another local
 ## user from port-scanning the socket (parity with the old unix-socket perms).
 
-import std/[sequtils, strutils, tables, net, nativesockets, os, random]
+import std/[sequtils, strutils, tables, net, nativesockets, os, random, times]
 when defined(posix): import std/posix
 import wkbcore
 
@@ -205,11 +205,33 @@ proc handleImpl(app: var App; req: string): string =
     # `ln` is a 0-based index; gotoLine is 1-based, so pass +1.
     app.ed.gotoLine(clamp(ln, 0, app.ed.getLineCount() - 1) + 1, 0)
     result = "ok: goto " & $(ln + 1)
-  of "run-block":                        # run the src block at/containing 1-based <line>
+  of "run-block":                        # run the src block at/containing 1-based <line> or named
     # Position + run in ONE request (so the cursor is right when babel runs), the
     # editor's own C-c C-c: executes in the block's :session and writes #+RESULTS.
-    var ln = (if parts.len > 1 and parts[1].len > 0: (try: parseInt(parts[1]) except: 1)
-              else: app.ed.currentLine + 1) - 1
+    # parts[1] is a 1-based line number OR a #+name: — names survive the line
+    # shifts that result insertions cause, so agents don't re-list blocks
+    # before every run (roadmap item, 2026-10-20).
+    var ln = -1
+    if parts.len > 1 and parts[1].len > 0:
+      try: ln = parseInt(parts[1]) - 1
+      except ValueError:
+        let want = parts[1]
+        let total = app.ed.getLineCount()
+        var i = 0
+        while i < total and ln < 0:
+          let t = strutils.strip(app.ed.getLineText(i))
+          if t.toLowerAscii.startsWith("#+name:") and
+             strutils.strip(t[7 .. ^1]) == want:
+            var j = i + 1
+            while j < min(i + 4, total):
+              let l2 = strutils.strip(app.ed.getLineText(j)).toLowerAscii
+              if l2.startsWith("#+begin_src") or l2.startsWith("```"):
+                ln = j; break
+              inc j
+          inc i
+        if ln < 0: return "error: no src block named '" & want & "'"
+    else:
+      ln = app.ed.currentLine
     ln = clamp(ln, 0, app.ed.getLineCount() - 1)
     # `blocks` reports the header line; babel wants a body line.
     let low = strutils.strip(app.ed.getLineText(ln)).toLowerAscii
@@ -242,6 +264,33 @@ proc handleImpl(app: var App; req: string): string =
   of "interrupt":                        # interrupt\t<id>: Ctrl-C a running job / drop a queued one
     let id = if parts.len > 1: (try: parseInt(parts[1]) except: 0) else: 0
     result = interruptJob(app, id)
+  of "restart-session":
+    # restart-session [lang [name]] — kill a wedged REPL; it respawns on next use.
+    # Recovery for the babel-hang found 2026-10-20 (an R block dyn.loading a
+    # native library ran 438 s in the persistent session where Rscript took
+    # 1.5 s): in-flight jobs on that session are retired as interrupted so
+    # `jobs` doesn't list them as running forever.
+    let lang = if parts.len > 1 and parts[1].len > 0: parts[1] else: "r"
+    let nm   = if parts.len > 2 and parts[2].len > 0: parts[2] else: "default"
+    let key = lang.toLowerAscii & "/" & nm
+    if app.sessions.hasKey(key):
+      var s = app.sessions[key]
+      s.pty.closePty()
+      app.sessions.del(key)
+      for i in 0 ..< app.jobs.len:
+        if app.jobs[i].sessKey == key and
+           app.jobs[i].job.state notin {jsDone, jsInterrupted}:
+          app.jobs[i].job.state = jsInterrupted
+          app.jobs[i].job.output = "(session restarted)"
+          app.jobs[i].job.finished = epochTime()
+          if app.jobs[i].kind == jkBlock:
+            var aj = app.jobs[i]
+            finishBabelJob(app, aj)
+            app.jobs[i] = aj
+          else: app.jobs[i].applied = true
+      result = "ok: session '" & key & "' killed; respawns on next use"
+    else:
+      result = "(no session '" & key & "')"
   of "blocks":
     let total = app.ed.getLineCount()
     var i = 0

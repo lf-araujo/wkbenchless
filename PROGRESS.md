@@ -196,6 +196,32 @@ no manual `--passL` flag needed for normal builds.
   and pushed. Active development is on **wkbenchless** (see the planned
   work below).
 
+## Planned: babel robustness + block-by-name invocation (wkbenchless)
+
+Two issues found 2026-10-20 while running the fastsem JSS benchmark
+blocks through `wkbctl`:
+
+1. **R src blocks can hang in the long-lived session.** An inlined
+   benchmark script (fits a CFA via `dyn.load` of the fastsem `.so` +
+   `.Call`) ran 438 s+ as a babel block and had to be interrupted;
+   the *same script* via `Rscript` completes in 1.5 s.  Suspects:
+   (a) `dyn.load` of a native library into the persistent R session
+   leaves state that wedges later work (the fastsem library's OpenCL
+   init / Weave pool are known to poison in-process R — see the
+   fastsem README's `chol2inv` TODO); (b) the R REPL session itself
+   was wedged by an earlier block.  Needs: a `babel` timeout/heartbeat
+   (flag a block as stuck after N seconds of no output), and a
+   `restart-session` verb so an agent can recover without killing the
+   editor.  Workaround used: run heavy/native-library blocks via
+   `wkbctl sh` (`Rscript ...`) instead of babel R blocks.
+2. **`run-block` should accept `#+name:`.** Blocks already carry names
+   (`wkbblocks.nim` parses `#+name:` into a name→index table) but the
+   table is only used for `:depends`/`:var` resolution; `run-block`
+   takes a line number only, so every result insertion shifts lines
+   and callers must re-list blocks before each run.  Fix: in
+   `wkbctrl.nim`'s `run-block`, resolve `parts[1]` against the name
+   table before falling back to `parseInt`.
+
 ## Planned: reference management (wkbenchless)
 
 Design settled in discussion (2026-09). Land on a `[cite:@key]` in an org
