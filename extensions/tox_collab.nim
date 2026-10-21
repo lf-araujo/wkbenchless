@@ -573,7 +573,9 @@ proc joinSession*(app: var App; target: string) =
   if session != nil:
     app.msg = "collab: already in a session (M-x tox-leave first)"; return
   # a Tox ID (optionally "<id>:<port>") goes through tuntox; host:port is
-  # plain LAN TCP.
+  # plain LAN TCP. The target is pasted more often than typed, so strip
+  # the newline a clipboard copy usually carries.
+  let target = target.strip()
   let parts = target.rsplit(":", 1)
   if parts.len == 2:
     let port = try: parts[1].parseInt except ValueError: 0

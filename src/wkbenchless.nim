@@ -360,6 +360,14 @@ proc handlePalette(app: var App; e: Event) =
     of KeyBackspace:
       if app.paletteQuery.len > 0:
         app.paletteQuery.setLen(app.paletteQuery.len - 1); app.paletteSel = 0
+    of KeyV:
+      # paste into the prompt (Ctrl-V / Cmd-V) -- a Tox ID is 76 chars,
+      # nobody types that. Strip the newline a clipboard copy carries.
+      if CtrlPressed in e.mods or GuiPressed in e.mods:
+        let text = getClipboardText().strip()
+        if text.len > 0:
+          app.paletteQuery.add text
+          app.paletteSel = 0
     else: discard
   elif e.kind == TextInputEvent:
     for ch in e.text:
