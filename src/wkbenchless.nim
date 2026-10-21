@@ -276,6 +276,14 @@ proc handleSearch(app: var App; e: Event) =
         app.searchQuery.add ch; recomputeMatches(app); gotoCurrentMatch(app)
 
 proc paletteAccept(app: var App) =
+  # free-text prompts have no list to select from -- the query IS the
+  # answer, so it must not pass through the entries guard below (an
+  # empty list made Enter do nothing, ever, for pmPrompt)
+  if app.paletteMode == pmPrompt:
+    app.paletteActive = false
+    if gPromptHandler != nil:
+      gPromptHandler(app, app.paletteQuery)
+    return
   let items = paletteEntries(app)
   if app.paletteSel < 0 or app.paletteSel >= items.len: return
   let id = items[app.paletteSel].id
@@ -340,10 +348,7 @@ proc paletteAccept(app: var App) =
     else:
       app.paletteActive = false
       saveBufferAs(app, id)
-  of pmPrompt:
-    app.paletteActive = false
-    if gPromptHandler != nil:
-      gPromptHandler(app, app.paletteQuery)
+  of pmPrompt: discard # unreachable: handled by the early return above
   of pmDagPending:
     app.paletteActive = false
     if gDagPendingAccept != nil:
