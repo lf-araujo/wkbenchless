@@ -2,14 +2,13 @@
 ##
 ## The editing model is wkbcrdt.nim (Logoot split, ported from CRDT.el);
 ## the transport is plain TCP (stdlib net) -- over LAN as-is, or P2P
-## anywhere by tunneling that TCP over Tox. tox_transport.nim spawns and
-## supervises the tuntox child on BOTH sides, so neither user runs
-## anything by hand:
+## anywhere by tunneling that TCP over Tox. wkbtox.nim runs the nim-tuntox
+## library IN-PROCESS on BOTH sides, so neither user installs anything:
 ##
-##   host:  M-x tox-share   (listens on :6543, spawns tuntox, copies the
-##                          Tox ID to the clipboard once it appears)
-##   peer:  M-x tox-join <host's Tox ID>   (spawns tuntox -L, joins through
-##                                          the local forward when it's up)
+##   host:  M-x tox-share   (listens on :6543, starts the tox server, copies
+##                          the Tox ID to the clipboard once it appears)
+##   peer:  M-x tox-join <host's Tox ID>   (opens the local forward, joins
+##                                          through it when it's up)
 ##     or:  M-x tox-join <host:port>       (plain LAN TCP, no tox at all)
 ##
 ## Set TUNTOX_SHARED_SECRET in the environment (or gToxSecret) on both
@@ -57,7 +56,7 @@ type
     listen: Socket                ## host only
     peers: Table[int, Peer]       ## fd -> peer (host: guests; guest: the host)
     sel: Selector[int]
-    tox: ToxChild                 ## the tuntox child (nil: plain LAN TCP)
+    tox: ToxTransport             ## the in-process tox tunnel (nil: plain LAN TCP)
     pendingToxPort: int           ## guest: local forward port while it comes up
     joinDeadline: float           ## guest: epoch seconds to give up at
 
@@ -443,20 +442,17 @@ proc tick(app: var App; s: CollabSession) =
   if app.findBuffer(s.filePath) < 0:
     endSession(app)              # the shared buffer was closed
     return
-  # supervise the tuntox child: pick up our Tox ID (host), notice it dying
+  # drive the in-process tox tunnel; the host's Tox ID shows up on the
+  # first poll after spawn
   if s.tox != nil and s.tox.poll():
     if s.tox.id.len > 0:
       putClipboardText(s.tox.id)
       app.msg = "collab: tox ID " & s.tox.id & " (copied) -- peer: M-x tox-join <ID>" &
         (if gToxSecret.len == 0: "  [no shared secret!]" else: "")
-    elif s.tox.dead:
-      app.msg = "collab: tuntox exited -- log: " & s.tox.logPath & " (LAN still up)"
-      s.tox = nil
   # guest: the tox forward is coming up -- try the local connect each tick
   if s.pendingToxPort > 0:
     if epochTime() > s.joinDeadline:
-      app.msg = "collab: the tox tunnel never came up -- tuntox log: " &
-        (if s.tox != nil: s.tox.logPath else: "?")
+      app.msg = "collab: the tox tunnel never came up -- is the host sharing?"
       endSession(app)
       return
     var sock = newSocket()
@@ -552,28 +548,21 @@ proc startShare*(app: var App) =
   s.shadow = text
   s.lastVersion = app.ed.editVersion()
   session = s
-  # the tox transport: spawn tuntox so peers behind NATs can reach :PORT too.
+  # the tox transport: in-process, so peers behind NATs can reach :PORT too.
   # LAN sharing works either way -- tox is additive.
   s.tox = spawnServer()
-  if s.tox == nil:
-    app.msg = "collab: sharing on :" & $gToxPort & " (LAN) -- peer: M-x tox-join <host>:" &
-      $gToxPort & "  (no tuntox on PATH; install tuntox for P2P over Tox)"
-  else:
-    app.msg = "collab: sharing on :" & $gToxPort & " (LAN) + tox -- waiting for the Tox ID..."
+  app.msg = "collab: sharing on :" & $gToxPort & " (LAN) + tox -- waiting for the Tox ID..."
 
 proc joinOverTox(app: var App; toxId: string; remotePort: int) =
-  ## Join through a tuntox tunnel: spawn the client forward, then connect
-  ## through it once it accepts (the tick hook retries; DHT traversal can
-  ## take a minute).
+  ## Join through a tox tunnel: open the client forward, then connect
+  ## through it (the tick hook retries; DHT traversal can take a minute).
   if app.ed.changed:
     app.msg = "collab: save or discard this buffer first"; return
   let localPort = if gToxLocalPort > 0: gToxLocalPort else: gToxPort
-  let child = spawnClient(toxId, localPort, remotePort)
-  if child == nil:
-    app.msg = "collab: no tuntox on PATH (or $WKB_TUNTOX) -- cannot tunnel over tox"; return
+  let t = spawnClient(toxId, localPort, remotePort)
   let s = CollabSession(
     isHost: false, site: 0, sel: newSelector[int](), filePath: app.filePath,
-    tox: child, pendingToxPort: localPort, joinDeadline: epochTime() + 120)
+    tox: t, pendingToxPort: localPort, joinDeadline: epochTime() + 120)
   s.shadow = app.ed.fullText()      # don't broadcast pre-sync content
   s.lastVersion = app.ed.editVersion()
   session = s
