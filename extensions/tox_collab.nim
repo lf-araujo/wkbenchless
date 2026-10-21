@@ -21,8 +21,19 @@
 ## not a correctness requirement -- the peers' docs converge under any
 ## delivery order (see src/test_logoot.nim).
 ##
-## STATUS: text sync + relay + remote cursors + tuntox transport; the
-## crdt.el sexp protocol (Emacs interop) is the next phase.
+## Robustness to dropped links: the guest keeps the session when the
+## host link dies and redials (the tox forward re-requests a tunnel on
+## accept; the library retries the friend request if the tox link itself
+## died). Local edits made while apart are recorded; on reconnect they
+## are replayed when only the guest moved, adopted when only the host
+## moved, and -- when BOTH sides edited -- turned into a CriticMarkup
+## review ({++[sN] ... ++} / {--[sN] ... --} per side, consensus plain)
+## that a human resolves with the critic commands and M-x tox-resolve.
+## First resolver wins; the reviewed text becomes the doc for everyone.
+##
+## STATUS: text sync + relay + remote cursors + in-process tox transport
+## + offline divergence review; the crdt.el sexp protocol (Emacs interop)
+## is the next phase.
 
 import wkbcore
 import wkbcrdt
@@ -57,8 +68,14 @@ type
     peers: Table[int, Peer]       ## fd -> peer (host: guests; guest: the host)
     sel: Selector[int]
     tox: ToxTransport             ## the in-process tox tunnel (nil: plain LAN TCP)
-    pendingToxPort: int           ## guest: local forward port while it comes up
+    pendingToxPort: int           ## guest: port to (re)connect to while a link is due
+    pendingLanHost: string        ## guest: LAN host to redial ("": the tox forward)
     joinDeadline: float           ## guest: epoch seconds to give up at
+    redialHost: string            ## guest: "" = the tox forward, else the LAN host
+    redialPort: int               ## guest: 0 = do not redial after a drop
+    baseText: string             ## doc text when the link dropped (divergence base)
+    offlineOps: seq[Op]           ## guest: local ops created while disconnected
+    resolving: bool              ## divergence review: the wire is frozen until tox-resolve
 
 var session: CollabSession        ## the one live session, or nil
 
@@ -111,7 +128,7 @@ proc diffRange(a, b: string): tuple[pos, delLen, insLen: int] =
 proc captureLocal(app: var App; s: CollabSession) =
   ## Turn local buffer edits (typed anywhere: keys, paste, babel, org
   ## commands) into CRDT ops and broadcast them.
-  if s.busy: return
+  if s.busy or s.resolving: return
   let idx = app.sharedIdx(s)
   let text = if idx == app.curBuf: app.ed.fullText()
              else: app.buffers[idx].ed.fullText()
@@ -125,6 +142,8 @@ proc captureLocal(app: var App; s: CollabSession) =
   if delLen > 0: ops.add s.doc.localDelete(pos, delLen)
   if insLen > 0: ops.add s.doc.localInsert(pos, text[pos ..< pos + insLen], s.site)
   s.shadow = text
+  if (not s.isHost) and s.peers.len == 0:
+    s.offlineOps.add ops    # nobody to send to: replay these on reconnect
   for op in ops:
     let line = opToJson(op)
     if s.isHost:
@@ -213,6 +232,51 @@ proc sendSync(s: CollabSession; p: var Peer; name: string) =
   p.sendLine(%*{"t": "sync", "name": name, "blocks": blocks})
   p.sendLine(%*{"t": "ready"})
 
+proc sendDocDump(s: CollabSession; kind: string) =
+  ## Our whole doc as one message (resync: the resolved text after a review).
+  var blocks = newJArray()
+  for b in s.doc.blocks:
+    blocks.add %[wireId(b.id), newJBool(b.eob), newJString(b.text)]
+  for fd, p in s.peers.mpairs:
+    p.sendLine(%*{"t": kind, "blocks": blocks})
+
+proc sendOp(s: CollabSession; op: Op) =
+  ## One recorded op onto the wire, in the same shape live edits use.
+  for fd, p in s.peers.mpairs:
+    case op.kind
+    of opInsert:
+      p.sendLine(%*{"t": "ins", "id": wireId(op.id), "s": op.text})
+    of opDelete:
+      var runs = newJArray()
+      for r in op.runs:
+        runs.add %[wireId(r.id), newJInt(r.count)]
+      p.sendLine(%*{"t": "del", "runs": runs})
+
+proc adoptDoc(app: var App; s: CollabSession) =
+  ## Push s.doc into the shared buffer and reset the edit-capture shadow.
+  s.busy = true
+  let idx = app.sharedIdx(s)
+  if idx == app.curBuf:
+    app.ed.setText(s.doc.docText())
+    s.shadow = app.ed.fullText()
+    s.lastVersion = app.ed.editVersion()
+  else:
+    app.buffers[idx].ed.setText(s.doc.docText())
+    s.shadow = app.buffers[idx].ed.fullText()
+    s.lastVersion = app.buffers[idx].ed.editVersion()
+  s.busy = false
+
+proc enterResolve(app: var App; s: CollabSession; markedUp: string) =
+  ## Freeze the wire and show the divergence as CriticMarkup for review;
+  ## M-x tox-resolve resumes sharing from the reviewed text.
+  s.resolving = true
+  s.busy = true
+  let idx = app.sharedIdx(s)
+  if idx == app.curBuf: app.ed.setText(markedUp)
+  else: app.buffers[idx].ed.setText(markedUp)
+  s.busy = false
+  app.msg = "collab: both sides edited while apart -- review the {++ --} marks, then M-x tox-resolve"
+
 proc dropPeer(s: CollabSession; fd: int) =
   if not s.peers.hasKey(fd): return
   try: s.sel.unregister(fd)
@@ -224,6 +288,8 @@ proc dropPeer(s: CollabSession; fd: int) =
 proc sessionName(app: App; s: CollabSession): string =
   ## The shared buffer's file path, for the sync message.
   if s.filePath.len > 0: s.filePath else: "*scratch*"
+
+proc endSession*(app: var App) {.used.}   # fwd: defined below
 
 proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
   var j: JsonNode
@@ -270,10 +336,34 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
       app.msg = "collab: joined as site " & $s.site
   of "sync":
     if not s.isHost:
+      if s.resolving: return      # frozen: a divergence review is in progress
       var blocks: seq[Block]
       for b in j["blocks"]:
         blocks.add Block(id: parseId(b[0]), eob: b[1].getBool(),
                          text: b[2].getStr())
+      # a reconnect after a drop: reconcile against the divergence base
+      # before adopting -- the host's sync may not be the whole story
+      if s.baseText.len > 0:
+        var remoteText = ""
+        for b in blocks: remoteText.add b.text
+        let localText = s.doc.docText()
+        if localText != s.baseText and remoteText == s.baseText:
+          # only we moved while apart: keep our doc, replay the offline ops
+          s.baseText = ""
+          for op in s.offlineOps: s.sendOp(op)
+          s.offlineOps = @[]
+          app.msg = "collab: reconnected -- replayed your offline edits"
+          return
+        if localText != s.baseText and remoteText != s.baseText:
+          # both sides moved: human review of the divergence, on both ends
+          for ofd, p in s.peers.mpairs:
+            p.sendLine(%*{"t": "diverge", "text": localText})
+          enterResolve(app, s, divergeMarkup(s.baseText, localText,
+            remoteText, s.site.int, 1))
+          return
+        # only the host moved (or nothing did): adopt below
+        s.baseText = ""
+        s.offlineOps = @[]
       s.doc = loadBlocks(blocks)
       # adopt the shared document's extension so the guest gets the right
       # language (org highlighting, folding, babel...) -- not whatever the
@@ -311,12 +401,14 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
       s.busy = false
       app.msg = "collab: synced (" & $s.doc.docLen & " chars)"
   of "ins":
+    if s.resolving: return      # frozen: a divergence review is in progress
     applyInsert(app, s, parseId(j["id"]), j["s"].getStr())
     drainPending(app, s)
     if s.isHost:                       # relay to the other guests
       for ofd, p in s.peers.mpairs:
         if ofd != fd: p.sendLine(j)
   of "del":
+    if s.resolving: return      # frozen: a divergence review is in progress
     var runs: seq[IdRun]
     for r in j["runs"].getElems():
       runs.add (parseId(r[0]), r[1].getInt().int)
@@ -326,6 +418,7 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
       for ofd, p in s.peers.mpairs:
         if ofd != fd: p.sendLine(j)
   of "cur":
+    if s.resolving: return      # frozen: a divergence review is in progress
     let site = j["u"].getInt().uint16
     let cid = parseId(j["id"])
     var found = false
@@ -430,12 +523,37 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
       ledger = l
       dagReady = true
       app.msg = "dag: synced (" & $l.papers.len & " papers)"
+  of "diverge":
+    # a returning guest edited while apart, and so did we: review it too.
+    # First resolver wins; the review snapshot is the base at the drop.
+    if s.isHost and s.baseText.len > 0 and not s.resolving and
+        s.peers.hasKey(fd):
+      enterResolve(app, s, divergeMarkup(s.baseText, s.doc.docText(),
+        j["text"].getStr(), 1, s.peers[fd].site.int))
+  of "resync":
+    # the reviewed text, as a full doc dump: adopt it, resume sharing,
+    # and bring every other peer along
+    if s.isHost:
+      var blocks: seq[Block]
+      for b in j["blocks"]:
+        blocks.add Block(id: parseId(b[0]), eob: b[1].getBool(),
+                         text: b[2].getStr())
+      s.doc = loadBlocks(blocks)
+      s.baseText = ""
+      s.offlineOps = @[]
+      s.resolving = false
+      adoptDoc(app, s)
+      for ofd, p in s.peers.mpairs:
+        if ofd != fd: s.sendSync(p, app.sessionName(s))
+      app.msg = "collab: divergence resolved -- sharing resumed"
   of "bye":
+    if not s.isHost:
+      endSession(app)            # the host left deliberately: do not redial
+      return
     dropPeer(s, fd)
-    if s.isHost: app.msg = "collab: peer left"
+    app.msg = "collab: peer left"
   else: discard
 
-proc endSession*(app: var App) {.used.}   # fwd: defined below
 
 proc tick(app: var App; s: CollabSession) =
   app.syncActive()               # write live edits into the buffer slot
@@ -449,22 +567,30 @@ proc tick(app: var App; s: CollabSession) =
       putClipboardText(s.tox.id)
       app.msg = "collab: tox ID " & s.tox.id & " (copied) -- peer: M-x tox-join <ID>" &
         (if gToxSecret.len == 0: "  [no shared secret!]" else: "")
-  # guest: the tox forward is coming up -- try the local connect each tick
+  # divergence review freezes the wire: the buffer holds the markup and
+  # edits stay local until M-x tox-resolve resumes sharing
+  if s.resolving: return
+  # guest: a link is due (first join, or a redial after a drop) -- try the
+  # connect each tick; the tox forward re-requests a tunnel on accept
   if s.pendingToxPort > 0:
     if epochTime() > s.joinDeadline:
-      app.msg = "collab: the tox tunnel never came up -- is the host sharing?"
+      app.msg = if s.baseText.len > 0:
+        "collab: could not reconnect before the deadline -- session ended"
+      else: "collab: the tox tunnel never came up -- is the host sharing?"
       endSession(app)
       return
     var sock = newSocket()
     try:
-      sock.connect("127.0.0.1", Port(s.pendingToxPort))
+      let host = if s.pendingLanHost.len > 0: s.pendingLanHost else: "127.0.0.1"
+      sock.connect(host, Port(s.pendingToxPort))
       sock.getFd().setBlocking(false)
       let fd = sock.getFd().int
       s.sel.registerHandle(fd, {selectors.Event.Read}, 0)
       s.peers[fd] = Peer(sock: sock, site: 1, buf: "")
       s.peers[fd].sendLine(%*{"t": "hello", "v": wireVersion})
       s.pendingToxPort = 0
-      app.msg = "collab: tox tunnel up -- syncing ..."
+      app.msg = if s.baseText.len > 0: "collab: reconnected -- syncing ..."
+                else: "collab: tox tunnel up -- syncing ..."
     except CatchableError:
       try: sock.close()          # forward not listening yet; retry next tick
       except OSError, IOError: discard
@@ -504,7 +630,23 @@ proc tick(app: var App; s: CollabSession) =
       try: app.handleLine(s, fd, line)
       except CatchableError: app.msg = "collab: dropped a malformed message"
   for fd in closed:
-    if s.isHost: app.msg = "collab: peer disconnected"
+    # the doc as it stood IS the divergence base: whatever each side edits
+    # from here on happened while the other side could not see it
+    s.baseText = s.doc.docText()
+    if s.isHost:
+      app.msg = "collab: peer disconnected"
+    else:
+      dropPeer(s, fd)
+      if s.redialPort > 0:
+        # keep the session: redial the forward (or the LAN host) and keep
+        # editing -- offline ops are recorded and reconciled on reconnect
+        s.pendingToxPort = s.redialPort
+        s.pendingLanHost = s.redialHost
+        s.joinDeadline = epochTime() + 300
+        app.msg = "collab: connection lost -- redialing (your edits stay local)"
+      else:
+        app.msg = "collab: the host connection was lost"
+      continue
     dropPeer(s, fd)
   captureLocal(app, s)
 
@@ -562,7 +704,8 @@ proc joinOverTox(app: var App; toxId: string; remotePort: int) =
   let t = spawnClient(toxId, localPort, remotePort)
   let s = CollabSession(
     isHost: false, site: 0, sel: newSelector[int](), filePath: app.filePath,
-    tox: t, pendingToxPort: localPort, joinDeadline: epochTime() + 120)
+    tox: t, pendingToxPort: localPort, joinDeadline: epochTime() + 120,
+    redialPort: localPort)   # the forward outlives any one tunnel
   s.shadow = app.ed.fullText()      # don't broadcast pre-sync content
   s.lastVersion = app.ed.editVersion()
   session = s
@@ -594,7 +737,8 @@ proc joinSession*(app: var App; target: string) =
   except OSError, IOError, CatchableError:
     app.msg = "collab: cannot connect to " & target; return
   let s = CollabSession(
-    isHost: false, site: 0, sel: newSelector[int](), filePath: app.filePath)
+    isHost: false, site: 0, sel: newSelector[int](), filePath: app.filePath,
+    redialHost: host, redialPort: port.int)
   s.sel.registerHandle(sock.getFd().int, {selectors.Event.Read}, 0)
   s.peers[sock.getFd().int] = Peer(sock: sock, site: 1, buf: "")
   s.shadow = app.ed.fullText()      # don't broadcast pre-sync content
@@ -631,6 +775,30 @@ proc extend*(app: var App) =
         except CatchableError as e: app.msg = "tox-join: " & e.msg
     openPalette(a, pmPrompt))
   defcommand("tox-leave", "Leave the collaborative session", endSession)
+  defcommand("tox-resolve",
+    "Accept the reviewed divergence merge and resume sharing",
+    proc (a: var App) =
+      if session == nil or not session.resolving:
+        a.msg = "collab: no divergence to resolve"; return
+      # unresolved tokens resolve as accepted (insertions kept); the
+      # reviewed text becomes the doc, and everyone adopts it
+      let idx = a.sharedIdx(session)
+      let marked = if idx == a.curBuf: a.ed.fullText()
+                   else: a.buffers[idx].ed.fullText()
+      let text = applyCriticMarkup(marked, accept = true)
+      var d: Doc
+      discard d.localInsert(0, text, session.site)
+      session.doc = d
+      session.resolving = false
+      session.baseText = ""
+      session.offlineOps = @[]
+      adoptDoc(a, session)
+      if session.isHost:
+        for fd, p in session.peers.mpairs:
+          session.sendSync(p, a.sessionName(session))
+      else:
+        session.sendDocDump("resync")
+      a.msg = "collab: divergence resolved -- sharing resumed")
   bindkey("C-c j", "tox-share")
   bindkey("C-c n", "tox-join")
   registerCtlVerb("tox-join", "join a collab session: <host:port | tox ID>",
@@ -653,9 +821,11 @@ proc extend*(app: var App) =
                   proc(a: var App; args: seq[string]; body: string): string =
     if session == nil: return "no session"
     var tox = ""
-    if session.tox != nil:
+    if session.resolving: tox = ", RESOLVING DIVERGENCE (M-x tox-resolve)"
+    elif session.tox != nil:
       if session.tox.id.len > 0: tox = ", tox " & session.tox.id[0 ..< 8]
-      elif session.pendingToxPort > 0: tox = ", tox tunnel opening"
+      elif session.pendingToxPort > 0:
+        tox = if session.baseText.len > 0: ", redialing" else: ", tox tunnel opening"
       else: tox = ", tox"
     (if session.isHost: "host site " & $session.site & ", " &
       $session.peers.len & " peer(s), " & $session.doc.docLen & " chars" & tox
