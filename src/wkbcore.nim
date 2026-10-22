@@ -1670,10 +1670,12 @@ proc stripAuthorTag(s: string): string =
     if e > 0: return s[e + 1 .. ^1]
   s
 
-proc applyCriticMarkup*(text: string; accept: bool): string =
+proc applyCriticMarkup*(text: string; accept: bool; keepComments = false): string =
   ## Resolve every CriticMarkup token. accept: keep insertions & the NEW side of
   ## a substitution, drop deletions. reject: the opposite. Comments are dropped
-  ## either way; a highlight always keeps its text (only the wrapper goes).
+  ## unless `keepComments` (the editor's accept/reject-all keeps them: in the
+  ## coauthor workflow the comments ARE the open issues); a highlight always
+  ## keeps its text (only the wrapper goes).
   ## A leading [Author] tag is stripped from whichever side is kept.
   ##   {++ins++}  {--del--}  {~~old~>new~~}  {>>comment<<}  {==highlight==}
   result = newStringOfCap(text.len)
@@ -1706,7 +1708,9 @@ proc applyCriticMarkup*(text: string; accept: bool): string =
           i = e + 1; continue
       elif a == '>' and b == '>':          # {>>comment<<} -- asymmetric close
         let e = closeOf('<', '<')
-        if e >= 0: (i = e + 1; continue)   # drop the comment entirely
+        if e >= 0:
+          if keepComments: result.add text[i .. e]
+          i = e + 1; continue              # else drop the comment entirely
     result.add text[i]; inc i
 
 proc collectLatexHeader(app: App): string =
@@ -1906,13 +1910,18 @@ proc toggleInlineImages*(app: var App) =
 
 proc criticAcceptAll*(app: var App) =
   if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
-  app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = true))
-  app.ed.markChanged(); app.msg = "accepted all tracked changes"
+  # replaceTextUndoable, not setText: setText clears the undo stack, so the
+  # acceptance could not be undone with C-z. Comments survive -- they are the
+  # open issues of the review round, resolved via Mark DONE / Clean DONE.
+  app.ed.replaceTextUndoable(
+    applyCriticMarkup(app.ed.fullText(), accept = true, keepComments = true))
+  app.msg = "accepted all tracked changes (comments kept)"
 
 proc criticRejectAll*(app: var App) =
   if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
-  app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = false))
-  app.ed.markChanged(); app.msg = "rejected all tracked changes"
+  app.ed.replaceTextUndoable(
+    applyCriticMarkup(app.ed.fullText(), accept = false, keepComments = true))
+  app.msg = "rejected all tracked changes (comments kept)"
 
 proc lineStartOffset(app: App): int =
   ## Byte offset of the start of the current line in fullText.
@@ -1949,8 +1958,8 @@ proc criticResolveOne(app: var App; accept: bool) =
   let piece = ft[s ..< e]
   if piece.startsWith("{>>"):
     app.msg = "that is a comment (use Mark DONE / Clean DONE)"; return
-  app.ed.setText(ft[0 ..< s] & applyCriticMarkup(piece, accept) & ft[e ..< ft.len])
-  app.ed.markChanged()
+  app.ed.replaceTextUndoable(
+    ft[0 ..< s] & applyCriticMarkup(piece, accept) & ft[e ..< ft.len])
   app.msg = (if accept: "accepted change" else: "rejected change")
 
 proc criticAcceptOne*(app: var App) = criticResolveOne(app, true)

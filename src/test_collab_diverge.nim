@@ -24,6 +24,17 @@ block author_tags:
     applyCriticMarkup("{++[not a tag, no close++}", true) ==
       "[not a tag, no close"
 
+# -- comments: the editor's accept/reject-all keeps them, the merge drops them --
+block comments:
+  check "accept-all keeps comments when asked",
+    applyCriticMarkup("a{>>[Carol] fix this<<}b", true, keepComments = true) ==
+      "a{>>[Carol] fix this<<}b"
+  check "reject-all keeps comments when asked",
+    applyCriticMarkup("a{>>[Carol] fix this<<}b", false, keepComments = true) ==
+      "a{>>[Carol] fix this<<}b"
+  check "the merge fingerprint still drops them",
+    applyCriticMarkup("a{>>[Carol] fix this<<}b", true) == "ab"
+
 # -- no divergence: unchanged text passes through plain ------------------------
 block no_divergence:
   let base = "alpha\nbeta\ngamma\n"
