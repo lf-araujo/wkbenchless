@@ -147,7 +147,7 @@ type
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
   PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent,
-                   pmSaveAs, pmExport, pmHistory, pmPrompt
+                   pmSaveAs, pmExport, pmHistory, pmPrompt, pmDagPending
   ExportTarget* = tuple[id, label, cmd: string]   ## palette entry: id -> command
   SearchMode* = enum smFind, smReplace
   SearchField* = enum sfQuery, sfReplace
@@ -218,6 +218,9 @@ proc relTime*(t: float): string
 var gExportTargets*: seq[ExportTarget]   ## registered Export-button targets
 var gPromptHandler*: proc(app: var App; text: string)  ## pmPrompt accept callback
 var gStatusCircle*: Color = color(0xb0, 0xb0, 0xb0)  ## status circle: gray=offline
+var gStatusCircleRect*: Rect = rect(0, 0, 0, 0)  ## clickable bounds (set during draw)
+var gDagPendingEntries*: proc(app: App): seq[tuple[id, label: string]]  ## palette items
+var gDagPendingAccept*: proc(app: var App; id: string)  ## palette accept action
 proc registerExport*(id, label, cmd: string) =
   ## Add a target to the Export button's palette ("Export…" opens it).
   gExportTargets.add (id, label, cmd)
@@ -878,6 +881,9 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
         result.add (p, nm & "    " & p.parentDir)
   of pmPrompt:
     discard   # free-text: the typed query is the answer, no list to filter
+  of pmDagPending:
+    if gDagPendingEntries != nil:
+      return gDagPendingEntries(app)
   of pmExport:
     # registered export targets (docx, notebook-html, ...): id -> command.
     # No match -> still show the list (the query is not a filter here), so the
@@ -1655,10 +1661,22 @@ proc openLink*(app: var App) =
     openExternally(t); app.msg = "opening " & extractFilename(t)
 
 # -- CriticMarkup (tracked changes), cf. org-tracked-docx --------------------
-proc applyCriticMarkup*(text: string; accept: bool): string =
+proc stripAuthorTag(s: string): string =
+  ## Tracked-change tokens carry a leading [Author] tag ({++[Elman, Jeremy]
+  ## text++}, as org_tracked writes them); the tag is provenance, not prose,
+  ## so it never survives into the kept text.
+  if s.len > 0 and s[0] == '[':
+    let e = s.find(']')
+    if e > 0: return s[e + 1 .. ^1]
+  s
+
+proc applyCriticMarkup*(text: string; accept: bool; keepComments = false): string =
   ## Resolve every CriticMarkup token. accept: keep insertions & the NEW side of
   ## a substitution, drop deletions. reject: the opposite. Comments are dropped
-  ## either way; a highlight always keeps its text (only the wrapper goes).
+  ## unless `keepComments` (the editor's accept/reject-all keeps them: in the
+  ## coauthor workflow the comments ARE the open issues); a highlight always
+  ## keeps its text (only the wrapper goes).
+  ## A leading [Author] tag is stripped from whichever side is kept.
   ##   {++ins++}  {--del--}  {~~old~>new~~}  {>>comment<<}  {==highlight==}
   result = newStringOfCap(text.len)
   var i = 0
@@ -1677,18 +1695,22 @@ proc applyCriticMarkup*(text: string; accept: bool): string =
         if e >= 0:
           let inner = text[i+3 ..< e-2]
           case a
-          of '+': (if accept: result.add inner)
-          of '-': (if not accept: result.add inner)
+          of '+': (if accept: result.add stripAuthorTag(inner))
+          of '-': (if not accept: result.add stripAuthorTag(inner))
           of '=': result.add inner
           of '~':
             let arrow = inner.find("~>")
-            if arrow >= 0: result.add (if accept: inner[arrow+2 .. ^1] else: inner[0 ..< arrow])
+            if arrow >= 0:
+              result.add (if accept: stripAuthorTag(inner[arrow+2 .. ^1])
+                          else: stripAuthorTag(inner[0 ..< arrow]))
             else: result.add inner
           else: discard
           i = e + 1; continue
       elif a == '>' and b == '>':          # {>>comment<<} -- asymmetric close
         let e = closeOf('<', '<')
-        if e >= 0: (i = e + 1; continue)   # drop the comment entirely
+        if e >= 0:
+          if keepComments: result.add text[i .. e]
+          i = e + 1; continue              # else drop the comment entirely
     result.add text[i]; inc i
 
 proc collectLatexHeader(app: App): string =
@@ -1888,13 +1910,18 @@ proc toggleInlineImages*(app: var App) =
 
 proc criticAcceptAll*(app: var App) =
   if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
-  app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = true))
-  app.ed.markChanged(); app.msg = "accepted all tracked changes"
+  # replaceTextUndoable, not setText: setText clears the undo stack, so the
+  # acceptance could not be undone with C-z. Comments survive -- they are the
+  # open issues of the review round, resolved via Mark DONE / Clean DONE.
+  app.ed.replaceTextUndoable(
+    applyCriticMarkup(app.ed.fullText(), accept = true, keepComments = true))
+  app.msg = "accepted all tracked changes (comments kept)"
 
 proc criticRejectAll*(app: var App) =
   if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
-  app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = false))
-  app.ed.markChanged(); app.msg = "rejected all tracked changes"
+  app.ed.replaceTextUndoable(
+    applyCriticMarkup(app.ed.fullText(), accept = false, keepComments = true))
+  app.msg = "rejected all tracked changes (comments kept)"
 
 proc lineStartOffset(app: App): int =
   ## Byte offset of the start of the current line in fullText.
@@ -1931,8 +1958,8 @@ proc criticResolveOne(app: var App; accept: bool) =
   let piece = ft[s ..< e]
   if piece.startsWith("{>>"):
     app.msg = "that is a comment (use Mark DONE / Clean DONE)"; return
-  app.ed.setText(ft[0 ..< s] & applyCriticMarkup(piece, accept) & ft[e ..< ft.len])
-  app.ed.markChanged()
+  app.ed.replaceTextUndoable(
+    ft[0 ..< s] & applyCriticMarkup(piece, accept) & ft[e ..< ft.len])
   app.msg = (if accept: "accepted change" else: "rejected change")
 
 proc criticAcceptOne*(app: var App) = criticResolveOne(app, true)
@@ -1997,7 +2024,7 @@ proc prevComment*(app: var App) =
   app.msg = "no previous comment"
 
 # -- two-pane diff (for agents to show before/after) -------------------------
-proc lineDiff(a, b: seq[string]): tuple[l, r: seq[string]; lk, rk: seq[char]] =
+proc lineDiff*(a, b: seq[string]): tuple[l, r: seq[string]; lk, rk: seq[char]] =
   ## LCS line alignment: each output row is (left, right) with a kind --
   ## ' ' unchanged, '-' removed (right blank), '+' added (left blank).
   let n = a.len; let m = b.len
@@ -2018,6 +2045,109 @@ proc lineDiff(a, b: seq[string]): tuple[l, r: seq[string]; lk, rk: seq[char]] =
   while j < m: (result.l.add ""; result.r.add b[j]; result.lk.add ' '; result.rk.add '+'; inc j)
 
 var gDiffAutoClose* = 20.0   ## seconds an untouched diff stays up (0 = until closed)
+
+
+# -- three-way divergence review (collab reconnects) ---------------------------
+type
+  DivHunk = tuple[b0, b1: int; lines: seq[string]; mine: bool]
+    ## base lines [b0, b1) replaced by `lines`; `mine` picks the side
+
+proc splitKeepNl(s: string): seq[string] =
+  ## Lines as atoms, each keeping its trailing newline -- concat is an exact
+  ## round-trrip, so markup rendering never loses a trailing newline.
+  var start = 0
+  for i, c in s:
+    if c == '\n': result.add s[start .. i]; start = i + 1
+  if start < s.len: result.add s[start ..< s.len]
+
+proc divHunks(base, x: seq[string]; mine: bool): seq[DivHunk] =
+  ## Change hunks of base -> x, coalescing adjacent delete/insert rows of the
+  ## LCS alignment into one substituted range.
+  let d = lineDiff(base, x)
+  var i = 0
+  var b = 0                      # the base line the next row speaks of
+  while i < d.l.len:
+    if d.lk[i] == ' ' and d.rk[i] == ' ':      # unchanged row
+      inc b; inc i; continue
+    let b0 = b
+    var lines: seq[string] = @[]
+    while i < d.l.len and not (d.lk[i] == ' ' and d.rk[i] == ' '):
+      if d.lk[i] == '-': inc b   # a base line dropped from x
+      if d.rk[i] == '+': lines.add d.r[i]
+      inc i
+    result.add (b0, b, lines, mine)
+
+proc gitUserName*(): string =
+  ## This checkout's `git config user.name` ("" if unset) -- the default
+  ## human-readable identity: collab divergence tags and dag reviewer IDs
+  ## fall back to it so "some ID" is there without any setup.
+  try:
+    let (o, c) = execCmdEx("git config user.name")
+    if c == 0: return o.strip()
+  except CatchableError: discard
+  ""
+
+proc divergeMarkup*(base, mine, theirs: string; mySite, theirSite: int;
+                    myTag = ""; theirTag = ""): string =
+  ## A CriticMarkup review of a three-way divergence: `base` is the text both
+  ## sides last agreed on (before the link dropped), `mine` and `theirs` the
+  ## versions each edited offline. Every changed region is wrapped, tagged
+  ## with the side that made it -- the peer's name when the handshake
+  ## exchanged one ({++[Chandra] ... ++}), else its site number
+  ## ({++[s2] ... ++}); changes both sides made identically are consensus and
+  ## pass through plain. The result is meant for human resolution (critic
+  ## accept/reject), not for silent merging -- that is what the live CRDT is
+  ## for.
+  proc tag(site: int; t: string): string =
+    (if t.len > 0: "[" & t & "]" else: "[s" & $site & "]")
+  let bl = splitKeepNl(base)
+  var hunks = divHunks(bl, splitKeepNl(mine), true)
+  hunks.add divHunks(bl, splitKeepNl(theirs), false)
+  hunks.sort(proc (a, b: DivHunk): int =
+    result = cmp(a.b0, b.b0)
+    if result == 0: result = cmp(a.b1, b.b1))
+  var bi = 0                     # next base line not yet emitted
+  var hi = 0
+  while hi < hunks.len:
+    # one review region: every hunk touching (overlapping or adjacent) the first
+    var grp = @[hunks[hi]]
+    var gEnd = hunks[hi].b1
+    inc hi
+    while hi < hunks.len and hunks[hi].b0 <= gEnd:
+      grp.add hunks[hi]; gEnd = max(gEnd, hunks[hi].b1); inc hi
+    while bi < grp[0].b0:        # unchanged context passes through
+      result.add bl[bi]; inc bi
+    var mineLines, theirsLines: seq[string]
+    var mineAte, theirsAte: bool
+    for h in grp:
+      if h.mine:
+        mineLines.add h.lines
+        if h.b1 > h.b0: mineAte = true
+      else:
+        theirsLines.add h.lines
+        if h.b1 > h.b0: theirsAte = true
+    if mineLines == theirsLines:
+      # both sides made the same change (or deleted the same lines): consensus
+      for l in mineLines: result.add l
+    else:
+      if bi < gEnd:              # base text one or both sides removed
+        let delTag = if mineAte and theirsAte: ""
+                     elif mineAte: tag(mySite, myTag)
+                     else: tag(theirSite, theirTag)
+        result.add "{--" & delTag
+        for i in bi ..< gEnd: result.add bl[i]   # lines carry their newlines
+        result.add "--}"
+      if theirsLines.len > 0:
+        result.add "{++" & tag(theirSite, theirTag)
+        for l in theirsLines: result.add l
+        result.add "++}"
+      if mineLines.len > 0:
+        result.add "{++" & tag(mySite, myTag)
+        for l in mineLines: result.add l
+        result.add "++}"
+    bi = gEnd
+  while bi < bl.len:              # trailing context
+    result.add bl[bi]; inc bi
 
 proc diffTokenize*(s: string): seq[string] =
   ## Words, whitespace runs, single punctuation, and "\n" as its own token.
@@ -2766,7 +2896,7 @@ proc overstrikeCR(s: string): string =
     lines.add(if cr >= 0: ln[cr + 1 .. ^1] else: ln)
   lines.join("\n")
 
-proc finishBabelJob(app: var App; aj: var AppJob) =
+proc finishBabelJob*(app: var App; aj: var AppJob) =
   ## Write a finished block's results into its buffer -- the active one or a
   ## background buffer (the user may have switched files while it ran).
   # A REPL on a real terminal (a remote tmux pane, say) colours its output --

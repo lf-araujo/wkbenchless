@@ -93,7 +93,24 @@ proc peelAuthor(inner, default: string): tuple[auth, text: string] =
       return (inner[1 ..< rb], inner[rb+1 .. ^1])
   (default, inner)
 
-proc criticToSpans(md: string; doneIds: var seq[int]): string =
+proc spanKeepEdges(t: string): string =
+  ## pandoc's markdown reader drops leading/trailing spaces inside a span
+  ## (`[x ]{.insertion}' -> `x'), which glues an insertion ending in a space to
+  ## the word after the token in Word (`{++… participants ++}in' ->
+  ## "participantsin"). A `&#32;' character reference survives as a real space
+  ## (`\ ' would come back as U+00A0), keeping the whitespace inside the
+  ## w:ins/w:del run.
+  var a = 0
+  while a < t.len and t[a] == ' ': inc a
+  var b = t.len
+  while b > a and t[b - 1] == ' ': dec b
+  if a == 0 and b == t.len: return t
+  result = ""
+  for _ in 1 .. a: result.add "&#32;"
+  result.add t[a ..< b]
+  for _ in 1 .. t.len - b: result.add "&#32;"
+
+proc criticToSpans*(md: string; doneIds: var seq[int]): string =
   ## CriticMarkup tokens -> pandoc markdown spans (for md -> docx). Uses the same
   ## split scanner style as wkbcore.applyCriticMarkup.
   let a = trackAuthor()
@@ -154,20 +171,25 @@ proc criticToSpans(md: string; doneIds: var seq[int]): string =
           case x
           of '+':
             let (au, tx) = peelAuthor(inner, a)
-            sep(result); result.add "[" & orgCiteToPandoc(tx) & "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
+            sep(result); result.add "[" & spanKeepEdges(orgCiteToPandoc(tx)) &
+              "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
           of '-':
             let (au, tx) = peelAuthor(inner, a)
-            sep(result); result.add "[" & orgCiteToPandoc(tx) & "]{.deletion author=\"" & au & "\" date=\"" & d & "\"}"
+            sep(result); result.add "[" & spanKeepEdges(orgCiteToPandoc(tx)) &
+              "]{.deletion author=\"" & au & "\" date=\"" & d & "\"}"
           of '=': result.add orgCiteToPandoc(inner)                        # highlight: keep the text
           of '~':
             let (au, body) = peelAuthor(inner, a)
             let arrow = body.find("~>")
             if arrow >= 0:
-              sep(result); result.add "[" & orgCiteToPandoc(body[0 ..< arrow]) & "]{.deletion author=\"" & au & "\" date=\"" & d & "\"}"
+              sep(result); result.add "[" & spanKeepEdges(orgCiteToPandoc(body[0 ..< arrow])) &
+                "]{.deletion author=\"" & au & "\" date=\"" & d & "\"}"
               let (au2, newText) = peelAuthor(body[arrow+2 .. ^1], au)   # `~>[Author]new'
-              sep(result); result.add "[" & orgCiteToPandoc(newText) & "]{.insertion author=\"" & au2 & "\" date=\"" & d & "\"}"
+              sep(result); result.add "[" & spanKeepEdges(orgCiteToPandoc(newText)) &
+                "]{.insertion author=\"" & au2 & "\" date=\"" & d & "\"}"
             else:
-              sep(result); result.add "[" & orgCiteToPandoc(body) & "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
+              sep(result); result.add "[" & spanKeepEdges(orgCiteToPandoc(body)) &
+                "]{.insertion author=\"" & au & "\" date=\"" & d & "\"}"
           else: discard
           i = e + 1; continue
       elif x == '>' and y == '>':                         # {>>[A] note<<}
@@ -608,6 +630,52 @@ proc spansToCritic*(md: string): string =
   s = flattenCritic(s)
   s = mergeSubstitutions(s)
   stripAnchorSpans(s)
+
+proc sharedEdge(side: string; c: char; leading: bool): tuple[ok: bool; side: string] =
+  ## Whether SIDE's prose (after any `[Author]' prefix) starts (or ends) with
+  ## emphasis delimiter `c', and the side with that one delimiter stripped.
+  var p = side
+  var pre = ""
+  let (au, rest) = peelAuthor(p, "")
+  if au.len > 0: (pre = p[0 ..< p.len - rest.len]; p = rest)
+  if leading:
+    if p.len == 0 or p[0] != c: return (false, side)
+    return (true, pre & p[1 .. ^1])
+  if p.len == 0 or p[^1] != c: return (false, side)
+  (true, pre & p[0 ..< p.len - 1])
+
+proc hoistCriticEmphasis*(s: string): string =
+  ## Org emphasis opened INSIDE a tracked change cannot reach past the token:
+  ## export stashes the token to a sentinel for the org->md pass, so a `/' (or
+  ## `*') leading both sides of a substitution -- an italic quote the coauthor
+  ## edited, `{~~/First, …~>/In sensitivity …~~}/' -- pairs with nothing and
+  ## exports as a literal `/' with no italics. When both sides share a
+  ## leading/trailing emphasis delimiter, move one copy outside the token:
+  ## pandoc then sees `/<sentinel>/…' and italicises the whole change.
+  result = newStringOfCap(s.len)
+  var i = 0
+  while i < s.len:
+    if i + 5 < s.len and s[i] == '{' and s[i+1] == '~' and s[i+2] == '~':
+      let e = s.find("~~}", i + 3)
+      if e > 0:
+        let inner = s[i + 3 ..< e]
+        let arrow = inner.find("~>")
+        if arrow >= 0:
+          var o = inner[0 ..< arrow]
+          var n = inner[arrow + 2 .. ^1]
+          var pre = ""
+          var post = ""
+          for c in {'/', '*'}:
+            let (oOk, o2) = sharedEdge(o, c, leading = true)
+            let (nOk, n2) = sharedEdge(n, c, leading = true)
+            if oOk and nOk: (pre = $c; o = o2; n = n2)
+            let (oTk, o3) = sharedEdge(o, c, leading = false)
+            let (nTk, n3) = sharedEdge(n, c, leading = false)
+            if oTk and nTk: (post = $c; o = o3; n = n3)
+          result.add pre & "{~~" & o & "~>" & n & "~~}" & post
+          i = e + 3
+          continue
+    result.add s[i]; inc i
 
 proc stash*(s: string; tokens: var seq[string]): string =
   ## Replace CriticMarkup tokens with opaque sentinels so a pandoc org<->md pass
@@ -2670,7 +2738,7 @@ proc otdExport(app: var App) =
       continue
     lines.add ln
   var toks: seq[string]
-  let orgStashed = stash(lines.join("\n"), toks)
+  let orgStashed = stash(hoistCriticEmphasis(lines.join("\n")), toks)
   let orgTmp = getTempDir() / "otd-export.org"
   writeFile(orgTmp, orgStashed)
   let md = getTempDir() / "otd-export.md"

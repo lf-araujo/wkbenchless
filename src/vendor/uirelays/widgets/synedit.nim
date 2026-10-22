@@ -1712,6 +1712,10 @@ proc backspaceNoSelect(s: var SynEdit; overrideUtf8 = false) =
 
 proc insertNoSelect(s: var SynEdit; text: string; singleUndoOp = false) =
   if s.cursor.int <= s.readOnly or text.len == 0: return
+  # Never insert inside a multibyte rune: a cursor that landed mid-rune (a
+  # byte-wise column walk, a programmatic jump) is snapped forward to the
+  # next grapheme start, so typing cannot split a UTF-8 character.
+  while s.cursor.int < s.len and (s[s.cursor].ord and 0xC0) == 0x80: inc s.cursor
   let oldCursor = s.cursor
   s.prepareForEdit()
   s.actions.setLen(clamp(s.undoIdx + 1, 0, s.actions.len))
@@ -1733,7 +1737,8 @@ proc insertNoSelect(s: var SynEdit; text: string; singleUndoOp = false) =
   s.highlightLine(oldCursor)
 
 proc gotoPos*(s: var SynEdit; pos: int) =
-  let pos = clamp(pos, 0, s.len)
+  var pos = clamp(pos, 0, s.len)
+  while pos < s.len and (s[pos].ord and 0xC0) == 0x80: inc pos  # mid-rune: snap
   s.cursor = pos.Natural
   s.currentLine = s.getLineFromOffset(pos)
   if s.currentLine >= s.firstLine + 1 and s.currentLine < s.firstLine + s.span.Natural - 1:
@@ -1942,12 +1947,10 @@ proc down(s: var SynEdit; jump: bool) =
       if not jump or s[s.cursor.int + 1] > ' ': break
     s.cursor += 1
   s.cursor += 1
-  var c = col
-  while s.cursor < L and c > 0:
-    if s[s.cursor] == '\L': break
-    dec c
-    s.cursor += 1
-  if s.cursor > L: s.cursor = L.Natural
+  # Walk GRAPHEMES, not bytes: a byte-wise column walk onto a line holding
+  # multibyte characters lands the cursor inside a rune, and the next keypress
+  # splices invalid UTF-8 into the buffer.
+  s.cursor = s.offsetAtColumn(s.cursor.int, col).Natural
   # Skip a collapsed src block: if we descended onto one of its hidden body
   # rows, continue to the first visible line below the block.
   block:

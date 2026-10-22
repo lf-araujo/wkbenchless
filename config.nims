@@ -9,6 +9,22 @@ switch("path", "src")
 ## `import uirelays`, `import uirelays/…`, and `import widgets/…` resolve to it.
 switch("path", "src/vendor/uirelays")
 
+## nim-tuntox (the sibling checkout of github.com/lf-araujo/nim-tuntox) is the
+## in-process Tox tunnel behind extensions/tox_collab.nim. A released build
+## would `requires "nim-tuntox"` instead of this path. Its toxcore binding
+## asks pkg-config for c-toxcore at compile time, so make the usual installs
+## visible even when the shell that launched the editor didn't export
+## PKG_CONFIG_PATH (C-c r's rebuild re-execs the compiler in-process).
+switch("path", "../nim-tuntox/src")
+block:
+  if getEnv("PKG_CONFIG_PATH").len == 0:
+    for pc in [getHomeDir() & ".local/lib64/pkgconfig",
+               getHomeDir() & ".local/lib/pkgconfig",
+               getCurrentDir() & "/../nim-tuntox/vendor/lib64/pkgconfig"]:
+      if dirExists(pc):
+        putEnv("PKG_CONFIG_PATH", pc)
+        break
+
 ## User config: ~/.config/wkbenchless/wkbconfig.nim (XDG_CONFIG_HOME, or
 ## %APPDATA% on Windows) is compiled in place of src/wkbconfig.nim when it exists,
 ## so a nimble-installed build can be configured without touching its package

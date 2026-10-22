@@ -129,6 +129,7 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     of pmExport: "export: "
     of pmHistory: "history: "
     of pmPrompt: app.palettePrompt
+    of pmDagPending: "pending: "
   # Scroll the visible window so the selection stays in view.
   var top = 0
   if app.paletteSel >= maxRows: top = app.paletteSel - maxRows + 1
@@ -275,6 +276,14 @@ proc handleSearch(app: var App; e: Event) =
         app.searchQuery.add ch; recomputeMatches(app); gotoCurrentMatch(app)
 
 proc paletteAccept(app: var App) =
+  # free-text prompts have no list to select from -- the query IS the
+  # answer, so it must not pass through the entries guard below (an
+  # empty list made Enter do nothing, ever, for pmPrompt)
+  if app.paletteMode == pmPrompt:
+    app.paletteActive = false
+    if gPromptHandler != nil:
+      gPromptHandler(app, app.paletteQuery)
+    return
   let items = paletteEntries(app)
   if app.paletteSel < 0 or app.paletteSel >= items.len: return
   let id = items[app.paletteSel].id
@@ -339,10 +348,11 @@ proc paletteAccept(app: var App) =
     else:
       app.paletteActive = false
       saveBufferAs(app, id)
-  of pmPrompt:
+  of pmPrompt: discard # unreachable: handled by the early return above
+  of pmDagPending:
     app.paletteActive = false
-    if gPromptHandler != nil:
-      gPromptHandler(app, app.paletteQuery)
+    if gDagPendingAccept != nil:
+      gDagPendingAccept(app, id)
 
 proc handlePalette(app: var App; e: Event) =
   if e.kind == KeyDownEvent:
@@ -355,6 +365,14 @@ proc handlePalette(app: var App; e: Event) =
     of KeyBackspace:
       if app.paletteQuery.len > 0:
         app.paletteQuery.setLen(app.paletteQuery.len - 1); app.paletteSel = 0
+    of KeyV:
+      # paste into the prompt (Ctrl-V / Cmd-V) -- a Tox ID is 76 chars,
+      # nobody types that. Strip the newline a clipboard copy carries.
+      if CtrlPressed in e.mods or GuiPressed in e.mods:
+        let text = getClipboardText().strip()
+        if text.len > 0:
+          app.paletteQuery.add text
+          app.paletteSel = 0
     else: discard
   elif e.kind == TextInputEvent:
     for ch in e.text:
