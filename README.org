@@ -200,56 +200,41 @@ When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
 - [ ] *Ctrl-click ~[cite:@key]~ → its BibTeX entry* — a click/keybinding hook
   on a citation that calls ~cite-goto~ (the ~wkbctl cite-goto <key>~ verb already
   does the jump for agents; this is the in-editor UI on top of it).
+- [ ] *Remote sessions: robust, polite reconnection* (reported 2026-10-21,
+  src/wkbsession.nim / ControlMaster login; light.vipbg.vcu.edu). An
+  overnight drop of the ControlMaster left a long qsub grid running in
+  ~wkb-ctace-R~, but getting back to it was convoluted and repeated
+  connection attempts got the client locked out (sshd closes before the
+  banner: ~kex_exchange_identification: Connection closed by remote host~).
+  - [ ] *No blind polling*: every ~ctl eval~ / reattach on a dead session
+    opens a fresh ssh attempt; with fail2ban-style hosts that extends the
+    ban. Back off exponentially (cap ~30 min), share ONE retry clock per
+    host across sessions and ~ctl~ callers, and stop after a pre-banner
+    close until the user logs in again.
+  - [ ] *Fail fast and clearly* — ~ctl eval~ on a session without a live
+    master should return ~error: no ControlMaster for <host>; log in
+    (M-x remote-login)~ immediately, not ~session ended during login~ after
+    a new attempt; distinguish "host refusing connections (possible
+    lockout)" from "auth needed" from "network down".
+  - [ ] *One login command* — ~M-x remote-login~ (and ~ctl remote-login
+    <host>~) opens the terminal tab with the right ~ssh -M -o
+    ControlPath=~/.ssh/wkb-cm-%C -o ControlPersist~ invocation, keeps the
+    tab open on failure (shows the exit code), and on success automatically
+    reattaches every session on that host (~tmux -CC new-session -A~). A
+    plain ~ssh host~ tab should not look like a valid login.
+  - [ ] *Status in the session panel*: master alive / gone, last attempt,
+    next retry time, and whether the tmux session + its job are still alive
+    on the host (cheap ~tmux has-session~ over the master once it is back).
+  - [ ] *Keep the master alive across sleep*: ~ServerAliveInterval~ /
+    ~ServerAliveCountMax~ on the master, and a longer ~ControlPersist~ while
+    remote jobs are registered.
 - [ ] ~bib --insert~ — drop ~[cite:@key]~ at the cursor from a search result.
 - [ ] ~bib --extract~ — write the current file's cited keys to a slim project
   ~refs.bib~ at export time.
-- [X] ~ctl diagnostics~ — shipped as the ~check~ / ~check-project~ agent verbs
-  (extensions/agent_tools.nim): ~nim check~ queued in the bash session (visible
-  in the panel) with a crisp ~check: ok|FAILED (exit N)~ last line. Surfacing
-  LSP publish-diagnostics on top remains optional polish, not a gap.
-- [X] *org-tracked docx round-trip hardening* (extensions/org_tracked.nim) —
-  ported the org-tracked-docx.el merge core and hardened it against the real
-  co-author round (Chandra's ~_cr.docx~ onto the canonical ~.org~; verified
-  end-to-end: tables 72/72, all comments survive, no spliced junk):
-  - [X] tables are *structural* — a contiguous run of ~|~ lines is a
-    passthrough block from the canonical; never align/replace table rows;
-  - [X] canonical comments always survive — carried onto replaced paragraphs
-    and re-anchored by tiered substring splice (exact → case-insensitive →
-    truncated → ordinal); the reviewer's comments get the same treatment;
-  - [X] change detection is citation-blind — every cite/cross-ref rendering
-    collapses to a ~[CITE]~ token before fingerprinting; two-pointer
-    alignment (40-char prefix, positional, lookahead 24) plus containment /
-    short-prefix / split-join tiers carries edits without splicing junk;
-  - [X] back-substitution maps through the docx's OWN bibliography (each
-    rendered reference matched to a ~.bib~ key by title) — robust even when
-    the canonical's citations drifted since the export; ~Figure N~ →
-    ~[cite:@fig:…]~ from ~#+name:~ order; unresolved numbers stay visible;
-  - [X] safety net — comments that can't be placed go to a
-    ~* Reviewer comments not auto-placed~ section, so nothing is lost;
-  - [ ] accepted edits (Word's accept strips the w:ins/w:del runs) are
-    carried but not *marked*: a clean word-diff of canonical vs the
-    reviewer's citation-normalised text, emitting fresh ~{++/--/~~}~, would
-    show what the acceptance changed.
-  - [X] Export (~otdExport~): embed fallback via docProps — the org also goes
-    in as a base64 ~OrgTrackedSource~ custom document property (Word/OneDrive
-    strip ~customXml/~ on save), and import reads whichever survived.
-- [X] *Document history: infinite undo + time-versioned browsing*
-  (src/vendor/uirelays/widgets/synedit.nim) — chosen model: linear + persist +
-  timestamps (deliberately not a branching tree).
-  - [X] Layer 1 — ~C-z~ is infinite and cross-session: every version group
-    carries a timestamp; the undo stack persists to a per-file sidecar in
-    the cache (sha1-keyed, so nothing pollutes the manuscript folder),
-    written on save and reloaded on open — guarded by the file's
-    mtime+size, so undoing against an externally changed file never
-    happens. The linear model stays: a new edit still truncates redo.
-  - [X] Layer 2 — ~M-x history~ time-versioned browser: buffer snapshots on
-    idle-pause (a moment you stopped, not a timer tick) and on save, pruned
-    to adaptive time density (all < 2h, hourly to 2 days, daily beyond, cap
-    60); the palette lists versions with age + line-delta labels; Enter
-    previews the diff in the diff panel, Enter again restores — as ONE
-    undoable edit, so C-z comes right back to the present, never a trap.
-  - [X] ~M-x cite-history~ — what we wrote about the citation at point, over
-    time: every snapshot's paragraphs citing the key, newest first.
+- [ ] *otd-import: mark accepted edits* — accepted edits (Word's accept
+  strips the w:ins/w:del runs) are carried but not *marked*: a clean
+  word-diff of canonical vs the reviewer's citation-normalised text,
+  emitting fresh ~{++/--/~~}~, would show what the acceptance changed.
 - [ ] *Matter as the highlight engine* — port the hand-rolled Org+CriticMarkup
   highlighter (~highlightOrg~, synedit.nim) onto [[https://github.com/elcritch/matter][matter]], elcritch's synchronous
   TextMate grammar engine for native Nim (JSON/plist ~.tmLanguage~ in, scope
