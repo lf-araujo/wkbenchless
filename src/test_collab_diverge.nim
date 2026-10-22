@@ -24,6 +24,21 @@ block author_tags:
     applyCriticMarkup("{++[not a tag, no close++}", true) ==
       "[not a tag, no close"
 
+# -- named sides: the handshake's identity replaces the site number ------------
+block named_tags:
+  let base = "alpha\nbeta\ngamma\n"
+  let mine = "alpha\nBETA\ngamma\n"
+  let theirs = "alpha\nbeta\nGAMMA\n"
+  let view = divergeMarkup(base, mine, theirs, 2, 1, "luis", "chandra")
+  check "my edits carry my name",
+    view.contains("{++[luis]BETA\n++}")
+  check "their edits carry their name",
+    view.contains("{++[chandra]GAMMA\n++}")
+  check "no bare site tags remain",
+    not view.contains("[s1]") and not view.contains("[s2]")
+  check "an empty name falls back to the site number",
+    divergeMarkup(base, mine, theirs, 2, 1).contains("{++[s2]BETA\n++}")
+
 # -- comments: the editor's accept/reject-all keeps them, the merge drops them --
 block comments:
   check "accept-all keeps comments when asked",

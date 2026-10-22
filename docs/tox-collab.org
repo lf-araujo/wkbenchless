@@ -85,9 +85,8 @@ hello/welcome handshake flows through the tunnel; =M-x tox-join
 <host:port>= is plain LAN TCP with no tox at all.
 - Set =TUNTOX_SHARED_SECRET= (or =gToxSecret=) on both sides: without it
 anyone holding the host's Tox ID can tunnel to ANY local port.
-- Phase 5: speak crdt.el's own protocol over the same tunnel for Emacs
-interop (their HACKING.org documents both the primary sexp protocol and
-the cross-editor bridge protocol).
+- Emacs interop (speaking crdt.el's own sexp protocol over the tunnel) is
+out of scope: this speaks only to other wkbenchless instances.
 
 * Dependency posture
 
@@ -141,8 +140,8 @@ convergence replace the relay -- no server, no relay, two addresses.
   =M-x tox-join <host:port>=, =M-x tox-leave=
 - remote peers = colored cursor markers + name in the status line
 - =wkbctl tox-peers= so agents can drive sessions
-- phase 5 fun: a =#+TOX:= header makes the file its own invite; share
-  the host's babel session (CRDT.el's remote-process idea)
+- a =#+TOX:= header makes the file its own invite; share the host's babel
+  session (CRDT.el's remote-process idea)
 
 * Phases
 
@@ -152,5 +151,7 @@ convergence replace the relay -- no server, no relay, two addresses.
 4. [X] tuntox spawn/manage: the tox transport (src/wkbtox.nim +
    src/test_tox_transport.nim against a fake tuntox; POSIX-only for now,
    Windows/macOS packaging is the next step)
-5. [ ] crdt.el protocol adapter: Emacs interop over the same tunnel
-6. [ ] org folding sync, shared babel, binary wire format
+5. [ ] org folding sync, shared babel, binary wire format
+
+Emacs interop (a crdt.el protocol adapter) was considered and dropped:
+wkbenchless peers are the only intended participants.

@@ -9,7 +9,8 @@
 ##   dag-init <supply> <id1,id2,...>   -- create a ledger with founding members
 ##   dag-import <doi> <title>          -- import a traditional paper by DOI
 ##   dag-submit                       -- submit the current org buffer as a paper
-##   dag-review <paperId> <accept|reject>  -- review a pending paper
+##   dag-review <paperId> <accept|reject> [reviewerId] -- review a pending paper
+##                                             (reviewer defaults to git user.name)
 ##   dag-status                        -- ledger summary
 ##   dag-pending                       -- list pending registrations
 ##   dag-citedby <paperId>             -- who cites this paper
@@ -127,11 +128,11 @@ proc extend*(app: var App) =
       except LedgerError as e:
         result = "dag: " & e.msg)
 
-  registerCtlVerb("dag-review", "review: <paperId> <accept|reject|sendback|abstain> <reviewerId>",
+  registerCtlVerb("dag-review", "review: <paperId> <accept|reject|sendback|abstain> [reviewerId]",
     proc(a: var App; args: seq[string]; body: string): string =
       if not dagReady: return "dag: no ledger"
-      if args.len < 3:
-        return "usage: dag-review <paperId> <accept|reject|sendback|abstain> <reviewerId>"
+      if args.len < 2:
+        return "usage: dag-review <paperId> <accept|reject|sendback|abstain> [reviewerId]"
       var pid = args[0]
       let verdict = case args[1].toLowerAscii()
         of "accept": rvAccept
@@ -139,7 +140,10 @@ proc extend*(app: var App) =
         of "sendback": rvSendBack
         of "abstain": rvAbstain
         else: rvAccept
-      let reviewer = args[2]
+      # the reviewer ID is not load-bearing: omitted, it defaults to this
+      # machine's identity (git user.name), so a review is one command
+      var reviewer = if args.len >= 3: args[2] else: gitUserName()
+      if reviewer.len == 0: reviewer = "anonymous"
       # accept a prefix: expand short IDs against pending papers
       if pid.len < 40:
         for reg in ledger.pending:

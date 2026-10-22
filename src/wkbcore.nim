@@ -2077,14 +2077,29 @@ proc divHunks(base, x: seq[string]; mine: bool): seq[DivHunk] =
       inc i
     result.add (b0, b, lines, mine)
 
-proc divergeMarkup*(base, mine, theirs: string; mySite, theirSite: int): string =
+proc gitUserName*(): string =
+  ## This checkout's `git config user.name` ("" if unset) -- the default
+  ## human-readable identity: collab divergence tags and dag reviewer IDs
+  ## fall back to it so "some ID" is there without any setup.
+  try:
+    let (o, c) = execCmdEx("git config user.name")
+    if c == 0: return o.strip()
+  except CatchableError: discard
+  ""
+
+proc divergeMarkup*(base, mine, theirs: string; mySite, theirSite: int;
+                    myTag = ""; theirTag = ""): string =
   ## A CriticMarkup review of a three-way divergence: `base` is the text both
   ## sides last agreed on (before the link dropped), `mine` and `theirs` the
   ## versions each edited offline. Every changed region is wrapped, tagged
-  ## with the site that made it ({++[s2] ... ++}, {--[s1] ... --}); changes
-  ## both sides made identically are consensus and pass through plain. The
-  ## result is meant for human resolution (critic accept/reject), not for
-  ## silent merging -- that is what the live CRDT is for.
+  ## with the side that made it -- the peer's name when the handshake
+  ## exchanged one ({++[Chandra] ... ++}), else its site number
+  ## ({++[s2] ... ++}); changes both sides made identically are consensus and
+  ## pass through plain. The result is meant for human resolution (critic
+  ## accept/reject), not for silent merging -- that is what the live CRDT is
+  ## for.
+  proc tag(site: int; t: string): string =
+    (if t.len > 0: "[" & t & "]" else: "[s" & $site & "]")
   let bl = splitKeepNl(base)
   var hunks = divHunks(bl, splitKeepNl(mine), true)
   hunks.add divHunks(bl, splitKeepNl(theirs), false)
@@ -2116,18 +2131,18 @@ proc divergeMarkup*(base, mine, theirs: string; mySite, theirSite: int): string 
       for l in mineLines: result.add l
     else:
       if bi < gEnd:              # base text one or both sides removed
-        let tag = if mineAte and theirsAte: ""
-                  elif mineAte: "[s" & $mySite & "]"
-                  else: "[s" & $theirSite & "]"
-        result.add "{--" & tag
+        let delTag = if mineAte and theirsAte: ""
+                     elif mineAte: tag(mySite, myTag)
+                     else: tag(theirSite, theirTag)
+        result.add "{--" & delTag
         for i in bi ..< gEnd: result.add bl[i]   # lines carry their newlines
         result.add "--}"
       if theirsLines.len > 0:
-        result.add "{++[s" & $theirSite & "]"
+        result.add "{++" & tag(theirSite, theirTag)
         for l in theirsLines: result.add l
         result.add "++}"
       if mineLines.len > 0:
-        result.add "{++[s" & $mySite & "]"
+        result.add "{++" & tag(mySite, myTag)
         for l in mineLines: result.add l
         result.add "++}"
     bi = gEnd
