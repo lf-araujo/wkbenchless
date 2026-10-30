@@ -1,0 +1,83 @@
+name: CI
+
+# Build and test on Linux / macOS / Windows on every push and pull request, so
+# a platform that stops building or passing is caught then -- not on release
+# day (release.yml only runs on a version tag). Setup mirrors release.yml.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.config.label }}
+    runs-on: ${{ matrix.config.os }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { os: ubuntu-22.04,   label: linux_x86_64,   exe: '',     nim: '2.4.0' }  # GPU build needs >= 2.4
+          - { os: macos-latest,   label: macos_arm64,    exe: '',     nim: '2.2.6' }
+          - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.2.6' }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install X11 dev libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxft-dev libxext-dev libxrender-dev \
+            libfontconfig1-dev libfreetype6-dev
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ matrix.config.nim }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Nimble packages
+        run: nimble install -d -y
+
+      # The same flags release.yml ships with (Windows: a GUI-subsystem app).
+      - name: Build wkbenchless + wkbctl
+        shell: bash
+        run: |
+          GUI=""
+          if [ -n "${{ matrix.config.exe }}" ]; then GUI="--app:gui"; fi
+          nim c -d:release --hints:off $GUI \
+            -o:wkbenchless${{ matrix.config.exe }} src/wkbenchless.nim
+          nim c -d:release --hints:off \
+            -o:wkbctl${{ matrix.config.exe }} src/wkbctl.nim
+
+      # Unit tests. Each skips what needs a tool the runner lacks (R, pandoc,
+      # bash). Windows runs the ones that need no POSIX shell; the session
+      # tests drive bash REPLs over a PTY. Manual integration tools
+      # (test_tmux_remote, test_highlight_perf) take arguments and are not here.
+      - name: Run tests
+        shell: bash
+        run: |
+          tests="test_bib test_cite test_collab_diverge test_diff test_hist
+                 test_landmark test_logoot test_otd_spans test_regex
+                 test_rmd_fold test_search test_session_view test_supplement
+                 test_tmuxctl test_utf8_cursor"
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            tests="$tests test_async_session test_blocks test_dag
+                   test_ssh_reconnect test_tox_transport"
+          fi
+          failed=""
+          for t in $tests; do
+            echo "::group::$t"
+            if nim c -r --hints:off --warnings:off "src/$t.nim"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"; echo "::error::$t failed"; failed="$failed $t"
+            fi
+          done
+          if [ -n "$failed" ]; then echo "FAILED:$failed"; exit 1; fi

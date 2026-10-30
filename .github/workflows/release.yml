@@ -7,10 +7,12 @@ name: Build and release binaries
 #   * Linux   -- uirelays X11 driver + POSIX PTY (openpt/fork).
 #   * macOS   -- native Cocoa driver + POSIX PTY. No XQuartz needed.
 #   * Windows -- winapi UI driver + a ConPTY terminal (CreatePseudoConsole).
-#     The AF_UNIX control socket + hot-reload fd-handoff are POSIX-only, so on
-#     Windows `wkbctl` and agent-control are stubbed for now (the editor,
-#     sessions, and terminal work; C-c r reload is manual).
+#     The control socket is loopback TCP, so `wkbctl` / agent control work
+#     here too; only the hot-reload fd-handoff is POSIX-only (C-c r rebuilds
+#     and restarts without carrying sessions over).
 # `fail-fast: false` still lets the other platforms publish if one regresses.
+# ci.yml builds and tests all three on every push, so a regression shows up
+# before a tag does.
 
 on:
   push:
@@ -32,7 +34,7 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - { os: ubuntu-22.04,   label: linux_x86_64,  exe: '',     nim: '2.2.6' }
+          - { os: ubuntu-22.04,   label: linux_x86_64,  exe: '',     nim: '2.4.0' }  # GPU build needs >= 2.4
           - { os: macos-latest,   label: macos_arm64,   exe: '',     nim: '2.2.6' }
           - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.2.6' }
           # NOTE: the macOS x86_64 leg (runs-on: macos-13, Intel) is dropped --
