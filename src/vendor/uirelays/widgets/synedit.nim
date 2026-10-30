@@ -3779,7 +3779,7 @@ proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
 
   of MouseWheelEvent:
     if focused:
-      s.scrollLines(-e.y * 3)
+      s.scrollLines(-e.wheelLines)
 
   else: discard
 

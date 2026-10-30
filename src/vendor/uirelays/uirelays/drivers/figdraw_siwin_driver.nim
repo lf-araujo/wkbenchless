@@ -75,6 +75,11 @@ var
   stateStack: seq[DrawState]
   currentState: DrawState
   typefaceIdsByPath: Table[string, TypefaceId]
+  # Text layout is CPU work; an editor redraws the same lines every frame
+  # (scrolling is nothing but redraws), so lay each (font, text) out once.
+  measureCache: Table[(int, string), TextExtent]
+  layoutCache: Table[(int, string), GlyphArrangement]
+  wheelAcc: float32           ## scroll lines not sent yet (a touchpad's fractions)
   siwinInitialized = false
   frameStarted = false
 
@@ -104,6 +109,19 @@ proc toLogicalSize(v: int32): int =
 
 proc queueEvent(e: input.Event) =
   eventQueue.addLast(e)
+
+proc queueScroll(lines, dx: int) =
+  ## A wheel event in lines. Merged into a wheel event still waiting in the
+  ## queue: a touchpad fires far faster than frames render, and one frame per
+  ## event left scrolling trailing behind the finger.
+  if eventQueue.len > 0 and eventQueue[eventQueue.len - 1].kind == MouseWheelEvent:
+    var last = addr eventQueue[eventQueue.len - 1]
+    last.preciseLines += lines
+    last.x += dx
+    last.y = cmp(last.preciseLines, 0)
+  else:
+    queueEvent(input.Event(kind: MouseWheelEvent, x: dx, y: cmp(lines, 0),
+                           preciseLines: lines))
 
 proc resolveFontPath(path: string): string =
   if path.len > 0:
@@ -245,28 +263,32 @@ proc queueTextEvent(text: string) =
       e.text[i] = text[i]
   queueEvent(e)
 
-proc applyClip(ctx: BackendContext; state: DrawState): bool =
-  if not state.clipActive:
-    return false
-  let clipRect = scaledRect(state.clipRect)
-  ctx.beginMask(clipRect, [0.0'f32, 0.0'f32, 0.0'f32, 0.0'f32])
+proc sameClip(a, b: DrawState): bool =
+  a.clipActive == b.clipActive and (not a.clipActive or a.clipRect == b.clipRect)
+
+proc applyClip(ctx: BackendContext; state: DrawState) =
+  ## Open a mask for `state`'s clip (the caller pops it when the clip changes).
+  ctx.beginMask(scaledRect(state.clipRect), [0.0'f32, 0.0'f32, 0.0'f32, 0.0'f32])
   ctx.endMask()
-  true
 
 proc replayText(ctx: BackendContext; op: DrawOp) =
   let slot = getFontSlot(op.font)
   if slot.isNil or op.text.len == 0:
     return
 
-  let textBox = rect(0.0'f32, 0.0'f32, 1_000_000.0'f32, 1_000_000.0'f32)
-  let layout = typeset(
-    textBox,
-    [span(slot.uiFont, toFill(op.fg), op.text)],
-    hAlign = Left,
-    vAlign = Top,
-    minContent = false,
-    wrap = false,
-  )
+  let key = (op.font.int, op.text)
+  if key notin layoutCache:
+    if layoutCache.len > 20_000: layoutCache.clear()   # bound it; refills on use
+    let textBox = rect(0.0'f32, 0.0'f32, 1_000_000.0'f32, 1_000_000.0'f32)
+    layoutCache[key] = typeset(
+      textBox,
+      [span(slot.uiFont, toFill(op.fg), op.text)],   # (fill unused: replay colours)
+      hAlign = Left,
+      vAlign = Top,
+      minContent = false,
+      wrap = false,
+    )
+  let layout = layoutCache[key]
   let ext = layout.bounding
   if ext.w > 0 and ext.h > 0 and op.bg.a > 0'u8:
     ctx.drawRect(
@@ -327,8 +349,9 @@ proc replayImage(ctx: BackendContext; op: DrawOp) =
   let key = hash((op.image.int, op.src.x, op.src.y, op.src.w, op.src.h))
   if key notin ctx.entries():
     let cropped =
-      if op.src.x == 0 and op.src.y == 0 and
-         op.src.w == slot.image.width and op.src.h == slot.image.height:
+      if op.src.w <= 0 or op.src.h <= 0 or
+         (op.src.x == 0 and op.src.y == 0 and
+          op.src.w == slot.image.width and op.src.h == slot.image.height):
         slot.image
       else:
         try:
@@ -357,8 +380,14 @@ proc renderQueuedOps() =
   let ctx: BackendContext = renderer.ctx
   ctx.saveTransform()
   ctx.scale(ctx.pixelScale)
+  # A mask per op made every frame thousands of stencil passes (nearly every
+  # op is clipped to its pane): open one only where the clip changes.
+  var open = DrawState()
   for op in drawOps:
-    let hasClip = applyClip(ctx, op.state)
+    if not sameClip(op.state, open):
+      if open.clipActive: ctx.popMask()
+      if op.state.clipActive: applyClip(ctx, op.state)
+      open = op.state
     case op.kind
     of dopFillRect:
       ctx.drawRect(scaledRect(op.rect), toFigColor(op.fillColor))
@@ -384,8 +413,7 @@ proc renderQueuedOps() =
       replayText(ctx, op)
     of dopImage:
       replayImage(ctx, op)
-    if hasClip:
-      ctx.popMask()
+  if open.clipActive: ctx.popMask()
   ctx.restoreTransform()
   ctx.endFrame()
   renderer.endFrame()
@@ -393,12 +421,31 @@ proc renderQueuedOps() =
 
 proc figCreateWindow(layout: var ScreenLayout) =
   if not siwinInitialized:
-    renderer = newFigRenderer(atlasSize = 1024, backendState = SiwinRenderBackend())
-    appWindow = newSiwinWindow(
-      size = ivec2(layout.width.int32, layout.height.int32),
-      fullscreen = layout.fullScreen,
-      title = "uirelays",
-    )
+    # siwin takes the X11 WM_CLASS / Wayland app_id from the window's initial
+    # title, so open it under the program's own name (as the X11 driver sets
+    # WM_CLASS): docks match that to the .desktop entry's StartupWMClass.
+    # The app sets its real title right after.
+    let appName = block:
+      let n = getAppFilename().extractFilename.changeFileExt("")
+      if n.len > 0: n else: "uirelays"
+    # OpenGL needs the window (its context current) before the renderer, which
+    # queries GL limits as it starts; Vulkan creates the renderer first and
+    # hands it to the window (figdraw's own siwin examples do the same).
+    when UseVulkanBackend:
+      renderer = newFigRenderer(atlasSize = 1024, backendState = SiwinRenderBackend())
+      appWindow = newSiwinWindow(
+        renderer,
+        size = ivec2(layout.width.int32, layout.height.int32),
+        fullscreen = layout.fullScreen,
+        title = appName,
+      )
+    else:
+      appWindow = newSiwinWindow(
+        size = ivec2(layout.width.int32, layout.height.int32),
+        fullscreen = layout.fullScreen,
+        title = appName,
+      )
+      renderer = newFigRenderer(atlasSize = 1024, backendState = SiwinRenderBackend())
     useAutoScale = appWindow.configureUiScale()
     renderer.setupBackend(appWindow)
     appWindow.eventsHandler = WindowEventsHandler(
@@ -454,11 +501,18 @@ proc figCreateWindow(layout: var ScreenLayout) =
             last.clicks = if e.double: 2 else: 1
           eventQueue.addLast(last),
       onScroll: proc(e: siwin.ScrollEvent) =
-        queueEvent(input.Event(
-          kind: MouseWheelEvent,
-          x: e.deltaX.round().int,
-          y: e.delta.round().int,
-        )),
+        # siwin reports notches: 1 a wheel click, fractions from a touchpad.
+        # Count lines (3 a notch, the editor's wheel step) and carry what is
+        # left over, so a touchpad's small steps add up to one-line scrolls
+        # instead of each rounding to nothing. siwin's sign is positive =
+        # down (Wayland's axis value, X11's button 5); uirelays' is positive =
+        # up, so negate -- the compositor has already applied each device's
+        # natural-scrolling setting.
+        wheelAcc -= e.delta * 3
+        let lines = wheelAcc.int            # truncates toward 0
+        wheelAcc -= lines.float32
+        let dx = e.deltaX.round().int
+        if lines != 0 or dx != 0: queueScroll(lines, dx),
     )
     appWindow.firstStep()
     siwinInitialized = true
@@ -533,9 +587,13 @@ proc figMeasureText(f: screen.Font; text: string): TextExtent =
   let slot = getFontSlot(f)
   if slot.isNil or text.len == 0:
     return
-  let layout = slot.pixieFont.typeset(text)
-  let bounds = layout.layoutBounds()
+  let key = (f.int, text)
+  measureCache.withValue(key, hit):
+    return hit[]
+  if measureCache.len > 20_000: measureCache.clear()
+  let bounds = slot.pixieFont.typeset(text).layoutBounds()
   result = TextExtent(w: ceil(bounds.x).int, h: ceil(bounds.y).int)
+  measureCache[key] = result
 
 proc figDrawText(f: screen.Font; x, y: int; text: string;
                  fg, bg: screen.Color): TextExtent =
@@ -576,6 +634,13 @@ proc figLoadImage(path: string): screen.Image =
     screen.Image(images.len)
   except PixieError:
     screen.Image(0)
+
+proc figImageSize(img: screen.Image): tuple[w, h: int] =
+  ## Native pixel size -- the editor sizes inline images from it (without it,
+  ## they got a placeholder box and an empty source rect, so drew nothing).
+  let slot = getImageSlot(img)
+  if slot.isNil or slot.image.isNil: (0, 0)
+  else: (slot.image.width, slot.image.height)
 
 proc figFreeImage(img: screen.Image) =
   let idx = img.int - 1
@@ -685,6 +750,7 @@ proc initFigDrawSiwinDriver*() =
     loadImage: figLoadImage,
     freeImage: figFreeImage,
     drawImage: figDrawImage,
+    imageSize: figImageSize,
   )
   inputRelays = InputRelays(
     pollEvent: figPollEvent,
