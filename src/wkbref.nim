@@ -14,6 +14,7 @@
 ## so the index is built lazily and rebuilt when any root's newest file changes.
 
 import std/[os, strutils, tables, times, sets, hashes, algorithm, osproc]
+import wkbproc                # runCmd: a missing tool is exit 127, never a crash
 
 var
   gCorpusRoots*: seq[string]   ## dirs to index for prose (config; `~` ok). Empty
@@ -53,10 +54,12 @@ proc addKey(dst: var seq[string]; raw: string; requireYear: bool) =
     if not hasYear: return
   dst.add raw
 
-proc keyAtPoint*(line: string; col: int): string =
+proc keyAtPoint*(line: string; col: int; maxDist = int.high): string =
   ## The citekey under, or nearest to, column COL on LINE (for `M-x cite-context`
   ## on the citation at point), or "" if the line has no bibliography key.
-  ## Crossref labels (`@fig:`) are ignored.
+  ## Crossref labels (`@fig:`) are ignored. Keys farther than MAXDIST columns
+  ## away don't count (a Ctrl-click wants the citation it landed on, not the
+  ## nearest one anywhere on the line).
   var best = ""
   var bestDist = int.high
   var i = 0
@@ -65,10 +68,13 @@ proc keyAtPoint*(line: string; col: int): string =
       var k = i + 1
       while k < line.len and line[k] in keyChars: inc k
       let key = line[i+1 ..< k]
-      if key.len > 0 and ':' notin key:
+      # a ':' right after the key marks a pandoc-crossref label (@fig:one):
+      # keyChars excludes ':' so the parse stops at "fig" -- without this
+      # check the label's prefix would pose as a citekey
+      if key.len > 0 and (k >= line.len or line[k] != ':'):
         let d = if col >= i and col <= k: 0
                 elif col < i: i - col else: col - k
-        if d < bestDist: bestDist = d; best = key
+        if d < bestDist and d <= maxDist: bestDist = d; best = key
       i = k
     else: inc i
   best   # nearest valid key on the line (the user invoked on this citation)
@@ -368,7 +374,7 @@ proc citeNotes*(key: string): seq[string] =
   let sql = "ATTACH 'file:" & bbt & "?immutable=1' AS bbt;" &
     "SELECT DISTINCT n.note || '" & sep & "' FROM bbt.citekeys b " &
     "JOIN itemNotes n ON n.parentItemID = b.itemID WHERE b.citekey = '" & key & "';"
-  let (outp, code) = execCmdEx(quoteShell(sqlite) & " " &
+  let (outp, code) = runCmd(quoteShell(sqlite) & " " &
     quoteShell("file:" & zt & "?immutable=1") & " " & quoteShell(sql))
   if code != 0: return
   for chunk in outp.split(sep):
@@ -400,7 +406,7 @@ proc citePaper*(key: string): seq[tuple[path, preview: string]] =
     "JOIN itemAttachments ia ON ia.parentItemID = b.itemID " &
     "JOIN items i ON i.itemID = ia.itemID " &
     "WHERE ia.contentType = 'text/markdown' AND b.citekey = '" & key & "';"
-  let (outp, code) = execCmdEx(quoteShell(sqlite) & " " &
+  let (outp, code) = runCmd(quoteShell(sqlite) & " " &
     quoteShell("file:" & zt & "?immutable=1") & " " & quoteShell(sql))
   if code != 0: return
   let storageDir = zoteroDir() / "storage"
@@ -471,7 +477,7 @@ WHERE ck IS NOT NULL AND (lower(coalesce(ck,'')||' '||coalesce(authors,'')||' '|
     var w = ""
     for t in terms: w.add " AND lower(coalesce(ck,'')||' '||coalesce(authors,'')||' '||coalesce(title,'')||' '||coalesce(notetext,'')) LIKE " & sqlLit("%" & t & "%")
     w) & ") LIMIT " & $limit & ";"
-  let (outp, code) = execCmdEx(quoteShell(sqlite) & " " &
+  let (outp, code) = runCmd(quoteShell(sqlite) & " " &
     quoteShell("file:" & zt & "?immutable=1") & " " & quoteShell(sql))
   if code != 0: return
   for row in outp.split(rs):

@@ -17,6 +17,7 @@
 
 import std/[os, osproc, strutils, times, base64, re, sequtils, streams]
 import wkbcore
+import wkblayout         # expandLayout (backend-neutral layout directives)
 
 var gNotebookHtmlEmbedMax* = 0   ## embed images up to this many bytes (0 = all)
 
@@ -334,7 +335,8 @@ proc notebookHtmlExport*(app: var App) =
   var heads, options: seq[string]
   collectSetup(src, lines, heads, options)
   var running = 0
-  let body = applyExports(app, lines, running)
+  var usedLandscape = false   # landscape is a no-op for HTML; pagebreak -> CSS div
+  let body = expandLayout(applyExports(app, lines, running), ltHtml, usedLandscape)
 
   let tmp = getTempDir() / "wkb-notebook-html"
   createDir(tmp)

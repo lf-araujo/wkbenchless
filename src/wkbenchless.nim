@@ -21,7 +21,8 @@ import wkbdesktop
 import wkbpty
 import wkbctrl
 import wkbctlclient       # so `wkbenchless ctl <verb>` == the wkbctl client
-import std/[os, tables, strutils, math]
+import nimhost            # `wkbenchless nim-host`: the warm nimteractive session
+import std/[os, tables, strutils, math, sets]
 from std/times import epochTime   # blink pacing for the redraw gate
 
 const fontPath =
@@ -251,7 +252,10 @@ proc handleSearch(app: var App; e: Event) =
     case e.key
     of KeyEsc: app.endSearch()
     of KeyEnter:
-      if ShiftPressed in e.mods: searchPrev(app)
+      # Sublime's keys: Ctrl+Alt+Enter replaces all, Enter in the replace
+      # field replaces the current match, Shift+Enter steps back
+      if CtrlPressed in e.mods and AltPressed in e.mods: replaceAll(app)
+      elif ShiftPressed in e.mods: searchPrev(app)
       elif app.searchField == sfReplace: replaceCurrent(app)
       else: searchNext(app)
     of KeyTab:
@@ -259,21 +263,20 @@ proc handleSearch(app: var App; e: Event) =
     of KeyUp, KeyDown:
       browseSearchHistory(app, e.key == KeyUp)
     of KeyBackspace:
-      if app.searchField == sfReplace:
-        if app.searchReplace.len > 0: app.searchReplace.setLen(app.searchReplace.len - 1)
-      elif app.searchQuery.len > 0:
-        app.searchQuery.setLen(app.searchQuery.len - 1)
-        recomputeMatches(app); gotoCurrentMatch(app)
+      searchFieldBackspace(app)
+    of KeyV:
+      # paste into the active field; a trailing newline from a line copy
+      # would never match, so drop it
+      if CtrlPressed in e.mods or GuiPressed in e.mods:
+        let text = getClipboardText().strip(leading = false, chars = {'\n', '\r'})
+        if text.len > 0: searchFieldAdd(app, text)
     else: discard
   elif e.kind == TextInputEvent:
+    var typed = ""
     for ch in e.text:
       if ch == '\0': break
-      if app.searchMode == smReplace and app.searchField == sfReplace:
-        app.searchReplace.add ch
-      elif app.searchMode == smReplace and ch == '!':
-        replaceAll(app); return
-      else:
-        app.searchQuery.add ch; recomputeMatches(app); gotoCurrentMatch(app)
+      typed.add ch
+    if typed.len > 0: searchFieldAdd(app, typed)
 
 proc paletteAccept(app: var App) =
   # free-text prompts have no list to select from -- the query IS the
@@ -475,27 +478,29 @@ proc feedTerminalKey(t: var Pty; e: Event): bool =
       else: false
   else: false
 
-proc tabLabel(app: App; key: string): string =
-  ## Display text for a bottom-pane tab key (a terminal tab shows its label).
-  if key.startsWith("·term:"):
-    let idx = (try: parseInt(key["·term:".len .. ^1]) except: -1)
-    if idx >= 0 and idx < app.terminals.len: return app.terminals[idx].label
-  key
+proc chipText(t: TabInfo): string =
+  ## What a tab's chip says, the same for every kind of tab: its name, where it
+  ## runs when that is not here, and what it is doing unless it is just ready
+  ## (the dot's colour says that too, but not to everyone).
+  result = t.name
+  if t.host.len > 0: result.add " @" & t.host
+  if t.detail.len > 0: result.add " " & t.detail
+  elif t.state != tsReady: result.add " " & $t.state
 
-proc tabWidth(app: App; key: string; lineH: int): int =
-  (" " & tabLabel(app, key) & " ").len * (lineH div 2) + 4
+proc stateColor(t: TabInfo): Color =
+  ## The chip's state dot.
+  case t.state
+  of tsReady: color(80, 175, 90)
+  of tsRunning, tsQueued: color(225, 165, 40)
+  of tsStarting, tsReconnecting:
+    if t.detail == "lockout?": color(215, 70, 60) else: color(80, 145, 225)
+  of tsEnded: color(140, 140, 140)
 
-proc termLines(outbuf: string): seq[string] =
-  ## ANSI-strip the live buffer and drop the marker driver's own noise so a
-  ## session terminal shows only interactive I/O and real block output. Every
-  ## driver artefact -- the run call (`.nimacs_run(...)`), the markers
-  ## (`__NIMACS_BOR__`), and the ready ping and its echo (`paste0("NIMACSx",
-  ## "READY")`, split so the token never appears contiguously) -- carries
-  ## "nimacs", so a case-insensitive substring test catches them all. Returns
-  ## ALL lines; the caller windows them (with scrollback).
-  for ln in stripAnsi(outbuf).splitLines():
-    if "nimacs" in ln.toLowerAscii: continue
-    result.add ln
+proc dotSize(lineH: int): int = max(4, lineH div 3)
+
+proc chipWidth(app: App; t: TabInfo; lineH: int): int =
+  ## Width of a chip's body (state dot + text), without its [X].
+  4 + dotSize(lineH) + measureText(app.font, " " & chipText(t) & " ").w
 
 # --- hand-drawn toolbar icons ------------------------------------------------
 # The toolbar font is a monospace coding font (Hack/Consolas/Menlo) with no glyph
@@ -620,6 +625,8 @@ proc main() =
     let invoked = extractFilename(paramStr(0)).changeFileExt("")
     if params.len > 0 and params[0] == "edit-diff":   # Claude Code hook entry point
       quit(editDiff(params[1 .. ^1]))
+    if params.len > 0 and params[0] == "nim-host":    # warm `nimteractive` session
+      quit(nimHost())
     if params.len > 0 and params[0] == "install-desktop":   # icon + launcher (Linux)
       quit(installDesktop())
     if asCtl or invoked == "wkbctl":
@@ -654,7 +661,7 @@ proc main() =
     ed.setEmphasisFonts(boldFont, italicFont, boldItalicFont, captionFont)
 
   registerBuiltins()
-  var app = App(ed: createSynEdit(font), sess: createSynEdit(font),
+  var app = App(ed: createSynEdit(font),
                 objects: createSynEdit(font), help: createSynEdit(font),
                 curLang: "r", curSession: "default", focus: "editor",
                 font: font, bigFont: bigFont, fontSize: fontSize,
@@ -688,7 +695,6 @@ proc main() =
   app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
   app.curBuf = 0
   loadHistory(app)                       # snapshots + cross-session undo
-  app.sess.setText("session output\n")
 
   # `--goto N`: restore the cursor line after a recompile re-exec.
   for i in 1 .. paramCount() - 1:
@@ -951,7 +957,7 @@ proc main() =
       uiLineH = uiMetrics.lineHeight
       lineH = metrics.lineHeight
       app.font = font; app.bigFont = bigFont
-      app.ed.setFont(font); app.sess.setFont(font)
+      app.ed.setFont(font)
       app.objects.setFont(font); app.help.setFont(font)
       app.ed.bigFont = bigFont; applyEmphasisFonts(app.ed)
       for b in app.buffers.mitems:
@@ -1144,7 +1150,7 @@ proc main() =
           else:
             var cx = r.x + 4
             for k in app.tabKeys():
-              let lw = tabWidth(app, k, lineH)
+              let lw = chipWidth(app, tabInfo(app, k), lineH)
               let xw = lineH
               if e.x >= cx and e.x < cx + lw + xw:
                 if e.x >= cx + lw: closeTab(app, k)   # the chip's [x]
@@ -1199,7 +1205,7 @@ proc main() =
       if overDiff and e.kind in {MouseWheelEvent, MouseDownEvent}:
         app.diffPinned = true                 # touched: it stays until Esc/q
       if e.kind == MouseWheelEvent and overDiff:
-        app.diffScroll += e.y * 3
+        app.diffScroll += e.wheelLines
       let redFg = app.theme.ed.fg[TokenClass.Red]
       let greenFg = app.theme.ed.fg[TokenClass.Green]
       let removedBg = blend(bg, redFg, 22)
@@ -1251,9 +1257,16 @@ proc main() =
         let want = gReadingMargins.getOrDefault(ext, 0)
         app.ed.readingMargin = min(want, max(0, (editorRect.w - 240) div 2))  # keep >=240px of text
       let act = app.ed.draw(evFor("editor"), editorRect, focused = app.focus == "editor" and not overlay)
-      if act.kind == ctrlClick:              # Ctrl+click an org link -> open it
-        app.ed.gotoPos(act.pos)
-        openLink(app)
+      if act.kind == ctrlClick:              # Ctrl+click: an org link opens it,
+        app.ed.gotoPos(act.pos)              # a [cite:@key] jumps to its BibTeX
+        if linkAtCursor(app).len == 0:
+          let key = keyAtPoint(app.ed.getLineText(app.ed.currentLine),
+                               app.ed.currentCol, maxDist = 12)
+          if key.len > 0:
+            app.msg = citeGoto(app, key)
+          else:
+            openLink(app)                    # else the link behaviour (or its
+        else: openLink(app)                  # "no link at cursor" message)
       elif e.kind == MouseDownEvent and e.button == LeftButton and
            not overlay and app.focus == "editor" and app.ed.lang == langOrg and
            e.x >= editorRect.x and e.x < editorRect.x + editorRect.w and
@@ -1284,11 +1297,13 @@ proc main() =
         let active = k == curKey
         let chipBg = if active: app.theme.chipActiveBg else: app.theme.chipBg
         let chipFg = if active: app.theme.chipActiveFg else: app.theme.chipFg
-        let label = " " & tabLabel(app, k) & " "
-        let lw = tabWidth(app, k, lineH)
+        let t = tabInfo(app, k)
+        let lw = chipWidth(app, t, lineH)
         let xw = bh
+        let d = dotSize(lineH)
         fillRect(rect(cx, r.y, lw + xw, bh), chipBg)
-        discard drawText(app.font, cx + 2, r.y, label, chipFg, chipBg)
+        fillRect(rect(cx + 4, r.y + (bh - d) div 2, d, d), stateColor(t))
+        discard drawText(app.font, cx + 4 + d, r.y, " " & chipText(t) & " ", chipFg, chipBg)
         let xr = rect(cx + lw, r.y, xw, bh)   # per-tab [X] close button
         fillRect(xr, app.theme.closeBg)
         discard drawText(boldFont, xr.x + xw div 3, r.y, "X",
@@ -1325,8 +1340,9 @@ proc main() =
         elif e.kind == MouseUpEvent and selecting:
           selecting = false; selHas = selA != selB; copyNow = selHas
       if ap != nil and ap[].vt != nil:
-        # Standalone terminal: a full screen-grid emulator (cursor-addressed
-        # TUIs like claude render here). Colored cell runs + block cursor.
+        # Every tab -- REPL session, shell, agent -- is a screen-grid emulator
+        # (cursor-addressed TUIs like claude render here; a session's grid
+        # leaves out its run driver's lines). Colored cell runs + block cursor.
         let vt = ap[].vt
         if ap[].alive: setPtySize(ap[], rows, max(1, body.w div charW))
         if termRepaintFrames > 0:          # post-reload: repaint once sized
@@ -1344,12 +1360,12 @@ proc main() =
             let row = max(1, (lastMouse.y - body.y) div lineH + 1)
             let ev = if vt.mouseSgr: "\e[<" & $btn & ";" & $col & ";" & $row & "M"
                      else: "\e[M" & $chr(32 + btn) & $chr(32 + col) & $chr(32 + row)
-            for _ in 0 ..< 3 * abs(e.y): feed(ap[], ev)
+            for _ in 0 ..< abs(e.wheelLines): feed(ap[], ev)
           elif vt.inAlt:
             let arrow = if e.y > 0: "\e[A" else: "\e[B"
-            for _ in 0 ..< 3 * abs(e.y): feed(ap[], arrow)
+            for _ in 0 ..< abs(e.wheelLines): feed(ap[], arrow)
           else:
-            vt.scrollView(e.y * 3)
+            vt.scrollView(e.wheelLines)
         let atTail = vt.viewOffset == 0
         for ry in 0 ..< vt.rows:
           let vrow = vt.viewRow(ry)
@@ -1381,30 +1397,10 @@ proc main() =
           discard drawText(app.font, body.x + body.w - 7 * charW, body.y,
             "[+" & $vt.viewOffset & "]", app.theme.dimFg, app.theme.panelBg)
         if not ap[].alive:
+          let hint = if ap[].driverView: "[session ended -- its next run starts a fresh one]"
+                     else: "[process ended -- Esc-hide, reopen with M-x terminal]"
           discard drawText(app.font, body.x + 4, body.y + (vt.rows) * lineH,
-            "[process ended -- Esc-hide, reopen with M-x terminal]", app.theme.dimFg, sessBg)
-      elif ap != nil:
-        # REPL session: the ANSI-stripped, marker-filtered line-log + scrollback.
-        let all = termLines(ap[].outbuf)
-        if ap[].alive: setPtySize(ap[], rows, max(1, body.w div charW))
-        if e.kind == MouseWheelEvent and
-           lastMouse.x >= body.x and lastMouse.x < body.x + body.w and
-           lastMouse.y >= body.y and lastMouse.y < body.y + body.h:
-          app.termScroll += e.y * 3
-        let maxScroll = max(0, all.len - rows)
-        app.termScroll = max(0, min(app.termScroll, maxScroll))
-        let stop = all.len - app.termScroll     # exclusive; tail when scroll==0
-        let start = max(0, stop - rows)
-        var y = body.y
-        for i in start ..< stop:
-          discard drawText(app.font, body.x + 4, y, all[i], app.theme.termFg, sessBg)
-          visText.add all[i]
-          y += lineH
-        if app.termScroll > 0:
-          discard drawText(app.font, body.x + body.w - 6 * charW, body.y,
-            "[+" & $app.termScroll & "]", app.theme.dimFg, sessBg)
-        if not ap[].alive:
-          discard drawText(app.font, body.x + 4, y, "[session ended]", app.theme.dimFg, sessBg)
+            hint, app.theme.dimFg, sessBg)
       else:
         discard drawText(app.font, body.x + 4, body.y,
           "no session yet -- run a src block (C-c C-c) or M-x terminal",

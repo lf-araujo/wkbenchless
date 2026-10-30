@@ -15,15 +15,19 @@
 import std/[strutils, os]
 import wkbvterm
 export wkbvterm
-from uirelays import Color
+from uirelays import Color, color
 
 when defined(windows): import std/winlean   # Handle, WINBOOL, ...
 else:                   import std/posix     # Pid, fork, ...
 
 type
   Pty* = object
-    outbuf*: string       ## line-log (REPL sessions; ANSI-stripped at draw)
-    vt*: VTerm            ## screen-grid emulator (standalone terminal); nil for sessions
+    outbuf*: string       ## raw output log (REPL sessions; terminals keep none)
+    vt*: VTerm            ## screen-grid emulator the pane draws (terminals and sessions)
+    driverView*: bool     ## REPL session: `vt` shows the output minus the run
+                          ## driver's own lines (see `showOutput`)
+    viewLine: string      ## driverView: the output line not yet ended
+    viewShown: int        ## driverView: bytes of `viewLine` already on screen
     tapping*: bool        ## an async session job is in flight: `drain` also feeds `tap`
     tap*: string          ## raw output since the in-flight job started (wkbsession)
     tmuxTarget*: string   ## non-empty: the child is `tmux -CC` and this names the
@@ -460,26 +464,65 @@ proc readAvail(t: var Pty; b: var array[8192, char]): int =
     return m
   if n < 0: -1 else: 0
 
+proc stripAnsi*(s: string): string
+
+proc driverLine(s: string): bool =
+  ## A session driver's own output: the run call's echo, the BEGIN/END markers,
+  ## the ready ping. Every one carries "nimacs" (split in the driver's source,
+  ## so a definition's echo can't match by accident).
+  "nimacs" in s.toLowerAscii
+
+proc showOutput(t: var Pty; chunk: string) =
+  ## Put new output on the screen grid. A terminal gets it as is; a REPL
+  ## session (`driverView`) has its driver lines dropped here, before the
+  ## emulator, one line at a time: the unfinished line is shown as it grows
+  ## (prompts, progress bars) unless it already looks like a driver line, and
+  ## erased if it turns out to be one when it ends -- a prompt the echo of a
+  ## run call is typed after goes with it.
+  if t.vt == nil: return
+  if not t.driverView:
+    t.vt.write(chunk); return
+  var start = 0
+  for i, c in chunk:
+    if c != '\n': continue
+    t.viewLine.add chunk[start .. i]
+    start = i + 1
+    if not driverLine(t.viewLine):
+      t.vt.write(t.viewLine[t.viewShown .. ^1])
+    elif t.viewShown > 0:
+      let w = stripAnsi(t.viewLine[0 ..< t.viewShown]).len
+      t.vt.write("\r\e[2K")
+      for _ in 0 ..< max(0, w - 1) div max(1, t.vt.cols):
+        t.vt.write("\e[A\e[2K")                # rows it wrapped onto
+    t.viewLine.setLen(0); t.viewShown = 0
+  t.viewLine.add chunk[start .. ^1]
+  if t.viewLine.len > t.viewShown and not driverLine(t.viewLine):
+    t.vt.write(t.viewLine[t.viewShown .. ^1])
+    t.viewShown = t.viewLine.len
+  if t.viewShown > 16_384 and t.viewShown == t.viewLine.len:
+    t.viewLine.setLen(0); t.viewShown = 0      # a \r progress bar that never ends
+
+proc recordOutput(t: var Pty; chunk: string) =
+  ## A session's output also goes to `outbuf`; a terminal's only to the grid.
+  if t.vt == nil or t.driverView: t.outbuf.add chunk
+  showOutput(t, chunk)
+
 proc drain*(t: var Pty): int =
-  ## Non-blocking: consume everything available. A screen-grid terminal (vt !=
-  ## nil) feeds the emulator; a REPL session appends to the line-log `outbuf`.
-  ## Returns the number of bytes consumed this call, or -1 if the child is gone.
+  ## Non-blocking: consume everything available into the screen grid (and a
+  ## session's `outbuf`). Returns the number of bytes consumed this call, or -1
+  ## if the child is gone.
   var b {.noinit.}: array[8192, char]
   var total = 0
   while true:
     let n = readAvail(t, b)
     if n > 0:
       total += n
-      if t.vt != nil:
-        var chunk = newString(n)
-        copyMem(addr chunk[0], addr b[0], n)
-        t.vt.write(chunk)
-      else:
-        for i in 0 ..< n: t.outbuf.add b[i]
-        # Whoever drains (the live pane's pump or the job poller), the in-flight
-        # async job sees every byte -- a single reader, no race for the output.
-        if t.tapping:
-          for i in 0 ..< n: t.tap.add b[i]
+      var chunk = newString(n)
+      copyMem(addr chunk[0], addr b[0], n)
+      recordOutput(t, chunk)
+      # Whoever drains (the live pane's pump or the job poller), the in-flight
+      # async job sees every byte -- a single reader, no race for the output.
+      if t.tapping: t.tap.add chunk
     elif n < 0: return -1                        # dead
     else: break                                 # nothing more right now
   total
@@ -488,7 +531,7 @@ proc pump*(t: var Pty): bool =
   ## Drain the pty; returns true if any new output was consumed (so the pane may
   ## have changed on screen and the caller should redraw).
   let n = drain(t)
-  if t.vt == nil and t.outbuf.len > 200_000:
+  if t.outbuf.len > 200_000:
     t.outbuf = t.outbuf[^120_000 .. ^1]
   n > 0
 
@@ -502,9 +545,10 @@ proc pollOnce*(t: var Pty; acc: var string; mirror = true): int =
   var b {.noinit.}: array[8192, char]
   let n = readAvail(t, b)
   if n > 0:
-    for i in 0 ..< n:
-      acc.add b[i]
-      if mirror: t.outbuf.add b[i]
+    var chunk = newString(n)
+    copyMem(addr chunk[0], addr b[0], n)
+    acc.add chunk
+    if mirror: recordOutput(t, chunk)
     return n
   elif n < 0: return -1
   else: return 0
@@ -532,6 +576,18 @@ proc startPty*(cmd, dir: string; fg, bg: Color): Pty =
   ## backed by a screen grid.
   result = spawnPty(["/bin/sh", "-c", cmd], dir)
   if result.alive: result.vt = newVTerm(24, 80, fg, bg)
+
+proc useSessionView*(t: var Pty) =
+  ## Give a REPL session's Pty the same screen grid a terminal has, shown
+  ## through the driver-line filter. The pane sets the theme colours and the
+  ## size when it first draws it (`setVtColors`, `setPtySize`).
+  if t.vt == nil:
+    t.vt = newVTerm(24, 80, color(220, 220, 220), color(0, 0, 0))
+  t.driverView = true
+
+proc snapToTail*(t: Pty) =
+  ## Scroll the pane's view back to the live output.
+  if t.vt != nil: t.vt.viewOffset = 0
 
 proc nudgeRepaint*(t: Pty) =
   ## Ask a full-screen TUI to repaint (used after a hot reload). POSIX SIGWINCHes;

@@ -16,7 +16,7 @@
 ## 127.0.0.1:<port> and sends "token\n<request>". The token keeps another local
 ## user from port-scanning the socket (parity with the old unix-socket perms).
 
-import std/[sequtils, strutils, tables, net, nativesockets, os, random, times]
+import std/[sequtils, strutils, tables, sets, net, nativesockets, os, random, times]
 when defined(posix): import std/posix
 import wkbcore
 
@@ -65,14 +65,19 @@ proc bibValue(entry, field: string): string =
         return strip(entry[j ..< k])
     i = i + field.len
 
-proc bibPathsFromBuffer(app: App): seq[string] =
+proc bibPathsFromBuffer(app: App; includeMaster = true): seq[string] =
+  ## The buffer's own `#+bibliography:' paths, plus the `$WKB_BIB' master list
+  ## unless the caller wants strictly project-local bibs (`bib --insert`:
+  ## the global Zotero export is machine-generated and gets overwritten, so a
+  ## key inserted from it can vanish underneath the citation).
   for i in 0 ..< app.ed.getLineCount():
     let ln = strip(app.ed.getLineText(i))
     if ln.toLowerAscii.startsWith("#+bibliography:"):
       let p = strip(ln[ln.find(':') + 1 .. ^1])
       if p.len > 0 and p notin result: result.add p
-  let master = getEnv("WKB_BIB")
-  if master.len > 0 and master notin result: result.add master
+  if includeMaster:
+    let master = getEnv("WKB_BIB")
+    if master.len > 0 and master notin result: result.add master
 
 proc resolveBib(p: string): string =
   let q = expandTilde(p)
@@ -80,6 +85,21 @@ proc resolveBib(p: string): string =
     let alt = getCurrentDir() / q
     if fileExists(alt): return alt
   q
+
+iterator bibEntries*(txt: string): tuple[key, entry: string] =
+  ## Every `@type{key, ...}' entry in a .bib file, sliced to the next `@'
+  ## (the format's own separator -- a brace-depth walk would be equivalent
+  ## for well-formed files, and this is what the search already trusted).
+  var i = txt.find('@')
+  while i >= 0:
+    let nxt = txt.find('@', i + 1)
+    let entry = if nxt < 0: txt[i .. ^1] else: txt[i ..< nxt]
+    let lb = entry.find('{')
+    let comma = entry.find(',')
+    if lb >= 0 and comma > lb:
+      let key = strip(entry[lb + 1 ..< comma])
+      if key.len > 0: yield (key, entry)
+    i = nxt
 
 proc bibSearch(app: App; query: string; limit = 30): string =
   let terms = query.toLowerAscii.splitWhitespace()
@@ -91,34 +111,85 @@ proc bibSearch(app: App; query: string; limit = 30): string =
     var txt = ""
     try: txt = readFile(path)
     except CatchableError: continue
-    var i = txt.find('@')
-    while i >= 0:
-      let nxt = txt.find('@', i + 1)
-      let entry = if nxt < 0: txt[i .. ^1] else: txt[i ..< nxt]
-      let lb = entry.find('{')
-      let comma = entry.find(',')
-      if lb >= 0 and comma > lb:
-        let key = strip(entry[lb + 1 ..< comma])
-        if key.len > 0 and key notin seen:
-          let author = bibValue(entry, "author")
-          let title  = bibValue(entry, "title")
-          let year   = bibValue(entry, "year")
-          let hay = (key & " " & author & " " & title & " " & year).toLowerAscii
-          var ok = true
-          for t in terms:
-            if not hay.contains(t): ok = false; break
-          if ok:
-            seen.add key
-            let a1 = (if author.len > 0: author.split(" and ")[0] else: "?").multiReplace(("{", ""), ("}", ""))
-            let yr = if year.len > 0: year else: "n.d."
-            hits.add key & " — " & a1 & " (" & yr & "). " & title.multiReplace(("{", ""), ("}", ""))
-      i = nxt
+    for (key, entry) in bibEntries(txt):
+      if key in seen: continue
+      let author = bibValue(entry, "author")
+      let title  = bibValue(entry, "title")
+      let year   = bibValue(entry, "year")
+      let hay = (key & " " & author & " " & title & " " & year).toLowerAscii
+      var ok = true
+      for t in terms:
+        if not hay.contains(t): ok = false; break
+      if ok:
+        seen.add key
+        let a1 = (if author.len > 0: author.split(" and ")[0] else: "?").multiReplace(("{", ""), ("}", ""))
+        let yr = if year.len > 0: year else: "n.d."
+        hits.add key & " — " & a1 & " (" & yr & "). " & title.multiReplace(("{", ""), ("}", ""))
   if hits.len == 0: return "(no bib entry matches: " & query & ")"
   if hits.len > limit:
     hits = hits[0 ..< limit] & @["… (" & $hits.len & " matches; showing " & $limit & ")"]
   hits.join("\n")
 
-proc citeGoto(app: var App; key: string): string =
+proc bibInsert*(app: var App; query: string): string =
+  ## Drop `[cite:@key]' at the cursor for the query's best match -- LOCAL
+  ## project bibs only (see bibPathsFromBuffer): a key that lives in the
+  ## project's own .bib is stable, one lifted from the overwritten-global
+  ## export is not. One match inserts; several come back as a list to narrow;
+  ## a selection is replaced by the citation.
+  let terms = query.toLowerAscii.splitWhitespace()
+  var seen: seq[string]
+  var hits: seq[string]
+  for raw in bibPathsFromBuffer(app, includeMaster = false):
+    let path = resolveBib(raw)
+    if not fileExists(path): continue
+    let txt = try: readFile(path) except CatchableError: ""
+    for (key, entry) in bibEntries(txt):
+      if key in seen: continue
+      let hay = (key & " " & bibValue(entry, "author") & " " &
+                 bibValue(entry, "title") & " " & bibValue(entry, "year")).toLowerAscii
+      var ok = true
+      for t in terms:
+        if not hay.contains(t): ok = false; break
+      if ok: seen.add key
+  if seen.len == 0: return "(no local bib entry matches: " & query & ")"
+  if seen.len > 1:
+    return $seen.len & " local matches -- narrow the query:\n" & seen.join("\n")
+  app.ed.insertText("[cite:@" & seen[0] & "]")
+  "ok: inserted [cite:@" & seen[0] & "]"
+
+proc bibExtract*(app: var App; outPath = ""): string =
+  ## Write the buffer's cited entries to a slim project `refs.bib' (or
+  ## OUTPATH), in first-citation order. Sources are ALL the bibs the buffer
+  ## knows -- local `#+bibliography:' files AND the global master: extract
+  ## only copies, so an overwritten global is harmless here. Keys cited but
+  ## found nowhere are reported, never invented.
+  var keys: seq[string]
+  for k in extractKeys(app.ed.fullText()):
+    if k notin keys: keys.add k
+  if keys.len == 0: return "(no citations in this buffer)"
+  var entries: seq[string]
+  var found = initHashSet[string]()
+  for raw in bibPathsFromBuffer(app):
+    let path = resolveBib(raw)
+    if not fileExists(path): continue
+    let txt = try: readFile(path) except CatchableError: ""
+    for (k, e) in bibEntries(txt):
+      if k in found or k notin keys: continue
+      found.incl k
+      entries.add e.strip
+  let dst = if outPath.len > 0: outPath
+            elif app.filePath.len > 0: app.filePath.parentDir / "refs.bib"
+            else: getCurrentDir() / "refs.bib"
+  var blob = ""
+  for e in entries: blob.add e & "\n\n"
+  writeFile(dst, blob)
+  let missing = keys.filterIt(it notin found)
+  result = "ok: wrote " & $entries.len & " of " & $keys.len &
+           " cited entries to " & dst
+  if missing.len > 0:
+    result.add "\n(not in any bib: " & missing.join(", ") & ")"
+
+proc citeGoto*(app: var App; key: string): string =
   ## Open the .bib that defines `@type{key,` and move the cursor to that entry.
   let needle = "{" & key.toLowerAscii & ","        # matches @article{key,
   for raw in bibPathsFromBuffer(app):
@@ -153,7 +224,9 @@ proc handleImpl(app: var App; req: string): string =
     # Queued, never blocking: the client polls `status <id>` for the output, so
     # the editor (and this socket) stay live while the code runs.
     let id = submitEval(app, lang, sess, code)
-    if id == 0: return "(no session for '" & lang & "')"
+    if id == 0:
+      return (if gSessionRefusal.len > 0: "error: " & gSessionRefusal
+              else: "(no session for '" & lang & "')")
     result = "queued: job " & $id
   of "command":
     if parts.len > 1 and gCommands.hasKey(parts[1]):
@@ -171,6 +244,12 @@ proc handleImpl(app: var App; req: string): string =
     if cmd.len == 0: return "error: open-terminal needs a command"
     openTerminal(app, cmd)
     result = "ok: opened terminal: " & cmd
+  of "remote-login":                     # remote-login\t<host>: the master login tab;
+    # its sessions reattach automatically once the master is up
+    let host = if parts.len > 1: strutils.strip(parts[1]) else: ""
+    if host.len == 0: return "usage: remote-login <host>"
+    remoteLoginCmd(app, host)
+    result = "ok: " & app.msg
   of "diff":                             # diff\t<title>[\t<path>]: body = OLD \x1e NEW
     let title = if parts.len > 1: parts[1] else: "diff"
     let path = if parts.len > 2: parts[2] else: ""   # the file it is about (cursor jump)
@@ -261,6 +340,8 @@ proc handleImpl(app: var App; req: string): string =
     result = jobStatus(app, id)
   of "jobs":                             # every tracked job, one line each
     result = jobsSummary(app)
+  of "tabs":                             # every bottom-pane tab: kind, host, state
+    result = tabsSummary(app)
   of "interrupt":                        # interrupt\t<id>: Ctrl-C a running job / drop a queued one
     let id = if parts.len > 1: (try: parseInt(parts[1]) except: 0) else: 0
     result = interruptJob(app, id)
@@ -303,7 +384,15 @@ proc handleImpl(app: var App; req: string): string =
     if result.len == 0: result = "(no src blocks)"
   of "bib":                                # search BibTeX for citation keys
     let q = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)
-    if q.len == 0: return "(usage: bib <query>)"
+    if q.len == 0: return "(usage: bib <query> | bib --insert <query> | bib --extract [path])"
+    if parts.len > 1 and parts[1] == "--insert":
+      # drop [cite:@key] at the cursor -- LOCAL project bibs only
+      let query = if parts.len > 2: parts[2] else: strip(body)
+      if query.len == 0: return "(usage: bib --insert <query>)"
+      return bibInsert(app, query)
+    if parts.len > 1 and parts[1] == "--extract":
+      # the buffer's cited entries -> a slim refs.bib (local + global sources)
+      return bibExtract(app, if parts.len > 2: parts[2] else: "")
     result = bibSearch(app, q)
   of "cite-goto":                          # jump to a BibTeX @key entry (opens the .bib)
     let key = if parts.len > 1 and parts[1].len > 0: parts[1] else: strip(body)

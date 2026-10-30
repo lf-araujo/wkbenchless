@@ -14,6 +14,12 @@ requires "pixie == 6.1.0"   # inline image decode (was vendored; never edited lo
 requires "checksums"        # sha1/md5, extracted out of the stdlib (std/sha1, std/md5 deprecated)
 # uirelays is vendored in src/vendor/uirelays (patched for inline images), so
 # there is no external UI dependency to fetch -- config.nims puts it on the path.
+when defined(linux):
+  # Linux renders on the GPU by default (config.nims): FigDraw into a siwin
+  # window. Both need Nim >= 2.4; built with an older Nim, wkbenchless falls
+  # back to the CPU X11 driver and these go unused.
+  requires "figdraw >= 0.46.4"
+  requires "siwin >= 1.1.2"
 
 task test, "Build and run the deterministic test suite (src/test_*.nim)":
   # src/tester.nim discovers every self-contained test and fails the task if
@@ -24,7 +30,9 @@ task run, "Build and run wkbenchless":
   exec "nim c -r -o:wkbenchless src/wkbenchless.nim"
 
 task release, "Build an optimized, stripped single binary to share":
-  # Runs standalone -- only needs system libX11/libXft at runtime, no compiler.
+  # Runs standalone, no compiler needed. On Linux it loads the system OpenGL
+  # (Mesa) and Wayland or X11 libraries at runtime (libX11/libXft for a
+  # -d:wkbX11 build).
   putEnv("WKB_NO_USER_CONFIG", "1")   # ship the default config, not ~/.config's
   exec "nim c -d:release -d:danger --opt:size --passL:-s -o:wkbenchless src/wkbenchless.nim"
 

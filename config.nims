@@ -1,4 +1,4 @@
-import std/os
+import std/[os, strutils]
 
 ## Put `src` on the module path so extensions (in ../extensions) can
 ## `import wkbcore` by name.
@@ -9,18 +9,48 @@ switch("path", "src")
 ## `import uirelays`, `import uirelays/…`, and `import widgets/…` resolve to it.
 switch("path", "src/vendor/uirelays")
 
+## Linux renders on the GPU by default: FigDraw (OpenGL) drawing into a siwin
+## window -- native Wayland on a Wayland session, X11 otherwise -- with text
+## through pixie, so no HarfBuzz library is needed at runtime. Needs
+## `nimble install figdraw siwin`, and Nim >= 2.4: 2.2.x rejects siwin's
+## exception effects. With an older Nim, or `-d:wkbX11`, the build uses the CPU
+## X11 + Xft driver instead (also the fallback if the GPU build misbehaves).
+## macOS and Windows keep their native drivers.
+when defined(linux) and not defined(wkbX11) and
+     not defined(feature.uirelays.figDrawWindy) and not defined(figDrawWindy):
+  when (NimMajor, NimMinor) >= (2, 4):
+    switch("define", "feature.uirelays.figDrawSiwin")
+    switch("define", "figdrawTextBackend=pixie")
+  else:
+    echo "wkbenchless: Nim " & NimVersion & " < 2.4 -- building the CPU X11 " &
+         "driver; use Nim >= 2.4 for GPU rendering (or -d:wkbX11 to silence this)"
+
 ## nim-tuntox (the sibling checkout of github.com/lf-araujo/nim-tuntox) is the
 ## in-process Tox tunnel behind extensions/tox_collab.nim. A released build
 ## would `requires "nim-tuntox"` instead of this path. Its toxcore binding
 ## asks pkg-config for c-toxcore at compile time, so make the usual installs
 ## visible even when the shell that launched the editor didn't export
 ## PKG_CONFIG_PATH (C-c r's rebuild re-execs the compiler in-process).
-switch("path", "../nim-tuntox/src")
+## The checkout is found beside this one, or at $WKB_TUNTOX_DIR -- set that for
+## `nimble install`, which builds in a copy under ~/.nimble/buildtemp where the
+## sibling path does not exist.
+let tuntoxDir =
+  if getEnv("WKB_TUNTOX_DIR").len > 0: getEnv("WKB_TUNTOX_DIR")
+  else: thisDir() & "/../nim-tuntox"
+switch("path", tuntoxDir & "/src")
 block:
   if getEnv("PKG_CONFIG_PATH").len == 0:
     for pc in [getHomeDir() & ".local/lib64/pkgconfig",
                getHomeDir() & ".local/lib/pkgconfig",
-               getCurrentDir() & "/../nim-tuntox/vendor/lib64/pkgconfig"]:
+               tuntoxDir & "/vendor/lib64/pkgconfig"]:
+      # skip a .pc whose prefix is not on this machine (the vendored
+      # toxcore is a Linux build; on macOS brew's pkg-config finds toxcore)
+      let tox = pc & "/toxcore.pc"
+      if fileExists(tox):
+        var prefix = ""
+        for line in readFile(tox).splitLines:
+          if line.startsWith("prefix="): prefix = line[7 .. ^1]
+        if prefix.len > 0 and not dirExists(prefix): continue
       if dirExists(pc):
         putEnv("PKG_CONFIG_PATH", pc)
         break

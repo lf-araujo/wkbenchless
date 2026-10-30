@@ -12,6 +12,7 @@
 ## revisions; comments are emitted best-effort as Word comments.
 
 import wkbcore
+import wkblayout            # shared backend-neutral layout directive expander
 import std/[osproc, os, strutils, times, tables, sequtils, sets, base64, algorithm]
 import zippy/ziparchives   # vendored pure-Nim zip: embed the .org into the docx
 
@@ -31,14 +32,14 @@ var
   gBib* = ""          ## bibliography path; else #+bibliography: header, else sibling .bib
   gCsl* = ""          ## CSL citation-style file (optional)
   gRefDoc* = ""       ## Word reference-doc / template (optional)
-  gMediaDir* = ""     ## extra dir (relative to the org, e.g. "graphs") to search
-                      ## for figure images, on top of the org's own directory
+  gMediaDir* = "graphs"  ## extra dir (relative to the org) searched for figure images
+                      ## on export, on top of the org's own directory; imports also
+                      ## extract their media here, so figures live in one place
   gEmbedSource* = true ## embed the canonical .org inside the exported docx (round-trip)
 
 proc trackAuthor(): string =
   if gAuthor.len > 0: return gAuthor
-  let (o, c) = execCmdEx("git config user.name")
-  result = (if c == 0: o.strip() else: "")
+  result = gitUserName()             # "" without git (e.g. a bare Windows box)
   if result.len == 0: result = "wkbenchless"
 
 proc nowDate(): string = now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
@@ -48,7 +49,7 @@ proc pandoc*(args: seq[string]): tuple[code: int; output: string] =
   if exe.len == 0: return (127, "pandoc not on PATH")
   var cmd = quoteShell(exe)
   for a in args: cmd.add " " & quoteShell(a)
-  let r = execCmdEx(cmd)
+  let r = runCmd(cmd)
   (r.exitCode, r.output)
 
 # ---- CriticMarkup <-> pandoc span conversion -------------------------------
@@ -110,6 +111,113 @@ proc spanKeepEdges(t: string): string =
   result.add t[a ..< b]
   for _ in 1 .. t.len - b: result.add "&#32;"
 
+proc fillEmptyTableRow*(ln: string): string =
+  ## An all-empty org table row (`| | |', a spacer between row groups) comes
+  ## out of pandoc's org -> markdown as a whitespace-only line, which the
+  ## markdown reader takes as the blank line ending the table: the caption no
+  ## longer attaches, and each later caption slides onto the next table
+  ## ("Undefined cross-reference: tbl:..."). A no-break space in the first cell
+  ## keeps the row non-blank and is invisible in Word. Rule lines (`|---+--|')
+  ## and rows with any content pass through unchanged.
+  let s = ln.strip()
+  if s.len < 2 or s[0] != '|' or s[^1] != '|': return ln
+  for c in s:
+    if c notin {'|', ' ', '\t'}: return ln
+  let lead = ln.len - ln.strip(trailing = false).len
+  ln[0 ..< lead] & "|   " & s[s.find('|', 1) .. ^1]
+
+const ruleMark* = "OTDRULEMARK"
+  ## Sentinel put in the first cell of the row below an interior table rule;
+  ## drawRuleRows turns it into a top border in the docx and removes it.
+
+proc isTableLine(ln: string): bool = ln.strip().startsWith("|")
+proc isRuleLine(ln: string): bool = ln.strip().startsWith("|-")
+
+proc prepTables*(lines: seq[string]): seq[string] =
+  ## Org tables, before pandoc: pandoc keeps only a table's top rule and header
+  ## separator and silently drops interior `|---+---|' rules. Mark the row below
+  ## each interior rule with ruleMark (drawn as a dark top border by
+  ## drawRuleRows), and give all-empty spacer rows a no-break space
+  ## (fillEmptyTableRow). Lines inside #+begin_/#+end_ blocks are left alone.
+  var inBlock = false
+  var i = 0
+  while i < lines.len:
+    let low = lines[i].strip().toLowerAscii
+    if low.startsWith("#+begin_"): inBlock = true
+    elif low.startsWith("#+end_"): inBlock = false
+    if inBlock or not isTableLine(lines[i]):
+      result.add lines[i]; inc i; continue
+    var j = i                                       # [i, j) is one table
+    while j < lines.len and isTableLine(lines[j]): inc j
+    var rows = 0
+    var headerSep = false
+    var pending = false
+    for k in i ..< j:
+      let ln = lines[k]
+      if isRuleLine(ln):
+        var dataAfter = false
+        for m in k + 1 ..< j:
+          if not isRuleLine(lines[m]): (dataAfter = true; break)
+        if rows == 0 or not dataAfter: result.add ln       # top / bottom rule
+        elif not headerSep: (headerSep = true; result.add ln)
+        else: pending = true                               # interior: drop, mark next row
+      else:
+        inc rows
+        if pending:
+          let p = ln.find('|')
+          result.add ln[0 .. p] & " " & ruleMark & ln[p + 1 .. ^1]
+          pending = false
+        else:
+          result.add fillEmptyTableRow(ln)
+    i = j
+
+proc drawRuleRows*(docx: string): bool =
+  ## Give every table row carrying ruleMark (see prepTables) a dark top border
+  ## on each of its cells, and remove the sentinel. Rewrites the package in
+  ## memory with zippy, [Content_Types].xml first, like resolveDoneComments.
+  let docxAbs = absolutePath(docx)
+  if not fileExists(docxAbs): return false
+  var pkg: OrderedTable[string, string]
+  try:
+    let reader = openZipArchive(docxAbs)
+    defer: reader.close()
+    for path in reader.walkFiles: pkg[path] = reader.extractFile(path)
+  except CatchableError: return false
+  var xml = pkg.getOrDefault("word/document.xml", "")
+  if ruleMark notin xml: return false
+  const border = "<w:tcBorders><w:top w:val=\"single\" w:sz=\"12\" w:space=\"0\" w:color=\"000000\"/></w:tcBorders>"
+  const markRun = "<w:r><w:t xml:space=\"preserve\">" & ruleMark & "</w:t></w:r>"
+  const spaceRun = "<w:r><w:t xml:space=\"preserve\"> </w:t></w:r>"
+  var res = ""
+  var i = 0
+  while true:
+    let m = xml.find(ruleMark, i)
+    if m < 0: res.add xml[i .. ^1]; break
+    var rs = xml.rfind("<w:tr>", 0, m)
+    let rs2 = xml.rfind("<w:tr ", 0, m)
+    if rs2 > rs: rs = rs2
+    let re = xml.find("</w:tr>", m)
+    if rs < i or re < 0:                     # not inside a row: just drop the mark
+      res.add xml[i ..< m]; i = m + ruleMark.len; continue
+    var row = xml[rs ..< re]
+    row = row.replace(markRun & spaceRun, "").replace(markRun, "")
+             .replace(ruleMark & " ", "").replace(ruleMark, "")
+    row = row.replace("<w:tcPr />", "<w:tcPr>" & border & "</w:tcPr>")
+             .replace("<w:tcPr/>", "<w:tcPr>" & border & "</w:tcPr>")
+             .replace("</w:tcPr>", border & "</w:tcPr>")   # non-empty tcPr
+             .replace(border & border, border)              # (the two rules above)
+             .replace("<w:tc><w:p", "<w:tc><w:tcPr>" & border & "</w:tcPr><w:p")
+    res.add xml[i ..< rs]; res.add row
+    i = re
+  pkg["word/document.xml"] = res
+  let ct = pkg.getOrDefault("[Content_Types].xml", "")
+  pkg.del("[Content_Types].xml")             # zippy: last inserted = first entry
+  pkg["[Content_Types].xml"] = ct
+  try:
+    writeFile(docxAbs, createZipArchive(pkg))
+    true
+  except CatchableError: false
+
 proc criticToSpans*(md: string; doneIds: var seq[int]): string =
   ## CriticMarkup tokens -> pandoc markdown spans (for md -> docx). Uses the same
   ## split scanner style as wkbcore.applyCriticMarkup.
@@ -124,8 +232,10 @@ proc criticToSpans*(md: string; doneIds: var seq[int]): string =
     ## markdown as a `[text][label]' reference link: the comment-start is
     ## swallowed and Word gets an orphan commentRangeEnd/commentReference with
     ## no comment (desktop Word repairs it; Word Online refuses to open the
-    ## file). An empty span `[]{}' separates them and renders as nothing.
-    if r.len > 0 and r[^1] == ']': r.add "[]{}"
+    ## file). An empty raw `<span></span>' separates them and renders as
+    ## nothing. (Not `[]{}': that is itself read as `[ref][]', a collapsed
+    ## reference link, and pandoc prints the brackets -- "[Figure 3][]".)
+    if r.len > 0 and r[^1] == ']': r.add "<span></span>"
   proc closeOf(o, c: char): int =
     var q = i + 3
     while q + 2 < md.len:
@@ -1125,7 +1235,7 @@ proc extractOrgSourceProperty(docx: string): string =
   gEmbeddedTruncated = false
   let unzipExe = findExe("unzip")
   if unzipExe.len == 0 or not fileExists(docx): return ""
-  let (content, cc) = execCmdEx(quoteShell(unzipExe) & " -p " &
+  let (content, cc) = runCmd(quoteShell(unzipExe) & " -p " &
                                 quoteShell(docx) & " docProps/custom.xml")
   if cc != 0: return ""
   proc prop(name: string): tuple[found: bool; value: string] =
@@ -1162,12 +1272,12 @@ proc extractOrgSource*(docx: string): string =
   ## save). Port of otd--extract-org-source-customxml; normalizes CRLF/CR to LF.
   let unzipExe = findExe("unzip")
   if unzipExe.len == 0 or not fileExists(docx): return ""
-  let (listing, lc) = execCmdEx(quoteShell(unzipExe) & " -Z1 " & quoteShell(docx))
+  let (listing, lc) = runCmd(quoteShell(unzipExe) & " -Z1 " & quoteShell(docx))
   if lc != 0: return ""
   for raw in listing.splitLines():
     let entry = raw.strip()
     if entry.startsWith("customXml/") and entry.endsWith(".xml") and entry.count('/') == 1:
-      let (content, cc) = execCmdEx(quoteShell(unzipExe) & " -p " &
+      let (content, cc) = runCmd(quoteShell(unzipExe) & " -p " &
                                     quoteShell(docx) & " " & quoteShell(entry))
       if cc != 0: continue
       let mi = content.find("<orgTrackedSource")
@@ -1409,6 +1519,23 @@ proc normalizeForMatch*(text: string): string =
     else:
       result.add c; prevWs = false
   result = result.strip()
+
+proc restoreSuppRefs*(s: string): string =
+  ## `[[#supp-tbl-x][eTable 1]]' -> `[cite:@tbl:x]': undo the supplement
+  ## relabelling (wkblayout.expandSupplement) so a returned docx's links to
+  ## supplement items read as the canonical's cross-refs again.
+  result = ""
+  var i = 0
+  while i < s.len:
+    if startsWithAt(s, i, "[[#supp-fig-") or startsWithAt(s, i, "[[#supp-tbl-"):
+      let mid = s.find("][", i)
+      let e = s.find("]]", i)
+      if mid > 0 and e > mid:
+        result.add "[cite:@" & s[i + 8 .. i + 10] & ":" & s[i + 12 ..< mid] & "]"
+        i = e + 2
+        continue
+    result.add s[i]
+    inc i
 
 proc restoreCiteForms*(s: string): string =
   ## `[[cite/t:@key]]' / `[[cite:@key]]' -> `[cite:@key]'; `[@key]' ->
@@ -2384,6 +2511,46 @@ proc rebaseOnCanonical*(canon, tracked: string; xrefMap: XrefMap): string =
        result[0 ..< p].endsWith(x) and not insideAnnotation(result, p - x.len):
       result = result[0 ..< p - x.len] & "{==" & x & "==}" & result[p .. ^1]
 
+proc wordDiffMarkup*(a, b: string): string =
+  ## Fresh CriticMarkup for the word-level changes from A to B: a replaced
+  ## run becomes {~~old~>new~~}, a pure removal {--old--}, a pure addition
+  ## {++new++}; unchanged runs pass through plain. Whitespace-only changes
+  ## are kept unmarked (they are not worth a human's review).
+  result = newStringOfCap(max(a.len, b.len))
+  let segs = tokenDiff(a, b)
+  var i = 0
+  while i < segs.len:
+    if segs[i].kind == '=':
+      result.add segs[i].text; inc i; continue
+    var del, ins: string
+    while i < segs.len and segs[i].kind in {'-', '+'}:
+      if segs[i].kind == '-': del.add segs[i].text else: ins.add segs[i].text
+      inc i
+    if del.strip().len == 0 and ins.strip().len == 0:
+      result.add ins                     # whitespace shuffle: keep, unmarked
+    elif del.len > 0 and ins.len > 0:
+      result.add "{~~" & del & "~>" & ins & "~~}"
+    elif del.len > 0:
+      result.add "{--" & del & "--}"
+    else:
+      result.add "{++" & ins & "++}"
+
+proc markAcceptedEdits*(canon, repl: string): string =
+  ## Edits that arrived ACCEPTED are carried but not marked: Word's accept
+  ## strips the w:ins/w:del runs, so the reviewer's paragraph is plain text
+  ## that differs from the canonical. Resolve both sides the way Word's
+  ## accept resolved them (the canonical's own older marks accepted away,
+  ## comments dropped -- the caller re-appends those), and wrap what changed
+  ## in fresh CriticMarkup for the canonical author to review with the critic
+  ## commands. REPL is returned untouched when the clean prose agrees modulo
+  ## whitespace (the change was only in comments or marks -- and a dropped
+  ## comment leaves its trailing space behind, which is not a change worth
+  ## marking, and returning REPL keeps the comment).
+  let a = applyCriticMarkup(canon, accept = true)
+  let b = applyCriticMarkup(repl, accept = true)
+  if a.strip() == b.strip(): return repl
+  wordDiffMarkup(a, b)
+
 proc mergeContent*(canonical, tracked, baseDir: string; report: var string): string =
   ## Walk CANONICAL preserving its full structure (headers, property drawers,
   ## export/src blocks, tables -- all verbatim); replace a body paragraph with
@@ -2474,6 +2641,11 @@ proc mergeContent*(canonical, tracked, baseDir: string; report: var string): str
         var repl = rebaseOnCanonical(u.text,
                      substituteAuthorYear(substituteCiteKeys(ti2, num2key), ay), xrefMap)
         if repl.len == 0: repl = backsubFor(ti2, u.text)
+        if not hasEdits(ti) and "{==" notin ti and repl.len > 0:
+          # accepted edits: Word's accept strips the w:ins/w:del runs, so the
+          # change arrives as plain text. Mark what the acceptance changed
+          # with fresh CriticMarkup so the canonical author can review it.
+          repl = markAcceptedEdits(u.text, repl)
         # the canonical paragraph's own comments must survive the replacement
         for c in criticComments(u.text):
           if not repl.contains(c): repl.add " " & c
@@ -2685,8 +2857,13 @@ proc otdImport(app: var App) =
   if docx.len == 0: (app.msg = "add a  #+OTD_DOCX: /path.docx  line first"; return)
   if not fileExists(docx): (app.msg = "not found: " & docx; return)
   let md = getTempDir() / "otd-import.md"
+  # Extract embedded docx images into the org's graphs/ dir (one figure home),
+  # not pandoc's default <docname>-media/ beside the file.
+  let mediaBase = (if app.filePath.len > 0: parentDir(absolutePath(app.filePath))
+                   else: parentDir(absolutePath(docx))) / gMediaDir
   var (code, outp) = pandoc(@["-f", "docx", "-t", "markdown", "--wrap=none",
-                              "--track-changes=all", docx, "-o", md])
+                              "--track-changes=all",
+                              "--extract-media=" & mediaBase, docx, "-o", md])
   if code != 0: (app.msg = "pandoc docx->md failed: " & outp.strip(); return)
   var toks: seq[string]
   let stashed = stash(spansToCritic(readFile(md)), toks)
@@ -2695,14 +2872,19 @@ proc otdImport(app: var App) =
   (code, outp) = pandoc(@["-f", "markdown", "-t", "org", "--wrap=none", md, "-o", orgOut])
   if code != 0: (app.msg = "pandoc md->org failed: " & outp.strip(); return)
   criticTokensToOrg(toks)          # their text skipped md->org: convert it too
-  let tracked = unstash(readFile(orgOut), toks)
+  let tracked = restoreSuppRefs(unstash(readFile(orgOut), toks))
   # Merge base: the org embedded in the docx when it survived the round-trip
   # (customXml, or the docProps fallback Word/OneDrive leave intact), else the
   # open buffer -- the canonical the user is working from.
   var canonical = extractOrgSource(docx)
   var base = "embedded org source"
-  if canonical.len == 0 and app.filePath.len > 0 and app.filePath.endsWith(".org"):
-    canonical = app.ed.fullText()
+  # A buffer holding only #+headers (e.g. just the #+OTD_DOCX: line) is a first
+  # import, not a merge base: merging onto it would drop every tracked paragraph.
+  let buf = app.ed.fullText()
+  let bufHasBody = bodyParas(parseUnits(buf)).len > 0
+  if canonical.len == 0 and bufHasBody and app.filePath.len > 0 and
+     app.filePath.endsWith(".org"):
+    canonical = buf
     base = "the open buffer" &
            (if gEmbeddedTruncated: " (the docx's embedded source was truncated by Word)" else: "")
   if canonical.len > 0:
@@ -2713,7 +2895,11 @@ proc otdImport(app: var App) =
     app.msg = "otd: imported " & extractFilename(docx) & " onto " & base &
               " -- " & report
   else:
-    app.ed.setText("#+OTD_DOCX: " & docx & "\n\n" & tracked.strip())
+    # Keep the buffer's own headers (#+TITLE, #+OTD_DOCX, ...) above the import.
+    var head = if bufHasBody: "" else: buf.strip()
+    if bufHasBody or orgHeaders(app, "OTD_DOCX").len == 0:
+      head = ("#+OTD_DOCX: " & docx & "\n" & head).strip()
+    app.ed.setText(head & "\n\n" & tracked.strip())
     app.ed.markChanged()
     app.msg = "otd: imported " & extractFilename(docx) & " (tracked changes as CriticMarkup)"
 
@@ -2725,10 +2911,14 @@ proc otdExport(app: var App) =
   # Feed pandoc the org with the OTD header dropped and the #+AFFIL/#+AUTHOR_LIST/
   # #+AUTHOR_GROUP headers replaced (once, in place) by a generated author block.
   let authors = authorBlock(app)
+  var raw: seq[string]
+  for i in 0 ..< app.ed.getLineCount(): raw.add app.ed.getLineText(i)
+  # Layout directives first (#+LANDSCAPE:/#+PAGEBREAK:/#+TITLEBLOCK:/#+SUPPLEMENT:):
+  # #+TITLEBLOCK reads the #+AUTHOR_LIST names, which the substitution below removes.
+  var usedLandscape = false
   var lines: seq[string]
   var authorsDone = false
-  for i in 0 ..< app.ed.getLineCount():
-    let ln = app.ed.getLineText(i)
+  for ln in expandLayout(raw, ltDocx, usedLandscape):
     let low = strutils.strip(ln).toLowerAscii
     if low.startsWith("#+otd_docx:"): continue
     if low.startsWith("#+affil:") or low.startsWith("#+author_list:") or
@@ -2737,8 +2927,9 @@ proc otdExport(app: var App) =
       authorsDone = true
       continue
     lines.add ln
+  let laid = lines
   var toks: seq[string]
-  let orgStashed = stash(hoistCriticEmphasis(lines.join("\n")), toks)
+  let orgStashed = stash(hoistCriticEmphasis(prepTables(laid).join("\n")), toks)
   let orgTmp = getTempDir() / "otd-export.org"
   writeFile(orgTmp, orgStashed)
   let md = getTempDir() / "otd-export.md"
@@ -2794,6 +2985,7 @@ proc otdExport(app: var App) =
   # the reference doc's running head / page numbers, which pandoc otherwise leaves
   # only on the final section.
   if refdoc.len > 0: discard propagateSectionChrome(docx)
+  discard drawRuleRows(docx)                 # interior org table rules -> row borders
   # Embed the canonical org so re-import can recover cite keys / cross-refs / headers.
   let embedded = gEmbedSource and embedOrgSource(docx, app.ed.fullText())
   if doneIds.len > 0: discard resolveDoneComments(docx, doneIds)

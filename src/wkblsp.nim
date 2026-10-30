@@ -62,9 +62,14 @@ proc startLsp*(command, rootUri: string; initOptions: JsonNode = nil): LspClient
   # Run via a shell so a snap (whose /snap/bin entry is a symlink to
   # /usr/bin/snap) resolves correctly -- findExe would collapse it to
   # /usr/bin/snap and drop the app name, breaking the launch.
+  # Windows has no /bin/sh (and no snaps): start the server directly off PATH.
   var p: Process
   try:
-    p = startProcess("/bin/sh", args = ["-c", command], options = {poStdErrToStdOut})
+    when defined(windows):
+      p = startProcess(parts[0], args = parts[1 .. ^1],
+                       options = {poUsePath, poStdErrToStdOut})
+    else:
+      p = startProcess("/bin/sh", args = ["-c", command], options = {poStdErrToStdOut})
   except OSError:
     return nil
   result = LspClient(process: p, nextId: 0, initialized: false,

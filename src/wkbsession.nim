@@ -2,8 +2,8 @@
 ## The driver brackets each block's output with markers whose literals are split
 ## (paste0 / adjacent quoted strings) so they never appear in the driver's own
 ## echo and desync the reader. The session runs on the SAME thread-free PTY
-## primitive the in-pane terminal uses -- one spawn path, and `session.pty.outbuf`
-## already holds a live log we can surface as a terminal later.
+## primitive the in-pane terminal uses -- one spawn path and one screen grid;
+## the grid just leaves out the driver's own lines (`useSessionView`).
 
 import std/[os, tempfiles, strutils, times]
 import wkbpty
@@ -190,6 +190,7 @@ proc startSession*(spec: ReplSpec): Session =
   ## Any run queued on it meanwhile just waits (`startNext` checks `phase`).
   var pty = spawnPty(spec.argv, dir = spec.cwd, env = spec.env)
   if not pty.alive: return nil
+  pty.useSessionView()
   if spec.tmuxName.len > 0:
     pty.tmuxTarget = spec.tmuxName
     pty.tmuxCommand("refresh-client -C 250,50")   # wide pane: no wrapping
@@ -202,8 +203,8 @@ proc startSession*(spec: ReplSpec): Session =
   result.pty.feed(spec.prime)
   result.pty.feed(spec.ready)                    # sync past banner + prime echo
   # mirror=false: the banner, the multi-line prime definition, and the REPL's
-  # continuation prompts must NOT land in the terminal (python's def spans many
-  # lines that don't carry the "nimacs" token the display filter keys on).
+  # continuation prompts must NOT land in the pane (python's def spans many
+  # lines that don't carry the "nimacs" token the driver-line filter keys on).
   # Must actually check for the marker: an interpreter that never starts (R
   # missing on a remote host, a qsub login that silently dropped back to a
   # plain shell, ...) leaves this PTY sitting at some other prompt forever --

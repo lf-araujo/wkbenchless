@@ -189,4 +189,4 @@ proc configure*(app: var App) =
   addHook("startup", proc(a: var App) =
     a.msg = "wkbenchless ready -- config loaded")
   addHook("after-babel", proc(a: var App) =
-    a.sess.appendOutput("-- (after-babel hook) --\n"))
+    a.msg.add " -- " & $a.lastBlockOutput.len & " bytes of output")

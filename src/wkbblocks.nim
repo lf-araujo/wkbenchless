@@ -10,6 +10,7 @@
 
 import std/[strutils, tables, osproc, os, tempfiles, sets, algorithm, sequtils]
 import checksums/md5          # std/md5 is deprecated (moves out of stdlib)
+import wkbproc                # runCmd: a missing tool is exit 127, never a crash
 
 type
   BlockInfo* = object
@@ -237,7 +238,7 @@ proc rSymbols*(bodies: seq[string]; err: var string): seq[SymInfo] =
     writeFile(f, b)
     files.add quoteShell(f)
   writeFile(dir / "infer.R", inferScript)
-  let (outp, code) = execCmdEx("Rscript --vanilla " & quoteShell(dir / "infer.R") & " " &
+  let (outp, code) = runCmd("Rscript --vanilla " & quoteShell(dir / "infer.R") & " " &
                                files.join(" "))
   if code != 0:
     err = "Rscript failed: " & outp.strip()

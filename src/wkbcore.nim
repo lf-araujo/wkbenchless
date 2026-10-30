@@ -11,20 +11,46 @@ import wkbsession
 import wkblsp                    # pure std/json LSP client -- portable, no GTK
 import wkbref                    # reference context: prose/notes/paper by citekey
 import wkbblocks                 # src blocks as a dependency graph (hashes, :depends)
+import wkbproc                   # runCmd: a missing tool is exit 127, never a crash
 import std/[tables, strutils, os, osproc, algorithm, times, sets, sequtils,
            json]
 import checksums/sha1         # std/sha1 is deprecated (moves out of stdlib)
 when defined(posix): import std/posix
 
-export uirelays, synedit, wkbsession, wkblsp, wkbref, wkbblocks   # config sees Event/SynEdit/ReplSpec/LspClient/gCorpusRoots/...
+export uirelays, synedit, wkbsession, wkblsp, wkbref, wkbblocks, wkbproc   # config sees Event/SynEdit/ReplSpec/LspClient/gCorpusRoots/...
   # uirelays + `synedit` above come from the vendored tree in src/vendor/uirelays
 
 type
+  TabKind* = enum
+    ## What a bottom-pane tab runs. Every kind is drawn the same way (a screen
+    ## grid, one chip in the tab bar); the kind only says what is behind it.
+    tkShell = "shell"                    ## a terminal: bash, an ssh login, ...
+                                         ## (first: the default for a Terminal)
+    tkAgent = "agent"                    ## a terminal running a coding agent (claude)
+    tkRepl = "repl"                      ## a babel session (marker driver, jobs)
+  TabState* = enum
+    tsStarting = "starting"              ## spawning, logging in, priming
+    tsReady = "ready"
+    tsRunning = "running"                ## a job is in flight
+    tsQueued = "queued"                  ## jobs wait, none running yet
+    tsReconnecting = "reconnecting"      ## remote: the link is down, watch retries
+    tsEnded = "ended"                    ## the process is gone
+  TabInfo* = object
+    ## One tab, whatever runs in it: what the chip shows and `ctl tabs` lists.
+    key*: string                         ## the `tabKeys` key
+    name*: string                        ## "r/default", "bash", "claude"
+    kind*: TabKind
+    host*: string                        ## "" = local
+    state*: TabState
+    detail*: string                      ## "job 7 +2", "retry 12s", "lockout?"
+
   Terminal* = object
     pty*: Pty                            ## the live PTY (host pumps/renders it)
     label*: string                       ## tab label ("bash", "claude", ...)
     cmd*: string                         ## the shell command it runs
     started*: bool                       ## host has spawned the PTY at least once
+    kind*: TabKind                       ## tkShell or tkAgent
+    host*: string                        ## remote host it logs in to ("" = local)
 
   JobKind* = enum jkBlock, jkEval, jkCacheLoad, jkFetch
   AppJob* = object
@@ -45,7 +71,7 @@ type
     applied*: bool                        ## results written back (or given up)
 
   App* = object
-    ed*, sess*, objects*, help*: SynEdit
+    ed*, objects*, help*: SynEdit
     sessions*: Table[string, Session]     ## key: langId & "/" & sessionName
     jobs*: seq[AppJob]                    ## async runs: in flight + recent history
     lastJobIds*: seq[int]                 ## ids queued by the last babel command
@@ -112,7 +138,6 @@ type
     sessionHidden*: bool                  ## bottom panel hidden (x on the tab bar)
     terminals*: seq[Terminal]             ## standalone terminals (bash, claude, ...), one tab each
     termActive*: int                      ## index into `terminals` shown now, -1 if none
-    termScroll*: int                      ## bottom-pane scrollback: lines up from tail
     reloadPending*: bool                  ## recompile done -> host snapshots + re-execs
     reloadBin*, reloadFile*: string       ## the freshly built binary + file to reopen
     reloadLine*: int                      ## cursor line to restore
@@ -187,6 +212,9 @@ var
   gExtraPaths*: seq[string]               ## dirs to prepend to PATH (config; ~ ok)
   gLoadLoginPath* = true                  ## seed PATH from the login shell at startup
   gClaudeCmd* = "claude --continue || claude"  ## command the `claude` action runs (config)
+  gAgentCmds* = @["claude", "codex", "aider", "gemini", "opencode"]
+                                           ## a terminal whose command starts with one
+                                           ## of these is an agent tab (config)
   gClaudeDiffHooks* = true                 ## inject --settings diff-on-edit hooks when
                                            ## launching claude, so its file edits pop into
                                            ## this editor's diff pane (config; set false off)
@@ -267,15 +295,16 @@ proc setupExecPath*() =
     let e = (if d.startsWith("~"): expandTilde(d) else: d)
     if e.len > 0 and e notin parts: parts.add e
   for p in gExtraPaths: addDir(p)
-  if gLoadLoginPath:
+  if gLoadLoginPath and not defined(windows):   # (no login shell to ask there)
     let sh = getEnv("SHELL", "/bin/bash")
     try:
-      let (outp, code) = execCmdEx(sh & " -lc 'printf %s \"$PATH\"'")
+      let (outp, code) = runCmd(sh & " -lc 'printf %s \"$PATH\"'")
       if code == 0:
         for p in outp.strip.split(':'): addDir(p)
     except CatchableError: discard
-  for p in getEnv("PATH").split(':'): addDir(p)
-  if parts.len > 0: putEnv("PATH", parts.join(":"))
+  # PathSep, not ':' -- Windows separates with ';' and every C:\ path has a ':'.
+  for p in getEnv("PATH").split(PathSep): addDir(p)
+  if parts.len > 0: putEnv("PATH", parts.join($PathSep))
 
 # -- themes: a base16 palette -> full editor + chrome theme ------------------
 proc rgb*(hex: int): Color =
@@ -360,7 +389,7 @@ proc applyTheme*(app: var App; idx: int) =
   template paint(e: untyped) =
     e.theme = t.ed
     e.srcBlockBg = t.srcBlockBg
-  paint(app.ed); paint(app.sess); paint(app.objects); paint(app.help)
+  paint(app.ed); paint(app.objects); paint(app.help)
   for b in app.buffers.mitems: paint(b.ed)
   app.msg = "theme: " & t.name
 
@@ -410,6 +439,30 @@ proc sshControlPath*(): string =
   ## marker sessions, so a password host is authenticated ONCE.
   getHomeDir() / ".ssh" / "wkb-cm-%C"
 
+proc sshKeepAliveOpts(): seq[string] =
+  ## On every master-carrying invocation: keep the connection honest across
+  ## laptop sleep (server-alive probes), and fail a black-holed network in 15s
+  ## instead of hanging the session for minutes.
+  @["-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=6",
+    "-o", "ConnectTimeout=15"]
+
+type SshHostState* = object
+  ## Per-host reconnect bookkeeping, ONE clock shared by every session and ctl
+  ## caller in this process: repeated ssh attempts on a dead host are exactly
+  ## what a fail2ban-style daemon extends a ban for.
+  fails*: int
+  nextTry*: float             ## epoch seconds: no probe before this
+  lastFail*: float
+  blocked*: bool              ## pre-banner close seen: only an explicit login retries
+
+var
+  gSshRetry*: Table[string, SshHostState]
+  gSshWatch*: HashSet[string] ## hosts with dead sessions: probe + auto-reattach
+  gSshProbing*: Table[string, float]  ## host -> probe launch time (in flight)
+  gSshNextWatch: float        ## rate limit for the watch poll
+  gSessionRefusal*: string    ## why the last remote getSession refused (ctl eval)
+  gSshPersistLogin* = "yes"   ## ControlPersist for the explicit remote-login master
+
 proc tmuxSessionName*(sessName: string; base: ReplSpec): string =
   ## "wkb-<session>-<interpreter>", tmux-safe (no ':' or '.'): the same name on
   ## every reconnect is what lets `new-session -A` find the running REPL.
@@ -429,7 +482,7 @@ proc remoteSpec(base: ReplSpec; host: string; dir = ""; meth = "";
   let ctrl = @["ssh", "-tt",
                "-o", "ControlPath=" & sshControlPath(),
                "-o", "ControlMaster=auto",
-               "-o", "ControlPersist=" & gSshPersist, host]
+               "-o", "ControlPersist=" & gSshPersist] & sshKeepAliveOpts() & @[host]
   var remote: seq[string]
   if base.env.len > 0:
     remote.add "env"
@@ -496,15 +549,32 @@ proc specFor*(base: ReplSpec; name: string; dir = ""): ReplSpec =
   if bar < 0: remoteSpec(base, target, dir, tmuxName = tn)
   else: remoteSpec(base, target[0 ..< bar], dir, target[bar + 1 .. ^1], tn)
 
+proc sshMasterUp(host: string): bool    # fwd: the ssh reconnect machinery, below
+proc sshRefusal*(host: string): string   # fwd
+
 proc getSession*(app: var App; lang, name: string; dir = ""): Session =
   ## A session named "name@host" runs on `host` over ssh (remote REPL, in `dir`
   ## if given); a plain name runs locally. `dir` is used only when creating.
+  gSessionRefusal = ""
   let key = lang.toLowerAscii & "/" & name
   if app.sessions.hasKey(key) and app.sessions[key] != nil:
     if app.sessions[key].pty.alive or app.sessions[key].busy:
       return app.sessions[key]       # (a dead one with runs left fails them first)
     app.sessions.del(key)            # its REPL exited: start a fresh one
   if not gRepls.hasKey(lang.toLowerAscii): return nil
+  if '@' in name:
+    # No blind polling: without a live master, refuse fast and clearly
+    # instead of opening a fresh ssh attempt on every eval / block run
+    # (fail2ban-style daemons ban for exactly that). The watch loop probes
+    # the host with exponential backoff and reattaches the sessions once a
+    # master is up; M-x remote-login <host> does it right now.
+    let host = name[name.find('@') + 1 .. ^1]
+    if not sshMasterUp(host):
+      gSessionRefusal = sshRefusal(host)
+      app.msg = "remote: " & gSessionRefusal
+      gSshWatch.incl host
+      return nil
+    gSshRetry.del host               # a working master clears the clock
   var spec = specFor(gRepls[lang.toLowerAscii], name, dir)
   if '@' notin name:
     # Local REPLs start where org-babel starts them: in `:dir` if given (relative
@@ -678,6 +748,8 @@ proc autoRevertActive*(app: var App): bool =
   app.ed.markSaved()
   app.ed.gotoPos(min(pos, app.ed.len))
   app.activeDiskMtime = t
+  takeSnapshot(app)                       # an external edit (agent/formatter/git) is a
+                                          # moment worth remembering -> into file history
   app.msg = "reverted " & extractFilename(app.filePath) & " (disk changed)"
   result = true
 
@@ -1517,8 +1589,9 @@ proc replaceCurrent*(app: var App) =
   if app.searchIdx < 0 or app.searchIdx >= app.searchMatches.len:
     app.msg = "no match"; return
   let p = app.searchMatches[app.searchIdx]
-  app.ed.selectRange(p, app.searchMatchEnds[app.searchIdx] - 1)
-  app.ed.deleteSelection()
+  if app.searchMatchEnds[app.searchIdx] > p:       # zero-width regex match: insert only
+    app.ed.selectRange(p, app.searchMatchEnds[app.searchIdx] - 1)
+    app.ed.deleteSelection()
   app.ed.gotoPos(p)
   app.ed.insertText(app.searchReplace)
   app.ed.markChanged()
@@ -1526,19 +1599,44 @@ proc replaceCurrent*(app: var App) =
   app.gotoCurrentMatch()
 
 proc replaceAll*(app: var App) =
+  ## Replace every match in one pass, last to first so the earlier offsets
+  ## stay valid. (Rescanning after each edit looped forever whenever the
+  ## replacement itself contained the needle, e.g. "a" -> "aa".)
   if app.searchQuery.len == 0: return
-  var n = 0
-  while app.searchMatches.len > 0:
-    let p = app.searchMatches[0]
-    app.ed.selectRange(p, app.searchMatchEnds[0] - 1)
-    app.ed.deleteSelection()
-    app.ed.gotoPos(p)
+  app.recomputeMatches()
+  let starts = app.searchMatches
+  let ends = app.searchMatchEnds
+  if starts.len == 0: app.msg = "no matches"; return
+  for k in countdown(starts.high, 0):
+    if ends[k] > starts[k]:
+      app.ed.selectRange(starts[k], ends[k] - 1)
+      app.ed.deleteSelection()
+    app.ed.gotoPos(starts[k])
     app.ed.insertText(app.searchReplace)
-    inc n
-    app.recomputeMatches()
   app.ed.markChanged()
-  app.msg = "replaced " & $n
+  app.msg = "replaced " & $starts.len
   app.endSearch()
+
+proc searchFieldAdd*(app: var App; text: string) =
+  ## Typed or pasted text goes to whichever panel field is active -- both
+  ## rows are always shown, so the field decides, not how the panel opened.
+  if app.searchField == sfReplace:
+    app.searchReplace.add text
+  else:
+    app.searchQuery.add text
+    recomputeMatches(app); gotoCurrentMatch(app)
+
+proc searchFieldBackspace*(app: var App) =
+  ## Delete the last character (whole UTF-8 sequence) of the active field.
+  proc dropLast(s: var string) =
+    var n = s.len
+    while n > 0 and (s[n - 1].ord and 0xC0) == 0x80: dec n   # continuation bytes
+    s.setLen max(n - 1, 0)
+  if app.searchField == sfReplace:
+    app.searchReplace.dropLast()
+  elif app.searchQuery.len > 0:
+    app.searchQuery.dropLast()
+    recomputeMatches(app); gotoCurrentMatch(app)
 
 proc findAllMatches*(app: var App) =
   ## The find panel's [Find All]: every match is already marker-highlighted
@@ -1732,10 +1830,10 @@ proc renderLatexFragment(inner, header, outPng: string): bool =
     "\\usepackage{amsmath,amssymb,amsfonts}\n" & header &
     "\\pagestyle{empty}\n\\begin{document}\n\\[\n" & inner &
     "\n\\]\n\\end{document}\n")
-  let (_, c1) = execCmdEx("latex -interaction=nonstopmode -halt-on-error " &
+  let (_, c1) = runCmd("latex -interaction=nonstopmode -halt-on-error " &
                           quoteShell(tex), workingDir = tmp)
   if c1 != 0: return false
-  let (_, c2) = execCmdEx("dvipng -q -T tight -D " & $gLatexDpi &
+  let (_, c2) = runCmd("dvipng -q -T tight -D " & $gLatexDpi &
                           " -bg White -o " & quoteShell(outPng) & " " &
                           quoteShell(tmp / "frag.dvi"), workingDir = tmp)
   result = c2 == 0 and fileExists(outPng)
@@ -2082,7 +2180,7 @@ proc gitUserName*(): string =
   ## human-readable identity: collab divergence tags and dag reviewer IDs
   ## fall back to it so "some ID" is there without any setup.
   try:
-    let (o, c) = execCmdEx("git config user.name")
+    let (o, c) = runCmd("git config user.name")
     if c == 0: return o.strip()
   except CatchableError: discard
   ""
@@ -2163,7 +2261,7 @@ proc diffTokenize*(s: string): seq[string] =
     result.add s[i ..< j]
     i = j
 
-proc tokenDiff(a, b: string): seq[tuple[text: string; kind: char]] =
+proc tokenDiff*(a, b: string): seq[tuple[text: string; kind: char]] =
   ## Word-level LCS of two texts, merged into runs of equal / removed / added.
   let x = diffTokenize(a)
   let y = diffTokenize(b)
@@ -2681,22 +2779,85 @@ proc currentTabKey*(app: App): string =
   if app.termActive >= 0: terminalTabKey(app.termActive)
   else: app.curLang.toLowerAscii & "/" & app.curSession
 
+proc displayHost*(target: string): string =
+  ## "user@host|method" -> "host": the part of an ssh target worth a chip.
+  result = target
+  let bar = result.find('|')
+  if bar >= 0: result.setLen(bar)
+  let at = result.rfind('@')
+  if at >= 0: result = result[at + 1 .. ^1]
+
+proc tabInfo*(app: App; key: string): TabInfo =
+  ## The one description of a tab -- session, shell or agent -- that the tab
+  ## bar draws and `ctl tabs` lists.
+  result.key = key
+  if key.startsWith("·term:"):
+    let idx = (try: parseInt(key["·term:".len .. ^1]) except: -1)
+    if idx < 0 or idx >= app.terminals.len:
+      result.name = key; result.state = tsEnded; return
+    let t = app.terminals[idx]
+    result.name = t.label; result.kind = t.kind; result.host = t.host
+    result.state = if not t.started: tsStarting
+                   elif t.pty.alive: tsReady
+                   else: tsEnded
+    return
+  result.kind = tkRepl
+  result.name = key
+  let at = key.find('@')
+  let target = if at >= 0: key[at + 1 .. ^1] else: ""
+  if at >= 0:
+    result.name = key[0 ..< at]; result.host = displayHost(target)
+  let s = app.sessions.getOrDefault(key)
+  if target.len > 0 and target in gSshWatch:
+    # The link is down: blocked (possible lockout), backing off until the
+    # next auto-retry, or waiting for a login to bring the master up.
+    result.state = tsReconnecting
+    let st = gSshRetry.getOrDefault(target)
+    if st.blocked: result.detail = "lockout?"
+    elif epochTime() < st.nextTry: result.detail = "retry " & $int(st.nextTry - epochTime()) & "s"
+  elif s == nil or (not s.pty.alive and not s.busy):
+    result.state = tsEnded
+  elif s.phase notin {spReady, spFailed}:
+    result.state = tsStarting
+  elif s.job != nil:
+    result.state = tsRunning
+    result.detail = "job " & $s.job.id & (if s.queue.len > 0: " +" & $s.queue.len else: "")
+  elif s.queue.len > 0:
+    result.state = tsQueued
+    result.detail = $s.queue.len & " queued"
+  else:
+    result.state = tsReady
+
+proc tabsSummary*(app: App): string =
+  ## `ctl tabs`: one line per tab -- key, kind, where, state, detail -- in
+  ## tab-bar order, the current one marked with '*'.
+  let cur = app.currentTabKey()
+  var lines: seq[string]
+  for k in app.tabKeys():
+    let t = tabInfo(app, k)
+    lines.add (if k == cur: "* " else: "  ") & t.key & "\t" & t.name & "\t" & $t.kind &
+              "\t" & (if t.host.len > 0: t.host else: "local") & "\t" & $t.state &
+              (if t.detail.len > 0: "\t" & t.detail else: "")
+  if lines.len == 0: "(no tabs)" else: lines.join("\n")
+
 proc selectTab*(app: var App; key: string) =
   ## Make `key` the current tab. Selecting a session turns the terminal off (and
   ## vice versa) -- the two were previously independent, so switching was
   ## invisible while the terminal was active.
   app.focus = "session"
-  app.termScroll = 0                    # a freshly selected tab starts at the tail
   if key.startsWith("·term:"):
     let idx = (try: parseInt(key["·term:".len .. ^1]) except: -1)
     if idx >= 0 and idx < app.terminals.len:
       app.termActive = idx
+      snapToTail(app.terminals[idx].pty)   # a freshly selected tab starts at the tail
       app.msg = "terminal: " & app.terminals[idx].label
     return
   app.termActive = -1
   let parts = key.split('/')
   app.curLang = parts[0]
   app.curSession = if parts.len > 1: parts[1] else: "default"
+  if app.sessions.hasKey(key) and app.sessions[key] != nil:
+    snapToTail(app.sessions[key].pty)
   refreshObjects(app)
   app.msg = "session: " & key
 
@@ -2747,24 +2908,139 @@ proc focusNext*(app: var App) =
   app.focus = order[(i + 1) mod order.len]
   app.msg = "focus: " & app.focus
 
-proc openTerminal*(app: var App; cmd: string)   # forward decl (defined below)
+proc openTerminal*(app: var App; cmd: string; kind = tkShell; host = "";
+                   label = "")   # forward decl (defined below)
 
 proc sshMasterUp(host: string): bool =
   ## Is there a live, authenticated ssh master connection to `host`?
-  let (_, code) = execCmdEx("ssh -O check -o ControlPath=" &
-    quoteShell(sshControlPath()) & " " & quoteShell(host) & " 2>/dev/null")
+  let (_, code) = runCmd("ssh -O check -o ControlPath=" &   # (stderr is captured)
+    quoteShell(sshControlPath()) & " " & quoteShell(host))
   code == 0
 
+proc noteSshFailure*(host: string; blocked: bool) =
+  var st = gSshRetry.mgetOrPut(host, SshHostState())
+  inc st.fails
+  st.lastFail = epochTime()
+  st.nextTry = st.lastFail + min(1800.0, float(1 shl min(st.fails, 11)))
+  if blocked: st.blocked = true
+  gSshRetry[host] = st
+  gSshWatch.incl host
+
+proc sshRefusal*(host: string): string =
+  ## The fail-fast message for eval / block runs when no master is up.
+  let st = gSshRetry.getOrDefault(host)
+  if st.blocked:
+    return host & " refused connections (possible lockout); log in (M-x remote-login " & host & ")"
+  result = "no ControlMaster for " & host & "; log in (M-x remote-login " & host & ")"
+  if epochTime() < st.nextTry:
+    result.add " [auto-retry in " & $int(st.nextTry - epochTime()) & "s]"
+
+proc remoteLoginCmd*(app: var App; host: string) =
+  ## THE login command: opens the terminal tab that creates the ControlMaster
+  ## (explicit -M, the shared ControlPath, keep-alives, a persist that outlives
+  ## the tab), shows ssh's exit code when it fails, and puts the host on the
+  ## watch list so every dead session on it reattaches automatically once the
+  ## master is up. A plain `ssh host` tab creates no control socket, so it
+  ## never counts as a login -- only `ssh -O check` on the shared path does.
+  if host.len == 0:
+    app.palettePrompt = "remote-login host: "
+    gPromptHandler = proc(app: var App; text: string) =
+      if text.strip.len > 0: remoteLoginCmd(app, text.strip)
+    openPalette(app, pmPrompt)
+    return
+  gSshRetry.del(host)            # a fresh login resets the clock
+  gSshWatch.incl host
+  var ssh = "ssh -tt -M -o ControlPath=" & sshControlPath() &
+            " -o ControlPersist=" & gSshPersistLogin
+  for o in sshKeepAliveOpts(): ssh.add " " & o
+  ssh.add " " & host
+  openTerminal(app, "sh -c " & quoteShell(
+    ssh & "; e=$?; echo; echo 'ssh exited with code '$e"),
+    host = displayHost(host), label = "login")
+  app.msg = "log in to " & host & " -- its sessions reattach once the master is up"
+
 proc ensureSshMaster(app: var App; host: string): bool =
-  ## True if a master to `host` is up. Otherwise open a terminal to log in (where
-  ## the password prompt actually works) and return false -- the user authenticates
-  ## once, then re-runs the block, and the marker session reuses the master.
+  ## True if a master to `host` is up. Otherwise open the login tab (where the
+  ## password prompt actually works) and return false -- the user authenticates
+  ## once; the watch then reattaches the sessions on that host by itself.
   if sshMasterUp(host): return true
   try: createDir(getHomeDir() / ".ssh") except CatchableError: discard
-  openTerminal(app, "ssh -tt -o ControlMaster=auto -o ControlPath=" & sshControlPath() &
-                    " -o ControlPersist=" & gSshPersist & " " & host)
-  app.msg = "log in to " & host & " in the terminal, then run the block again"
+  remoteLoginCmd(app, host)
   false
+
+proc reattachHostSessions*(app: var App; host: string): int =
+  ## Restart every dead session on HOST -- a tmux-backed one reattaches to the
+  ## still-running remote REPL (`new-session -A`; its first probe line says
+  ## whether the remote session and its job survived the drop). Returns how many.
+  var keys: seq[string]
+  for key, s in app.sessions:
+    if key.endsWith("@" & host) and
+       (s == nil or not s.pty.alive or s.phase == spFailed): keys.add key
+  for key in keys:
+    let slash = key.find('/')
+    if slash < 0: continue
+    if getSession(app, key[0 ..< slash], key[slash + 1 .. ^1]) != nil: inc result
+  if result > 0:
+    app.msg = "remote: master to " & host & " is up -- reattached " & $result &
+              " session" & (if result == 1: "" else: "s")
+
+proc probeFile(host: string): string =
+  var safe = ""
+  for c in host:
+    if c.isAlphaNumeric or c in {'@', '.', '-', '_'}: safe.add c else: safe.add '_'
+  getTempDir() / ("wkb-ssh-probe." & safe)
+
+proc launchSshProbe(host: string) =
+  ## Fire-and-forget BatchMode master attempt (never blocks the frame loop):
+  ## the shell backgrounds ssh and writes its exit status + output to a temp
+  ## file the watch loop reads on a later tick. BatchMode fails instead of
+  ## prompting, so an unattended probe can never hang on a password.
+  let f = probeFile(host)
+  var ssh = "ssh -M -o ControlPath=" & sshControlPath() &
+            " -o ControlPersist=" & gSshPersist &
+            " -o BatchMode=yes"
+  for o in sshKeepAliveOpts(): ssh.add " " & o
+  ssh.add " " & host & " true"
+  let inner = "rm -f " & quoteShell(f) & ".code; " &
+    ssh & " > " & quoteShell(f) & ".out 2>&1; echo $? > " & quoteShell(f) & ".code"
+  discard runCmd("sh -c " & quoteShell(inner) & " &")
+  gSshProbing[host] = epochTime()
+
+proc pollSshWatch*(app: var App) =
+  ## Rate-limited (5s): for every host with dead sessions, notice a live master
+  ## (the user logged in, or the network came back) and reattach; otherwise run
+  ## the next backoff-gated probe. A pre-banner close (fail2ban) blocks the
+  ## host -- no more probes until an explicit remote-login.
+  if epochTime() < gSshNextWatch: return
+  gSshNextWatch = epochTime() + 5.0
+  for host in toSeq(gSshWatch):
+    if sshMasterUp(host):
+      gSshWatch.excl host
+      gSshRetry.del host
+      discard reattachHostSessions(app, host)
+      continue
+    let st = gSshRetry.getOrDefault(host)
+    if st.blocked: continue
+    if gSshProbing.hasKey(host):
+      let f = probeFile(host)
+      if not fileExists(f & ".code"):
+        if epochTime() - gSshProbing[host] > 60.0: gSshProbing.del host
+        continue                       # still probing (or the write got lost)
+      gSshProbing.del host
+      let code = try: readFile(f & ".code").strip.parseInt except CatchableError: 1
+      if code == 0:
+        gSshWatch.excl host
+        gSshRetry.del host
+        discard reattachHostSessions(app, host)
+      else:
+        let outp = try: readFile(f & ".out") except CatchableError: ""
+        let low = outp.toLowerAscii
+        noteSshFailure(host, blocked =
+          "kex_exchange_identification" in low or "closed by remote host" in low or
+          "connection reset" in low)
+      try: removeFile(f & ".code"); removeFile(f & ".out") except CatchableError: discard
+      continue
+    if epochTime() >= st.nextTry: launchSshProbe(host)
 
 const runningPrefix* = ": [running: job "   ## placeholder line while a block runs
 
@@ -2866,7 +3142,8 @@ proc noteCtlJob(app: var App; sessKey: string) =
   app.curLang = parts[0]
   app.curSession = if parts.len > 1: parts[1] else: "default"
   app.sessionHidden = false
-  app.termScroll = 0
+  if app.sessions.hasKey(sessKey) and app.sessions[sessKey] != nil:
+    snapToTail(app.sessions[sessKey].pty)
 
 proc maybeReturnTab(app: var App): bool =
   ## Back to the terminal (Claude) once every control-socket run has finished.
@@ -2968,15 +3245,25 @@ proc pollJobs*(app: var App): bool =
   ## Host loop, every frame: advance every session's runs without blocking and
   ## deliver finished ones. Returns true if anything finished (redraw).
   var done: seq[RunJob]
-  for s in app.sessions.values:           # collect first: finishing runs hooks
+  for key, s in app.sessions.mpairs:       # collect first: finishing runs hooks
     done.add pollSession(s)
+    if s != nil and '@' in key:
+      let host = key[key.find('@') + 1 .. ^1]
+      if s.phase == spFailed and s.startFailed.len > 0:
+        # a remote login attempt died: count it on the host's shared clock (a
+        # timeout or an abandoned prompt only backs off; the probe's own
+        # output is what decides lockout blocking)
+        if s.startFailed == "session ended during login" or
+           s.startFailed == "login timed out":
+          noteSshFailure(host, blocked = false)
+        s.startFailed = ""               # note it once
+      elif s.phase == spReady and not s.pty.alive:
+        gSshWatch.incl host              # the link dropped mid-run: auto-reconnect
+  pollSshWatch(app)                       # master-up probes + auto-reattach
   if done.len == 0: return maybeReturnTab(app)
   for j in done:
     for i in 0 ..< app.jobs.len:
       if app.jobs[i].job == j and not app.jobs[i].applied:
-        if app.jobs[i].kind != jkFetch:       # (a fetch's hex isn't worth logging)
-          app.sess.appendOutput("# " & app.jobs[i].label & " [job " & $j.id & "]\n" &
-                                j.output & "\n")
         noteRan(app, app.jobs[i])
         if app.jobs[i].kind == jkBlock:
           var aj = app.jobs[i]
@@ -3510,7 +3797,28 @@ proc detectRebuildCmd*(): string =
   let dir = getAppDir()
   let bnim = dir / "toolchain" / "nim" / "bin" / "nim"
   let bzig = dir / "toolchain" / "zig" / "zig"
-  let nimExe = if fileExists(bnim): bnim.quoteShell else: "nim"
+  var nimExe = if fileExists(bnim): bnim.quoteShell else: "nim"
+  when defined(feature.uirelays.figDrawSiwin):
+    # A GPU build needs Nim >= 2.4 (config.nims falls back to the CPU driver
+    # below that). If the PATH `nim` is older, rebuild with the newest one
+    # nimble installed as a package -- it fetches one for figdraw's deps --
+    # rather than quietly turning this editor back into the CPU build.
+    proc nimVer(exe: string): (int, int) =
+      let (o, c) = runCmd(exe & " --version")
+      if c != 0: return (0, 0)
+      let v = o.splitLines()[0].split("Version ")
+      if v.len < 2: return (0, 0)
+      let p = v[1].split({'.', ' '})
+      try: (parseInt(p[0]), parseInt(p[1])) except ValueError: (0, 0)
+    if not fileExists(bnim) and nimVer("nim") < (2, 4):
+      var best = ""
+      var bestV = (0, 0)
+      for d in walkDirs(getHomeDir() / ".nimble" / "pkgs2" / "nim-*"):
+        let exe = d / "bin" / "nim"
+        if fileExists(exe):
+          let v = nimVer(exe.quoteShell)
+          if v >= (2, 4) and v > bestV: best = exe; bestV = v
+      if best.len > 0: nimExe = best.quoteShell
   if fileExists(bzig):
     let cc = (bzig & " cc").quoteShell     # Nim drives zig as a clang-alike
     result = nimExe & " " & "--cc:clang --clang.exe:" & cc &
@@ -3540,7 +3848,7 @@ proc writeHandoff(app: var App): string =
         discard fcntl(t.pty.master, F_SETFD, 0.cint)
         blob.add "T\t" & $t.pty.master & "\t" & $t.pty.pid & "\t" &
                  t.label & "\t" & $i & "\t" & $app.termActive & "\t" &
-                 t.cmd & "\n"
+                 t.cmd & "\t" & $t.kind & "\t" & t.host & "\n"
     if blob.len == 0: return ""
     let path = getTempDir() / ("wkbenchless-handoff." & $getpid())
     writeFile(path, blob)
@@ -3570,6 +3878,7 @@ proc adoptHandoff*(app: var App): tuple[terminals: seq[Terminal]; active: int] =
       if f[0] == "S" and gRepls.hasKey(f[3]):
         let sess = Session(pty: Pty(master: fd, pid: Pid(parseInt(f[2]))),
                            spec: specFor(gRepls[f[3]], f[4]))   # remote: keeps its stager
+        sess.pty.useSessionView()
         if sess.spec.tmuxName.len > 0:
           # The child is `tmux -CC`, already in control mode: without the
           # adapter, the prime below would be sent to tmux AS commands.
@@ -3583,7 +3892,9 @@ proc adoptHandoff*(app: var App): tuple[terminals: seq[Terminal]; active: int] =
         let idx = (if f.len > 4: (try: parseInt(f[4]) except: -1) else: -1)
         result.terminals.add Terminal(
           pty: Pty(master: fd, pid: Pid(parseInt(f[2]))),
-          label: f[3], cmd: (if f.len > 6: f[6] else: f[3]), started: true)
+          label: f[3], cmd: (if f.len > 6: f[6] else: f[3]), started: true,
+          kind: (if f.len > 7: parseEnum[TabKind](f[7], tkShell) else: tkShell),
+          host: (if f.len > 8: f[8] else: ""))
         if f.len > 5 and f[5] == $idx: result.active = idx
 
 proc nimblePkgSourceDir(): string =
@@ -3637,7 +3948,7 @@ proc recompileConfig*(app: var App) =
     # successful reload re-execs the freshly built binary from the resolved dir.
     let dir = resolveBuildDir()
     if gRebuildCmd.len == 0: gRebuildCmd = detectRebuildCmd()
-    let (outp, code) = execCmdEx(gRebuildCmd, workingDir = dir)
+    let (outp, code) = runCmd(gRebuildCmd, workingDir = dir)
     if code != 0:
       stderr.write("-- recompile FAILED --\n$ " & gRebuildCmd & "\n" & outp & "\n")
       # surface the first real error line in the status bar
@@ -3735,12 +4046,17 @@ proc terminalDir*(app: App): string =
   ## Where a new terminal starts: config gTerminalDir if set, else project root.
   if gTerminalDir.len > 0: expandTilde(gTerminalDir) else: projectRoot(app)
 
-proc openTerminal*(app: var App; cmd: string) =
+proc openTerminal*(app: var App; cmd: string; kind = tkShell; host = "";
+                   label = "") =
   ## Open `cmd` in its own bottom-panel terminal tab. Reuses an existing tab
   ## running the same command (so M-t twice doesn't stack bash tabs); otherwise
   ## adds a new one. Each terminal keeps its own PTY, so opening claude after a
-  ## bash terminal no longer kills the bash session.
-  let label = cmd.splitWhitespace()[0]   # "claude", "bash", ...
+  ## bash terminal no longer kills the bash session. `kind`/`host` are what its
+  ## chip shows (an agent; a login to a host); `label` overrides the default
+  ## tab name, the command's first word ("claude", "bash", ...).
+  let label = if label.len > 0: label else: cmd.splitWhitespace()[0]
+  let kind = if kind == tkShell and cmd.splitWhitespace()[0] in gAgentCmds: tkAgent
+             else: kind
   for i, t in app.terminals:
     if t.cmd == cmd:
       # The earlier run of this exact command already ended (an ssh drop,
@@ -3757,7 +4073,8 @@ proc openTerminal*(app: var App; cmd: string) =
       app.focus = "session"
       app.msg = "terminal: " & label
       return
-  app.terminals.add Terminal(pty: notRunningPty(), label: label, cmd: cmd)
+  app.terminals.add Terminal(pty: notRunningPty(), label: label, cmd: cmd,
+                            kind: kind, host: host)
   app.termActive = app.terminals.len - 1
   app.sessionHidden = false
   app.focus = "session"
@@ -3995,6 +4312,9 @@ proc registerBuiltins*() =
   defcommand("theme", "Theme: pick a base16 / sixteen color theme", themeCmd)
   defcommand("list-buffers", "List / switch buffers", listBuffers)
   defcommand("open-file", "Open file (browse)", openFileCmd)
+  defcommand("remote-login",
+    "Remote: log in to a host (creates the ssh ControlMaster; its sessions reattach)",
+    proc(app: var App) = remoteLoginCmd(app, ""))
   defcommand("find", "Find in buffer", openFind)
   defcommand("replace", "Find & replace in buffer", openReplace)
   defcommand("org-nav", "Org: navigate headings / named blocks / captions", orgNavCmd)
@@ -4037,7 +4357,7 @@ proc registerBuiltins*() =
                # so a failed write can never break the claude launch.
                if gClaudeDiffHooks and writeClaudeSettings():
                  cmd = withClaudeSettings(gClaudeCmd, claudeSettingsPath())
-               openTerminal(app, cmd))
+               openTerminal(app, cmd, kind = tkAgent))
   defcommand("show-panel", "Show the bottom panel", showPanel)
   defcommand("toggle-panel", "Show/hide the bottom panel", togglePanel)
   defcommand("recompile", "Recompile config & restart", recompileConfig)

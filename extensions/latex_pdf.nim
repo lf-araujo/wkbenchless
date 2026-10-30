@@ -24,8 +24,9 @@
 ## and #+PANDOC_OPTIONS / #+PANDOC_VARIABLES pass through. Nothing is evaluated:
 ## the stored #+RESULTS are exported, with each block's :exports applied.
 
-import std/[os, strutils, times, re]
+import std/[os, strutils, times, re, sequtils]
 import wkbcore
+import wkblayout         # expandLayout (backend-neutral layout directives)
 import ./notebook_html   # applyExports / keywordValue / optionValue
 import ./beamer_pdf      # run / runLatex / firstLatexErrors / toPandocOrg
 
@@ -92,8 +93,9 @@ proc latexPdfExport*(app: var App) =
   # -- buffer -> pandoc org -> .tex ------------------------------------------------
   var running = 0
   var body: seq[string]
+  var usedLandscape = false
   let noTitle = optionValue(options, "title") == "nil"
-  for ln in toPandocOrg(applyExports(app, lines, running)):
+  for ln in expandLayout(toPandocOrg(applyExports(app, lines, running)), ltLatex, usedLandscape):
     let low = ln.strip.toLowerAscii
     if noTitle and (low.startsWith("#+title:") or low.startsWith("#+subtitle:")): continue
     if low.startsWith("#+latex_header:") and "\\hypersetup" in ln:
@@ -101,6 +103,8 @@ proc latexPdfExport*(app: var App) =
       body.add "#+LATEX_HEADER: \\AtBeginDocument{" & v & "}"
       continue
     body.add ln
+  if usedLandscape and not body.anyIt("pdflscape" in it):   # #+LANDSCAPE: needs the package
+    body.insert("#+LATEX_HEADER: \\usepackage{pdflscape}", 0)
   let orgTmp = dir / (".wkb-export-" & src.splitFile.name & ".org")   # same dir: relative paths hold
   writeFile(orgTmp, body.join("\n") & "\n")
   defer: removeFile(orgTmp)

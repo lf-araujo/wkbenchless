@@ -369,12 +369,12 @@ proc vBuild(app: var App; args: seq[string]; body: string): string =
   queueShell(app, script)
 
 proc vNimRun(app: var App; args: seq[string]; body: string): string =
-  ## Nim code from stdin. With nimteractive (registered below as the `nim`
-  ## session) it goes to that warm session; otherwise scratch.nim + `nim r`
-  ## in the bash session, from the project root so config.nims paths apply.
+  ## Nim code from stdin. With the `nimteractive` warm session (registered
+  ## below) it goes there; otherwise scratch.nim + `nim r` in the bash session,
+  ## from the project root so config.nims paths apply.
   if strip(body).len == 0: return "(no code on stdin)"
-  if gRepls.hasKey("nim"):
-    let id = submitEval(app, "nim", "default", body)
+  if gRepls.hasKey("nimteractive"):
+    let id = submitEval(app, "nimteractive", "default", body)
     if id != 0: return "queued: job " & $id
   let root = nimbleRoot(getCurrentDir())
   let dir = if root.len > 0: root else: getCurrentDir()
@@ -388,57 +388,30 @@ proc vNimRun(app: var App; args: seq[string]; body: string): string =
     "else echo 'nim-run: FAILED (exit '$st')'; fi"
   queueShell(app, script)
 
-# -- nimteractive as the `nim` session ---------------------------------------
+# -- the `nimteractive` warm Nim session -------------------------------------
 #
-# A python3 carrier hosts `nimteractive` (lf-araujo/nimteractive: a warm Nim
-# session -- each eval compiles the growing script as a lib against a
-# persistent nimcache and dlopens it, so only the delta recompiles). It speaks
-# line-delimited JSON ops; the carrier translates the session's file+nonce
-# run into an eval op and relays the result's stdout. Registered only when the
-# binary exists, so `wkbctl eval nim`, `nim-run` and org `#+begin_src nim`
-# blocks all get the fast warm path; without it they fall back to nim r.
+# Pure Nim, no python carrier and no external binary: the session's REPL is
+# `wkbenchless nim-host` (see src/nimhost.nim + the subcommand dispatch in
+# wkbenchless.nim), which drives the vendored warm engine (src/nimsession.nim,
+# from lf-araujo/nimteractive). It speaks the session's own RUN/BOR/END text
+# protocol directly, so org `#+begin_src nimteractive` blocks, `wkbctl eval
+# nimteractive` and `nim-run` all get the fast warm path (each eval only
+# delta-recompiles the growing script). Registered as `nimteractive` to keep
+# it distinct from a plain compiled `nim` block.
 
 proc registerNimSession() =
-  var bin = findExe("nimteractive")
-  if bin.len == 0:                 # the standard nimble bin dir, if not on PATH
-    let cand = getHomeDir() / ".nimble" / "bin" / "nimteractive"
-    if fileExists(cand): bin = cand
-  if bin.len == 0: return
+  let self = getAppFilename()
+  if self.len == 0 or not fileExists(self): return
   let root = nimbleRoot(getCurrentDir())
   let cwd = if root.len > 0: root else: getCurrentDir()
-  let pyCwd = "\"" & cwd.replace("\\", "\\\\").replace("\"", "\\\"") & "\""
   let spec = ReplSpec(
-    argv: @["python3", "-q", "-u"],
-    env: @[("PYTHON_BASIC_REPL", "1")],
-    prime:
-      "import subprocess as _sp, json as _js, sys as _sys\n" &
-      "_nt = _sp.Popen([" & "'" & bin & "'" & "], cwd=" & pyCwd & ", stdin=_sp.PIPE, stdout=_sp.PIPE, text=True)\n" &
-      "def _nimacs_run(path, nonce):\n" &
-      "    print('__NIMACS' '_BOR__', nonce)\n" &
-      "    _nt.stdin.write(_js.dumps({'op':'eval','id':nonce,'code':open(path).read()}) + '\\n')\n" &
-      "    _nt.stdin.flush()\n" &
-      "    for _ln in _nt.stdout:\n" &
-      "        _i = _ln.find('{')\n" &
-      "        if _i < 0: continue\n" &
-      "        try: _r = _js.loads(_ln[_i:])\n" &
-      "        except ValueError: continue\n" &
-      "        if _r.get('id') != nonce: continue\n" &
-      "        if _r.get('op') == 'compiling':\n" &
-      "            _sys.stdout.write('[compiling...]\\n'); continue\n" &
-      "        _out = _r.get('stdout')\n" &
-      "        if _out:\n" &
-      "            _sys.stdout.write(_out)\n" &
-      "            if not _out.endswith('\\n'): _sys.stdout.write('\\n')\n" &
-      "        elif _r.get('op') != 'result':\n" &
-      "            print(_ln, end='')\n" &
-      "        break\n" &
-      "    print('__NIMACS' '_END__', nonce)\n" &
-      "    _sys.stdout.flush()\n" &
-      "\n",
-    ready: "print('NIMACS' 'xREADY')\n",
-    run: "_nimacs_run('{file}','{nonce}')\n",
-    quit: "_nt.stdin.write('{\"op\":\"exit\",\"id\":\"q\"}\\n'); _nt.stdin.flush()\n")
-  registerRepl("nim", spec)
+    argv: @[self, "nim-host"],
+    cwd: cwd,
+    prime: "",                 # the host initialises itself on startup
+    ready: "",                 # ... and prints NIMACSxREADY then, no priming
+    run: "RUN {file} {nonce}\n",
+    quit: "QUIT\n")
+  registerRepl("nimteractive", spec)
 
 proc vHelp(app: var App; args: seq[string]; body: string): string =
   ## `wkbctl help`: every extension-registered verb, one line each -- the

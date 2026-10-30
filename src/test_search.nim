@@ -81,4 +81,41 @@ findAllMatches(app)
 check "findAll count msg", app.msg == "3 matches"
 check "findAll first", app.searchIdx == 0
 
+# the panel always shows both rows: text typed into the replace field lands
+# there even when the panel was opened as plain find (C-f, then Tab/click)
+app.ed.setText("alpha beta alpha\n")
+openFind(app)
+searchFieldAdd(app, "alpha")
+app.searchField = sfReplace
+searchFieldAdd(app, "gamma")
+check "replace field takes text after find-open", app.searchReplace == "gamma"
+check "find field untouched", app.searchQuery == "alpha"
+searchFieldAdd(app, "!")
+check "'!' is ordinary text", app.searchReplace == "gamma!" and
+  app.ed.fullText() == "alpha beta alpha\n"
+searchFieldBackspace(app)
+check "backspace edits the replace field", app.searchReplace == "gamma"
+app.searchField = sfQuery
+searchFieldAdd(app, "ε")
+searchFieldBackspace(app)
+check "backspace drops a whole UTF-8 char", app.searchQuery == "alpha"
+
+# replaceAll when the replacement contains the needle (used to loop forever)
+app.searchReplace = "alphaalpha"
+replaceAll(app)
+check "replaceAll self-containing", app.ed.fullText() == "alphaalpha beta alphaalpha\n"
+check "replaceAll count msg", app.msg == "replaced 2"
+check "replaceAll closes the panel", not app.searchActive
+
+# zero-width regex matches insert without deleting
+app.ed.setText("a\nb\n")
+openReplace(app)
+app.searchRegex = true
+searchFieldAdd(app, "^")
+app.searchField = sfReplace
+searchFieldAdd(app, "> ")
+replaceAll(app)
+check "zero-width replaceAll", app.ed.fullText().startsWith("> a\n> b")
+app.searchRegex = false
+
 echo "all ok"

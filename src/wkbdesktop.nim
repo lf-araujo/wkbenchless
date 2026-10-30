@@ -9,13 +9,17 @@
 import std/[os, osproc, strutils]
 
 const
-  assetsDir = currentSourcePath().parentDir / ".." / "assets"
+  # Literal "/" joins, not the `/` operator or `parentDir`: under a cross target
+  # (`--os:windows`) they emit "\", which is no path on the Linux build host
+  # (see config.nims); a native Windows build accepts "/" as well.
+  srcFile = currentSourcePath()
+  assetsDir = srcFile[0 ..< srcFile.rfind({'/', '\\'})] & "/../assets"
   iconSizes = [16, 24, 32, 48, 64, 128, 256, 512]
   iconPngs = (proc (): seq[(int, string)] =
     for s in iconSizes:
-      result.add (s, staticRead(assetsDir / "icon" / "png" / ("wkbenchless-" & $s & ".png"))))()
-  iconSvg = staticRead(assetsDir / "icon" / "wkbenchless.svg")
-  iconIcns = staticRead(assetsDir / "icon" / "wkbenchless.icns")
+      result.add (s, staticRead(assetsDir & "/icon/png/wkbenchless-" & $s & ".png")))()
+  iconSvg = staticRead(assetsDir & "/icon/wkbenchless.svg")
+  iconIcns = staticRead(assetsDir & "/icon/wkbenchless.icns")
   desktopTemplate = """[Desktop Entry]
 Type=Application
 Name=wkbenchless

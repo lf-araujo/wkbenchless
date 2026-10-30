@@ -58,14 +58,14 @@ proc buildRequest(args: seq[string]; req: var string): string =
            "           set-buffer|insert <line>|replace <from> <to>|goto <line>|\n" &
            "           run-block [line|name]|restart-session [lang [name]]|run-all|diff <old> <new> [title]|bib <query>\n" &
            "           cite-goto <key>|open <path>|where|selection\n" &
-           "           jobs|status <id>|wait <id>...|interrupt <id>\n" &
+           "           jobs|status <id>|wait <id>...|interrupt <id>|tabs\n" &
            "           run-block [line] [--deps] [--force]|run-stale|infer-deps\n" &
            "           symbols|find-symbol <q>|references|def|type-def (nimsuggest)\n" &
            "           check|check-project|build|sh|nim-run (queued in the panel)\n" &
            "  (verbs that take text read it from stdin; run-block/run-all/eval wait\n" &
            "   for their jobs unless given --async, which prints the job id(s))"
   case args[0]
-  of "buffer", "blocks", "run-all", "jobs", "run-stale", "infer-deps":
+  of "buffer", "blocks", "run-all", "jobs", "tabs", "run-stale", "infer-deps":
     req = args[0]
   of "status", "interrupt":
     if args.len < 2: return "ctl " & args[0] & " <job id>"

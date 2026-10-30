@@ -25,6 +25,7 @@
 
 import std/[os, osproc, strutils, streams, times, re, math]
 import wkbcore
+import wkblayout         # expandLayout (backend-neutral layout directives)
 import ./notebook_html   # applyExports / keywordValue / optionValue
 
 var
@@ -263,7 +264,8 @@ proc beamerPdfExport*(app: var App) =
     if c > 0: args.add @["-V", v[0 ..< c].strip & "=" & v[c + 1 .. ^1].strip.strip(chars = {'"'})]
   # -- buffer -> pandoc org -> .tex ------------------------------------------------
   var running = 0
-  let body = toPandocOrg(applyExports(app, lines, running))
+  var usedLandscape = false   # landscape/pagebreak are silent no-ops on slides
+  let body = expandLayout(toPandocOrg(applyExports(app, lines, running)), ltBeamer, usedLandscape)
   let orgTmp = dir / (".wkb-export-" & src.splitFile.name & ".org")   # same dir: relative paths hold
   writeFile(orgTmp, body.join("\n") & "\n")
   defer: removeFile(orgTmp)
