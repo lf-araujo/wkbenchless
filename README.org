@@ -7,14 +7,6 @@ sessions, a real embedded terminal, and native org src-block highlighting. A
 /workbench-less/ alternative to heavier IDEs: no language-server manager, no
 background service, no Electron.
 
-#+begin_quote
-*Work in progress.* wkbenchless aims to reproduce, as one native binary, the
-literate scientific-workbench workflow the author built in Emacs (the
-
-[[https://github.com/lf-araujo/workbenchless][workbenchless]] config) — org-mode
-notebooks, remote REPLs, inline figures, and manuscript round-tripping —
-without Emacs. Expect rough edges; features are still landing.
-#+end_quote
 
 #+CAPTION: An org notebook in wkbenchless with a figure rendered inline
 [[file:docs/screenshot.png]]
@@ -67,22 +59,6 @@ languages, and themes are data, and ~C-c r~ recompiles and restarts /in place/,
   (green), ~{--deletions--}~ (red), ={~~old~>new~~}=, ~{>>comments<<}~ (grey),
   and ~{==highlights==}~ (yellow). Resolve with ~M-x criticmarkup-accept-all~ /
   ~-reject-all~ (~C-c j~ / ~C-c l~). Pairs with the ~org-tracked-docx~ round-trip.
-- *Two-pane diff view*: ~M-x diff-buffer~ shows the buffer vs its saved file
-  side by side (removals red, additions green, aligned by LCS). Agents can push
-  a diff — see /Agent control/ below.
-- *Themes*: base16 colour themes drive the editor /and/ the whole UI. ~M-x
-  theme~ (or ~C-c C-t~) switches live; the choice persists to
-  =~/.config/wkbenchless/state.cfg= and is restored on start. Ships ~seventeen~
-  (a light NANO/Sublime-“Sixteen” theme, the default), one-dark, gruvbox-dark,
-  and solarized-light — add your own in the config.
-- *Wide tables*: org rows don't reflow; ~M-Left~ / ~M-Right~ pan the view.
-- *RStudio-style panes*: editor · session · objects/environment · help.
-- *Find / replace*: ~C-f~ finds incrementally, ~C-h~ find-and-replace.
-- *Org navigator*: ~C-j~ — a palette of headings, named/captioned blocks, and
-  figure/table captions; pick one to jump.
-- *Landmark arrows*: the toolbar's single ▼/▲ pair jumps between /sections,
-  src blocks and CriticMarkup comments/ in document order — works in org and
-  Rmd alike (~M-x next-landmark~ / ~prev-landmark~).
 - *Command palette*: ~M-x~ (or ~C-p~); ~C-x C-r~ opens a recent file.
 
 Src-edit (~C-c e~) zooms a block into an isolated code file with LSP, alongside
@@ -94,8 +70,15 @@ document:
 
 * Build & run
 
-Needs the Nim toolchain, and (Linux) ~libX11~ + ~libXft~. macOS uses the native
-Cocoa backend.
+Needs the Nim toolchain. On Linux, wkbenchless renders on the GPU by default:
+[[https://github.com/elcritch/figdraw][FigDraw]] (OpenGL) drawing into a
+[[https://github.com/levovix0/siwin][siwin]] window -- native Wayland on a
+Wayland session, X11 otherwise. That needs *Nim >= 2.4* and
+~nimble install figdraw siwin~ (a current nimble; it fetches Nim 2.4 itself if a
+dependency asks for it). Built with an older Nim, or with ~-d:wkbX11~, it uses
+the CPU X11 driver instead (~libX11~ + ~libXft~). ~C-c r~ in a GPU build rebuilds
+with nimble's Nim >= 2.4 when the ~nim~ on PATH is older. macOS uses the native
+Cocoa backend, Windows the winapi one.
 
 #+begin_src sh
 nimble run          # build + run
@@ -105,8 +88,7 @@ nim c -o:wkbenchless src/wkbenchless.nim
 #+end_src
 
 Prebuilt binaries for Linux/macOS are attached to each
-[[https://github.com/lf-araujo/wkbenchless/releases][GitHub release]] (see
-/Releases/ below).
+[[https://github.com/lf-araujo/wkbenchless/releases][GitHub release]].
 
 * Configuration
 
@@ -137,7 +119,7 @@ add more with ~addExecPath~.
 next to the binary: ~nimble bundle -- /path/to/zig~ (see
 ~scripts/bundle-toolchain.sh~); Nim uses ~zig cc~ as a hermetic C backend.
 
-* Agent control (~ctl~)
+* Remote control (~ctl~)
 
 The editor exposes a loopback control socket (127.0.0.1, token-authenticated)
 that drives a running instance — handy for scripts and for agents in the
@@ -162,195 +144,7 @@ wkbctl cite-context <key>              # dossier for a citation: your notes + pr
 wkbctl zotero-search <query>           # search the whole Zotero library (see below)
 #+end_src
 
-** Reference context (a citation's memory)
-
-Land on a ~[cite:@key]~ and see everything /you/ have ever associated with that
-reference — the notes you wrote, the manuscript paragraphs you wrote citing it,
-and (via [[https://github.com/][Mktero]]) the paper's own reflowed Markdown. In
-the editor, ~M-x cite-context~ (~C-c ?~) on the citation at point fills a
-~*cite-context*~ buffer with all three sections. The same is scriptable:
-
-#+begin_src sh
-wkbctl cite-context <key>   # notes (Zotero) + your prose paragraphs + paper full text
-wkbctl cite-prose <key>     # just your manuscript paragraphs citing @key (file:line each)
-wkbctl cite-notes <key>     # just your Zotero notes on the item
-wkbctl cite-paper <key>     # just the paper's own Markdown (Mktero source), path + preview
-wkbctl cite-reindex         # rebuild the manuscript prose index
-wkbctl zotero-search <q>    # @key — Author (year). Title  [✎notes ▤paper ✍cited]
-#+end_src
-
-Notes and the citekey→item link come from Zotero's own SQLite (=~/Zotero=, read
-~immutable~ — no copy, no lock, safe while Zotero runs). Your manuscripts are
-indexed from ~gCorpusRoots~ (config), ~$WKB_CORPUS~, or the open file's
-directory — ~.org~/~.Rmd~, split into paragraphs with CriticMarkup resolved and
-near-duplicate drafts collapsed. ~zotero-search~ finds a paper you've /read/ but
-not yet cited; ~✍cited~ marks the ones already in your prose.
-
-~bib~ searches the buffer's own ~#+bibliography:~ paths plus an optional master
-set via ~$WKB_BIB~, matching all query terms against key/author/title/year — so
-an agent can find citation keys without loading the (possibly large) ~.bib~ into
-its context.
-
-When driving an org file, prefer ~wkbctl run-block <line>~ over piping code to
-~eval~: it runs through the editor's own babel, so the block executes in its
-~:session~, in its language, and writes ~#+RESULTS:~ back into the buffer.
-
-* Roadmap
-
-- [ ] *Ctrl-click ~[cite:@key]~ → its BibTeX entry* — a click/keybinding hook
-  on a citation that calls ~cite-goto~ (the ~wkbctl cite-goto <key>~ verb already
-  does the jump for agents; this is the in-editor UI on top of it).
-- [ ] *Remote sessions: robust, polite reconnection* (reported 2026-10-21,
-  src/wkbsession.nim / ControlMaster login; light.vipbg.vcu.edu). An
-  overnight drop of the ControlMaster left a long qsub grid running in
-  ~wkb-ctace-R~, but getting back to it was convoluted and repeated
-  connection attempts got the client locked out (sshd closes before the
-  banner: ~kex_exchange_identification: Connection closed by remote host~).
-  - [ ] *No blind polling*: every ~ctl eval~ / reattach on a dead session
-    opens a fresh ssh attempt; with fail2ban-style hosts that extends the
-    ban. Back off exponentially (cap ~30 min), share ONE retry clock per
-    host across sessions and ~ctl~ callers, and stop after a pre-banner
-    close until the user logs in again.
-  - [ ] *Fail fast and clearly* — ~ctl eval~ on a session without a live
-    master should return ~error: no ControlMaster for <host>; log in
-    (M-x remote-login)~ immediately, not ~session ended during login~ after
-    a new attempt; distinguish "host refusing connections (possible
-    lockout)" from "auth needed" from "network down".
-  - [ ] *One login command* — ~M-x remote-login~ (and ~ctl remote-login
-    <host>~) opens the terminal tab with the right ~ssh -M -o
-    ControlPath=~/.ssh/wkb-cm-%C -o ControlPersist~ invocation, keeps the
-    tab open on failure (shows the exit code), and on success automatically
-    reattaches every session on that host (~tmux -CC new-session -A~). A
-    plain ~ssh host~ tab should not look like a valid login.
-  - [ ] *Status in the session panel*: master alive / gone, last attempt,
-    next retry time, and whether the tmux session + its job are still alive
-    on the host (cheap ~tmux has-session~ over the master once it is back).
-  - [ ] *Keep the master alive across sleep*: ~ServerAliveInterval~ /
-    ~ServerAliveCountMax~ on the master, and a longer ~ControlPersist~ while
-    remote jobs are registered.
-- [ ] ~bib --insert~ — drop ~[cite:@key]~ at the cursor from a search result.
-- [ ] ~bib --extract~ — write the current file's cited keys to a slim project
-  ~refs.bib~ at export time.
-- [ ] *otd-import: mark accepted edits* — accepted edits (Word's accept
-  strips the w:ins/w:del runs) are carried but not *marked*: a clean
-  word-diff of canonical vs the reviewer's citation-normalised text,
-  emitting fresh ~{++/--/~~}~, would show what the acceptance changed.
-- [ ] *Matter as the highlight engine* — port the hand-rolled Org+CriticMarkup
-  highlighter (~highlightOrg~, synedit.nim) onto [[https://github.com/elcritch/matter][matter]], elcritch's synchronous
-  TextMate grammar engine for native Nim (JSON/plist ~.tmLanguage~ in, scope
-  tokens with UTF-8 byte offsets out; line-based with a ~ruleStack~ threaded
-  between lines; embedded-language dispatch; bundled VS Code grammar catalog).
-  The criticmarkup accept/reject commands (wkbcore.nim) work on raw text and
-  are untouched.
-  - [ ] Phase 1 — *spike* (go/no-go gate): vendor matter + the ~elcritch/reni~
-    fork (~feat/textmate-compat~, PR #84 pending upstream) like zippy/pixie;
-    ~parseRawGrammar~ a minimal grammar (headlines + directives), tokenize a
-    repo ~.org~ file, print scopes. Confirms Nim 2.2.0 compat, binary-size
-    cost, cold-start time.
-  - [ ] Phase 2 — *grammar*: author ~org.tmLanguage.json~ covering everything
-    ~highlightOrg~ does, with a scope convention built for the adapter:
-    ~critic.insertion/deletion/substitution/comment/highlight~ (substitution
-    splits old/new via captures), ~punctuation.definition.*~ for the markers
-    we hide, standard names (~markup.bold~, ~string.other.org~, …) elsewhere.
-    Snapshot tests (pinned token ranges + scopes) plus a golden test diffing
-    old vs new cell styles over the repo's own ~.org~ files.
-  - [ ] Phase 3 — *adapter* (~matterhl.nim~ in the vendored widget): scope →
-    ~TokenClass~ + ~cfHidden/cfBold/cfItalic~ mapping table; byte→cell offset
-    conversion (matter emits UTF-8 byte ranges, cells are per-grapheme);
-    rebuild ~srcBlockRanges~ from line states so folding is unchanged.
-  - [ ] Phase 4 — *incremental*: per-line token cache keyed on ~ruleStack~ —
-    re-tokenize from the edited line until the stack converges with the cache,
-    replacing today's full-buffer re-run on every keystroke. Extend
-    ~test_highlight_perf.nim~ to benchmark old vs new on manuscript-sized
-    files before trusting it.
-  - [ ] Phase 5 — *cleanup*: delete ~highlightOrg~ once the golden test passes;
-    Markdown/Rmd (matter ships a real Markdown grammar; our Rmd ~```{r}~
-    fences need the same embedded-dispatch treatment) is a separable
-    follow-up.
-  - Decisions: src-block *bodies* stay on stdlib ~GeneralTokenizer~ at first
-    (hybrid — matter marks the block boundaries only); upgrading to matter's
-    bundled VS Code grammars (ZIP-embedded, richer but heavier) is a later
-    step. Theme keeps the ~TokenClass~ mapping rather than adopting matter's
-    tmTheme pipeline. Main risk: the reni fork is a moving target on an
-    unmerged branch — vendoring pins it, updates are on us.
-
-* Changelog (recent)
-
-- *Babel sessions are nonce-safe and statement-wise*: every run carries a
-  unique nonce (BEGIN/END markers key on it), so a stale END left by a timed-out
-  long model fit can never poison the session; R blocks ~eval~ top-level forms
-  one by one (ESS-like), so one error is reported without aborting the rest;
-  the silence timeout is 10 min for model fits.
-- *run-all* (~C-c C-b~ / ~M-x run-all~ / ~ctl run-all~) runs every src block top
-  to bottom with a per-block ~[ok]/[ERR]~ report; the palette is wider (900 px)
-  with the best match on top while searching.
-- *Cut / selection over folds*: selecting across a folded region works — the
-  selection spans the fold instead of stopping at its edge.
-- *Bold at line start renders as body text*: org only treats a line as a
-  headline when the stars are followed by a space, so ~*Response.* …~
-  paragraphs keep body styling with a bold span — highlighter, big-font check,
-  outline and landmark nav all apply the same rule.
-- *LaTeX previews survive an export-only preamble*: a formula that fails to
-  compile with the buffer's ~#+LATEX_HEADER:~ lines (a beamer theme, fontspec
-  fonts for lualatex) is retried without them, and the rest of the document is
-  then rendered without them; the status line suggests moving export-only lines
-  to ~#+LATEX_HEADER_EXTRA:~, which previews never read (Org's convention).
-- *Beamer PDF export*: Export → ~beamer~ (~M-x beamer-pdf-export~) builds
-  ~<file>.pdf~ from org-beamer slides, no Emacs needed: pandoc (org → beamer)
-  writes the ~.tex~ — after the org-beamer bits it ignores are translated
-  (~BEAMER_col~ columns, ~BEAMER_opt~ frame options, ~ATTR_LATEX~ sizes,
-  ~#+BEAMER_*THEME~, ~H:~ as the slide level) and with ~#+PANDOC_OPTIONS~ /
-  ~#+PANDOC_VARIABLES~ passed through — then the ~#+LATEX_COMPILER~ (default
-  ~lualatex~; ~xelatex~, ~pdflatex~) runs on it directly, twice, in batchmode
-  with a per-pass timeout (~gBeamerLatexTimeout~). Nothing is evaluated: stored
-  ~#+RESULTS~ are exported per ~:exports~. Code goes to ~listings~, so a
-  ~\lstset~ in the header styles it (~gBeamerSrcBackend~).
-- *Config in ~~/.config/wkbenchless~*: ~edit-config~ (~C-c f~) no longer fails
-  with "config not found" on a ~nimble install~ed binary — it opens (creating
-  on first use) ~~/.config/wkbenchless/wkbconfig.nim~, which builds compile in
-  place of ~src/wkbconfig.nim~; it falls back to the source tree's copy
-  (~resolveBuildDir()~) if the config dir can't be written.
-- *Inline images via pixie*: PNG/JPG/GIF/… decode with the vendored, pure-Nim
-  [[https://github.com/treeform/pixie][pixie]] instead of shelling out to
-  ~magick~/~convert~, so figures render on machines without ImageMagick; the
-  flattened 24-bit BMP is cached as before. Inline images now also render for a
-  file opened straight from the command line (previously only via the Open
-  dialog set up the image flags).
-- *Reference context*: ~cite-context~ / ~cite-prose~ / ~cite-notes~ /
-  ~cite-paper~ / ~zotero-search~ verbs and the matching ~M-x~ commands (~C-c ?~),
-  reading your Zotero SQLite and manuscript corpus offline.
-- *Agent-control verbs*: ~bib <query>~ (search BibTeX without loading it),
-  ~cite-goto <key>~ (open the ~.bib~ and jump to the entry), and the
-  ~/ide~-parity ~open <path>~ / ~where~ / ~selection~.
-- *org/Rmd reading mode*: line numbers off by default (~C-c n~ /
-  ~toggle-line-numbers~ restores them); base font ~12pt (16px); per-extension
-  reading margins via ~setReadingMargin~ (prose centers, code blocks & tables stay
-  full width); Rmd/Markdown headings enlarged like org; org/Rmd table rules drawn
-  with box-drawing glyphs (~│ ─ ┼ ├ ┤~, display-only — the buffer stays ASCII).
-- *Citations render as ~@key~* — the ~[cite:~ / ~[cite/style:~ prefix and the
-  closing ~]~ are hidden (delimiters remain in the file, so export is unaffected).
-- *Tab folds Rmd ~```{r}~ chunks* (was org ~#+begin_src~ only).
-
-* Releases
-
-~.github/workflows/release.yml~ builds a *single ~wkbenchless~ binary* per
-platform (Linux/macOS/Windows) and attaches them to a GitHub release. Trigger it
-by pushing a version tag:
-
-#+begin_src sh
-git tag v0.2.2
-git push origin v0.2.2
-#+end_src
-
-or run it manually from the repo's *Actions* tab (“Build and release
-binaries” → /Run workflow/), giving the release tag as input. All three
-platforms build: Linux (X11) and macOS (Cocoa) with a POSIX PTY, and Windows
-with a ConPTY terminal and the winapi UI driver. The control socket is loopback
-TCP and works on *all three* (~wkbenchless ctl …~). The fd-handoff hot reload
-(~C-c r~ preserving sessions) is still POSIX-only; on Windows ~C-c r~ rebuilds
-and restarts without the live-session handoff.
 
 * License
 
-MIT. The legacy GTK editor (~src/nimacs.nim~) is kept for history but is no
-longer built.
+MIT. 

@@ -33,6 +33,7 @@ timeout. The CLI still *waits* for you by polling (`run-block`, `run-all` and
 ```sh
 wkbctl run-block 120 --async        # -> queued: job 7
 wkbctl jobs                         # id, state, label, elapsed for each job
+wkbctl tabs                         # bottom-pane tabs: key, name, kind, host, state
 wkbctl status 7                     # state line, then the output once done
 wkbctl wait 7 8                     # block until those jobs finish, with a report
 wkbctl interrupt 7                  # Ctrl-C a running job / drop a queued one
@@ -122,6 +123,8 @@ active buffer (the client sends the new file's path).
 ```sh
 nim c --hints:off -o:wkbenchless src/wkbenchless.nim   # the editor
 nim c --hints:off -o:wkbctl src/wkbctl.nim             # the control CLI
+# Linux builds the GPU driver (FigDraw + siwin) with Nim >= 2.4; an older nim
+# prints a note and builds the CPU X11 driver (-d:wkbX11 forces that).
 ```
 Extensions live in `extensions/*.nim` (each `proc extend*(app: var App)`), are
 compiled in on `C-c r`, and filenames must be valid Nim identifiers (use `_`).
