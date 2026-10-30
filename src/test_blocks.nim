@@ -199,4 +199,22 @@ doAssert id > 0 and c.termActive == -1 and c.curSession == "ctl", "session tab n
 settle(c)
 doAssert c.termActive == 0, "did not return to the claude tab"
 echo "ctl tab hand-off ok"
+
+# -- toggle-fold with no block above the cursor --------------------------------
+# The upward walk for the block opener once ran a Natural below 0 and the
+# OverflowDefect closed the whole app (cursor in an Rmd's prose before its
+# first chunk, or anywhere above an org file's first src block).
+for (lang, text) in [(langMarkdown, "Intro.\n\n```{r}\nx <- 1\n```\nend"),
+                     (langOrg, "* Head\ntext\n#+begin_src R\nx <- 1\n#+end_src\nend")]:
+  var f = App()
+  f.ed.setText(text)
+  f.ed.lang = lang
+  for ln in 1 .. text.countLines:
+    f.ed.gotoLine(ln, 0)
+    toggleFold(f)                         # must not raise, wherever the cursor is
+  f.ed.gotoLine(1, 0); toggleFold(f)
+  doAssert f.msg == "not on a src block", f.msg
+  f.ed.gotoLine(4, 0); toggleFold(f)
+  doAssert f.msg in ["folded", "unfolded"], f.msg
+echo "toggle-fold above the first block ok"
 echo "ALL OK"

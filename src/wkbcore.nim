@@ -1681,7 +1681,7 @@ proc blockStartLineAtCursor(app: App): int =
   ## Line index of the #+begin_src / Rmd ```{r} that opens the block the cursor
   ## sits in, -1.
   let cur = app.ed.currentLine
-  var i = cur
+  var i = cur.int     # an int, not currentLine's Natural: the walk ends at -1
   while i >= 0:
     let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
     if low.startsWith("#+begin_src"): return i
