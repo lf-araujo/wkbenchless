@@ -119,7 +119,7 @@ add more with ~addExecPath~.
 next to the binary: ~nimble bundle -- /path/to/zig~ (see
 ~scripts/bundle-toolchain.sh~); Nim uses ~zig cc~ as a hermetic C backend.
 
-* Remote control (~ctl~)
+* Control (~ctl~)
 
 The editor exposes a loopback control socket (127.0.0.1, token-authenticated)
 that drives a running instance — handy for scripts and for agents in the
