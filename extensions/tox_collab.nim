@@ -754,11 +754,15 @@ proc startShare*(app: var App) =
   # the tox transport: in-process, so peers behind NATs can reach :PORT too.
   # LAN sharing works either way -- tox is additive.
   s.tox = spawnServer()
-  app.msg = "collab: sharing on :" & $gToxPort & " (LAN) + tox -- waiting for the Tox ID..."
+  app.msg =
+    if toxAvailable: "collab: sharing on :" & $gToxPort & " (LAN) + tox -- waiting for the Tox ID..."
+    else: "collab: sharing on :" & $gToxPort & " (LAN only -- this build has no Tox tunnel)"
 
 proc joinOverTox(app: var App; toxId: string; remotePort: int) =
   ## Join through a tox tunnel: open the client forward, then connect
   ## through it (the tick hook retries; DHT traversal can take a minute).
+  if not toxAvailable:
+    app.msg = "collab: this build has no Tox tunnel -- join with host:port"; return
   if app.ed.changed:
     app.msg = "collab: save or discard this buffer first"; return
   let localPort = if gToxLocalPort > 0: gToxLocalPort else: gToxPort

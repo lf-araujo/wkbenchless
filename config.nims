@@ -54,6 +54,14 @@ block:
       if dirExists(pc):
         putEnv("PKG_CONFIG_PATH", pc)
         break
+## The Tox tunnel is optional: built (`wkbTox`) only when the nim-tuntox
+## checkout AND a pkg-config-visible toxcore are both here. Without them --
+## CI, the release binaries -- collab is LAN / host:port only (src/wkbtox.nim).
+## -d:wkbNoTox leaves it out regardless.
+when not defined(wkbNoTox):
+  if fileExists(tuntoxDir & "/src/tuntox.nim") and
+     gorgeEx("pkg-config --exists toxcore").exitCode == 0:
+    switch("define", "wkbTox")
 
 ## User config: ~/.config/wkbenchless/wkbconfig.nim (XDG_CONFIG_HOME, or
 ## %APPDATA% on Windows) is compiled in place of src/wkbconfig.nim when it exists,

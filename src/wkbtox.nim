@@ -26,9 +26,18 @@
 ##
 ## The editor tick calls poll() every frame; each poll drives tox_iterate
 ## plus the tunnel sockets. No threads, no child processes.
+##
+## Optional: config.nims defines `wkbTox` only when the nim-tuntox checkout
+## and a pkg-config-visible toxcore are both found. Without them (CI, the
+## release binaries) this module keeps its API but the tunnel is absent:
+## spawnServer/spawnClient return nil, so collab is LAN / host:port only.
 
 import std/[os, strutils, net]
-import tuntox
+when defined(wkbTox):
+  import tuntox
+
+const toxAvailable* = defined(wkbTox)
+  ## This build has the Tox tunnel (see the note above).
 
 const toxIdLen = 76     ## TOX_ADDRESS_SIZE (38 bytes) as hex
 
@@ -54,46 +63,65 @@ proc forwardUp*(port: int): bool =
   except OSError, IOError: return false
   true
 
-type
-  ToxTransport* = ref object
-    server*: TunnelServer    ## host side (nil on the guest)
-    client*: TunnelClient    ## guest side (nil on the host)
-    id*: string              ## host: our Tox ID, set at spawn
-    idPath*: string          ## host: where our_id is written for other tools
-    announced: bool          ## host: poll() reported the ID once
+when not toxAvailable:
+  type
+    ToxTransport* = ref object
+      id*: string              ## (always empty: no tunnel in this build)
+      idPath*: string
 
-proc spawnServer*(stateDir = ""): ToxTransport =
-  ## Server mode: stable identity in the cache dir (or STATEDIR), the
-  ## printable Tox ID available immediately (and mirrored to our_id).
-  let d = if stateDir.len > 0: stateDir else: toxDir()
-  let srv = newTunnelServer(d, gToxSecret)
-  result = ToxTransport(server: srv, id: srv.toxId(), idPath: d / "our_id")
-  writeFile(result.idPath, result.id & "\n")
+  proc spawnServer*(stateDir = ""): ToxTransport =
+    ## No tunnel in this build: sharing stays LAN-only.
+    nil
 
-proc spawnClient*(toxId: string; localPort, remotePort: int;
-    stateDir = ""): ToxTransport =
-  ## Client mode: forward 127.0.0.1:LOCALPORT to the collab port on the
-  ## host behind TOXID. The listener binds immediately; the tunnel forms
-  ## once the friend request (carrying the shared secret) is accepted.
-  let cl = newTunnelClient(
-    if stateDir.len > 0: stateDir else: toxDir(), gToxSecret, toxId)
-  discard cl.addForward(localPort, "127.0.0.1", remotePort.uint16)
-  ToxTransport(client: cl)
+  proc spawnClient*(toxId: string; localPort, remotePort: int;
+      stateDir = ""): ToxTransport =
+    ## No tunnel in this build: callers check `toxAvailable` first.
+    nil
 
-proc poll*(t: ToxTransport): bool =
-  ## One non-blocking step: drive tox and the tunnel sockets. True when
-  ## the Tox ID just became visible (host, first tick after spawn).
-  if t == nil: return false
-  if t.server != nil: t.server.poll()
-  if t.client != nil: t.client.poll()
-  if t.id.len > 0 and not t.announced:
-    t.announced = true
-    return true
-  false
+  proc poll*(t: ToxTransport): bool = false
+  proc stop*(t: ToxTransport) = discard
 
-proc stop*(t: ToxTransport) =
-  ## Nothing to kill anymore -- the identity is persisted in toxDir and
-  ## the GC reclaims the tox instance with the session.
-  if t == nil: return
-  if t.server != nil: t.server.saveState()
-  if t.client != nil: t.client.saveState()
+when toxAvailable:
+  type
+    ToxTransport* = ref object
+      server*: TunnelServer    ## host side (nil on the guest)
+      client*: TunnelClient    ## guest side (nil on the host)
+      id*: string              ## host: our Tox ID, set at spawn
+      idPath*: string          ## host: where our_id is written for other tools
+      announced: bool          ## host: poll() reported the ID once
+
+  proc spawnServer*(stateDir = ""): ToxTransport =
+    ## Server mode: stable identity in the cache dir (or STATEDIR), the
+    ## printable Tox ID available immediately (and mirrored to our_id).
+    let d = if stateDir.len > 0: stateDir else: toxDir()
+    let srv = newTunnelServer(d, gToxSecret)
+    result = ToxTransport(server: srv, id: srv.toxId(), idPath: d / "our_id")
+    writeFile(result.idPath, result.id & "\n")
+
+  proc spawnClient*(toxId: string; localPort, remotePort: int;
+      stateDir = ""): ToxTransport =
+    ## Client mode: forward 127.0.0.1:LOCALPORT to the collab port on the
+    ## host behind TOXID. The listener binds immediately; the tunnel forms
+    ## once the friend request (carrying the shared secret) is accepted.
+    let cl = newTunnelClient(
+      if stateDir.len > 0: stateDir else: toxDir(), gToxSecret, toxId)
+    discard cl.addForward(localPort, "127.0.0.1", remotePort.uint16)
+    ToxTransport(client: cl)
+
+  proc poll*(t: ToxTransport): bool =
+    ## One non-blocking step: drive tox and the tunnel sockets. True when
+    ## the Tox ID just became visible (host, first tick after spawn).
+    if t == nil: return false
+    if t.server != nil: t.server.poll()
+    if t.client != nil: t.client.poll()
+    if t.id.len > 0 and not t.announced:
+      t.announced = true
+      return true
+    false
+
+  proc stop*(t: ToxTransport) =
+    ## Nothing to kill anymore -- the identity is persisted in toxDir and
+    ## the GC reclaims the tox instance with the session.
+    if t == nil: return
+    if t.server != nil: t.server.saveState()
+    if t.client != nil: t.client.saveState()
