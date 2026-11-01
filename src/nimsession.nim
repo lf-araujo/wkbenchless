@@ -21,11 +21,13 @@ when defined(windows):
   proc cDup(fd: cint): cint {.importc: "_dup", header: "<io.h>".}
   proc cDup2(fd, fd2: cint): cint {.importc: "_dup2", header: "<io.h>".}
   proc cClose(fd: cint): cint {.importc: "_close", header: "<io.h>".}
+  proc cFileno(f: File): cint {.importc: "_fileno", header: "<stdio.h>".}
   const libExt = ".dll"
 else:
   proc cDup(fd: cint): cint {.importc: "dup", header: "<unistd.h>".}
   proc cDup2(fd, fd2: cint): cint {.importc: "dup2", header: "<unistd.h>".}
   proc cClose(fd: cint): cint {.importc: "close", header: "<unistd.h>".}
+  proc cFileno(f: File): cint {.importc: "fileno", header: "<stdio.h>".}
   const libExt = ".so"
 
 # ---- cache keys / compile ---------------------------------------------------
@@ -145,7 +147,8 @@ proc runLib(soPath: string): tuple[stdout: string, err: string] =
   if not open(cap, capPath, fmWrite): return ("", "could not create " & capPath)
   stdout.flushFile()
   let savedOut = cDup(1)
-  discard cDup2(getFileHandle(cap), 1)
+  discard cDup2(cFileno(cap), 1)   # the C runtime's fd (getFileHandle is an
+                                    # OS HANDLE on Windows in newer Nims)
   var runErr = ""
   let lib = loadLib(soPath)
   if lib == nil: runErr = "could not load " & soPath
