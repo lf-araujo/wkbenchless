@@ -305,7 +305,7 @@ proc enterResolve(app: var App; s: CollabSession; markedUp: string) =
 
 proc dropPeer(s: CollabSession; fd: int) =
   if not s.peers.hasKey(fd): return
-  try: s.sel.unregister(fd)
+  try: s.sel.unregister(fd.SocketHandle)
   except CatchableError: discard
   try: s.peers[fd].sock.close()
   except OSError, IOError: discard
@@ -638,7 +638,9 @@ proc tick(app: var App; s: CollabSession) =
       sock.connect(host, Port(s.pendingToxPort))
       sock.getFd().setBlocking(false)
       let fd = sock.getFd().int
-      s.sel.registerHandle(fd, {selectors.Event.Read}, 0)
+      # selectors take the SocketHandle: Windows' select backend has no
+      # int overload (POSIX accepts both)
+      s.sel.registerHandle(fd.SocketHandle, {selectors.Event.Read}, 0)
       s.peers[fd] = Peer(sock: sock, site: 1, buf: "")
       s.peers[fd].sendLine(%*{"t": "hello", "v": wireVersion,
                               "name": collabName()})
@@ -663,7 +665,7 @@ proc tick(app: var App; s: CollabSession) =
         accept(s.listen, client)
         client.getFd().setBlocking(false)
         let fd = client.getFd().int
-        s.sel.registerHandle(fd, {selectors.Event.Read}, 0)
+        s.sel.registerHandle(fd.SocketHandle, {selectors.Event.Read}, 0)
         s.peers[fd] = Peer(sock: client, site: 0, buf: "")
       except OSError: discard
       continue
@@ -720,7 +722,7 @@ proc endSession*(app: var App) =
     for fd, p in session.peers.mpairs: p.sendLine(%*{"t": "bye"})
   for fd in toSeq(session.peers.keys): session.dropPeer(fd)
   if session.isHost:
-    try: session.sel.unregister(session.listen.getFd().int)
+    try: session.sel.unregister(session.listen.getFd())
     except CatchableError: discard
     try: session.listen.close()
     except OSError, IOError: discard
@@ -744,7 +746,7 @@ proc startShare*(app: var App) =
   let s = CollabSession(
     isHost: true, site: 1, nextSite: 2, listen: listen,
     sel: newSelector[int](), filePath: app.filePath)
-  s.sel.registerHandle(listen.getFd().int, {selectors.Event.Read}, 0)
+  s.sel.registerHandle(listen.getFd(), {selectors.Event.Read}, 0)
   # the current buffer becomes the document
   let text = app.ed.fullText()
   discard s.doc.localInsert(0, text, s.site)
@@ -804,7 +806,7 @@ proc joinSession*(app: var App; target: string) =
   let s = CollabSession(
     isHost: false, site: 0, sel: newSelector[int](), filePath: app.filePath,
     redialHost: host, redialPort: port.int)
-  s.sel.registerHandle(sock.getFd().int, {selectors.Event.Read}, 0)
+  s.sel.registerHandle(sock.getFd(), {selectors.Event.Read}, 0)
   s.peers[sock.getFd().int] = Peer(sock: sock, site: 1, buf: "")
   s.shadow = app.ed.fullText()      # don't broadcast pre-sync content
   s.lastVersion = app.ed.editVersion()
