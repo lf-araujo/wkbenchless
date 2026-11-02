@@ -39,6 +39,13 @@ let tuntoxDir =
   else: thisDir() & "/../nim-tuntox"
 switch("path", tuntoxDir & "/src")
 block:
+  ## WKB_PKG_CONFIG_PATH goes in front of PKG_CONFIG_PATH: CI points it at the
+  ## static toxcore (an MSYS2 login shell resets PKG_CONFIG_PATH itself).
+  let wkbPc = getEnv("WKB_PKG_CONFIG_PATH")
+  if wkbPc.len > 0:
+    let old = getEnv("PKG_CONFIG_PATH")
+    let sep = when buildOS == "windows": ";" else: ":"
+    putEnv("PKG_CONFIG_PATH", if old.len > 0: wkbPc & sep & old else: wkbPc)
   if getEnv("PKG_CONFIG_PATH").len == 0:
     for pc in [getHomeDir() & ".local/lib64/pkgconfig",
                getHomeDir() & ".local/lib/pkgconfig",
