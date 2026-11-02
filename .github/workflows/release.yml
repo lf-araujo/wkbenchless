@@ -100,7 +100,7 @@ jobs:
 
       - name: Build toxcore (static)
         if: steps.toxcache.outputs.cache-hit != 'true'
-        run: scripts/build-toxcore.sh .toxcore
+        run: bash scripts/build-toxcore.sh .toxcore
 
       - name: Point the build at Tox
         run: |
