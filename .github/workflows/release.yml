@@ -34,14 +34,20 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - { os: ubuntu-22.04,   label: linux_x86_64,  exe: '',     nim: '2.4.0' }  # GPU build needs >= 2.4
-          - { os: macos-latest,   label: macos_arm64,   exe: '',     nim: '2.2.6' }
-          - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.2.6' }
+          - { os: ubuntu-22.04,   label: linux_x86_64,  exe: '',     nim: '2.4.0', shell: bash }  # GPU build needs >= 2.4
+          - { os: macos-latest,   label: macos_arm64,   exe: '',     nim: '2.2.6', shell: bash }
+          - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.2.6', shell: 'msys2 {0}' }
           # NOTE: the macOS x86_64 leg (runs-on: macos-13, Intel) is dropped --
           # that runner never got scheduled and left every release job stuck in
           # `needs: build`, so no release ever published. macos-latest (Apple
           # Silicon / arm64) covers current Macs; Intel Mac users build from
           # source until a reliable Intel runner is available.
+
+    # Windows: every `run:` goes through the MSYS2 MINGW64 shell, so Nim
+    # compiles with the same gcc and pkg-config that built toxcore.
+    defaults:
+      run:
+        shell: ${{ matrix.config.shell }}
 
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +65,52 @@ jobs:
 
       # macOS needs no extra deps: uirelays uses the native Cocoa driver.
 
+      # -- Tox tunnel: nim-tuntox + a static c-toxcore/libsodium ---------------
+      # The binaries carry the in-process Tox tunnel (extensions/tox_collab.nim).
+      # config.nims turns it on (-d:wkbTox) when it finds the nim-tuntox
+      # checkout at $WKB_TUNTOX_DIR and toxcore through pkg-config.
+      - name: Set up MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit
+          install: >-
+            make mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf
+
+      - name: Install pkg-config (macOS)
+        if: runner.os == 'macOS'
+        run: brew list pkgconf >/dev/null 2>&1 || brew install pkgconf
+
+      - name: Fetch nim-tuntox
+        uses: actions/checkout@v4
+        with:
+          repository: lf-araujo/nim-tuntox
+          ref: 442e9b20f0cab144d41956a874ad3b2335b2b509  # lf-araujo/nim-tuntox master
+          path: nim-tuntox
+
+      - name: Cache toxcore
+        id: toxcache
+        uses: actions/cache@v4
+        with:
+          path: .toxcore
+          key: toxcore-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-toxcore.sh') }}
+
+      - name: Build toxcore (static)
+        if: steps.toxcache.outputs.cache-hit != 'true'
+        run: scripts/build-toxcore.sh .toxcore
+
+      - name: Point the build at Tox
+        run: |
+          ws="$GITHUB_WORKSPACE"
+          if command -v cygpath >/dev/null 2>&1; then ws="$(cygpath -m "$ws")"; fi
+          echo "WKB_TUNTOX_DIR=$ws/nim-tuntox" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$ws/.toxcore/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "WKB_REQUIRE_TOX=1" >> "$GITHUB_ENV"
+          PKG_CONFIG_PATH="$ws/.toxcore/lib/pkgconfig" pkg-config --static --libs toxcore
+
       # ── Install Nim ────────────────────────────────────────────────────────
       - name: Install Nim
         uses: jiro4989/setup-nim-action@v2
@@ -72,19 +124,18 @@ jobs:
 
       # ── Build the single binary ────────────────────────────────────────────
       - name: Build wkbenchless
-        shell: bash
         run: |
           # One binary per platform: `wkbenchless ctl <verb>` (or a `wkbctl`
           # symlink) is the control client, so no separate wkbctl is shipped.
           # On Windows the editor is a GUI-subsystem app (no console window).
           GUI=""
-          if [ -n "${{ matrix.config.exe }}" ]; then GUI="--app:gui"; fi
+          # Windows links static (toxcore's pthreads, libgcc): one .exe, no DLLs.
+          if [ -n "${{ matrix.config.exe }}" ]; then GUI="--app:gui --passL:-static"; fi
           nim c -d:release -d:danger --opt:size $GUI \
             -o:wkbenchless${{ matrix.config.exe }} src/wkbenchless.nim
 
       # ── Name the binary by platform (shipped as-is, no archive) ────────────
       - name: Name the artifact
-        shell: bash
         run: |
           ASSET="wkbenchless_${{ matrix.config.label }}${{ matrix.config.exe }}"
           cp "wkbenchless${{ matrix.config.exe }}" "$ASSET"

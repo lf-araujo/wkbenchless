@@ -19,9 +19,15 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - { os: ubuntu-22.04,   label: linux_x86_64,   exe: '',     nim: '2.4.0' }  # GPU build needs >= 2.4
-          - { os: macos-latest,   label: macos_arm64,    exe: '',     nim: '2.2.6' }
-          - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.2.6' }
+          - { os: ubuntu-22.04,   label: linux_x86_64,   exe: '',     nim: '2.4.0', shell: bash }  # GPU build needs >= 2.4
+          - { os: macos-latest,   label: macos_arm64,    exe: '',     nim: '2.2.6', shell: bash }
+          - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.2.6', shell: 'msys2 {0}' }
+
+    # Windows: every `run:` goes through the MSYS2 MINGW64 shell, so Nim
+    # compiles with the same gcc and pkg-config that built toxcore.
+    defaults:
+      run:
+        shell: ${{ matrix.config.shell }}
 
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +42,52 @@ jobs:
             libx11-dev libxft-dev libxext-dev libxrender-dev \
             libfontconfig1-dev libfreetype6-dev
 
+      # -- Tox tunnel: nim-tuntox + a static c-toxcore/libsodium ---------------
+      # The binaries carry the in-process Tox tunnel (extensions/tox_collab.nim).
+      # config.nims turns it on (-d:wkbTox) when it finds the nim-tuntox
+      # checkout at $WKB_TUNTOX_DIR and toxcore through pkg-config.
+      - name: Set up MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit
+          install: >-
+            make mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf
+
+      - name: Install pkg-config (macOS)
+        if: runner.os == 'macOS'
+        run: brew list pkgconf >/dev/null 2>&1 || brew install pkgconf
+
+      - name: Fetch nim-tuntox
+        uses: actions/checkout@v4
+        with:
+          repository: lf-araujo/nim-tuntox
+          ref: 442e9b20f0cab144d41956a874ad3b2335b2b509  # lf-araujo/nim-tuntox master
+          path: nim-tuntox
+
+      - name: Cache toxcore
+        id: toxcache
+        uses: actions/cache@v4
+        with:
+          path: .toxcore
+          key: toxcore-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-toxcore.sh') }}
+
+      - name: Build toxcore (static)
+        if: steps.toxcache.outputs.cache-hit != 'true'
+        run: scripts/build-toxcore.sh .toxcore
+
+      - name: Point the build at Tox
+        run: |
+          ws="$GITHUB_WORKSPACE"
+          if command -v cygpath >/dev/null 2>&1; then ws="$(cygpath -m "$ws")"; fi
+          echo "WKB_TUNTOX_DIR=$ws/nim-tuntox" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$ws/.toxcore/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "WKB_REQUIRE_TOX=1" >> "$GITHUB_ENV"
+          PKG_CONFIG_PATH="$ws/.toxcore/lib/pkgconfig" pkg-config --static --libs toxcore
+
       - name: Install Nim
         uses: jiro4989/setup-nim-action@v2
         with:
@@ -47,10 +99,11 @@ jobs:
 
       # The same flags release.yml ships with (Windows: a GUI-subsystem app).
       - name: Build wkbenchless + wkbctl
-        shell: bash
         run: |
+          set -e
           GUI=""
-          if [ -n "${{ matrix.config.exe }}" ]; then GUI="--app:gui"; fi
+          # Windows links static (toxcore's pthreads, libgcc): one .exe, no DLLs.
+          if [ -n "${{ matrix.config.exe }}" ]; then GUI="--app:gui --passL:-static"; fi
           nim c -d:release --hints:off $GUI \
             -o:wkbenchless${{ matrix.config.exe }} src/wkbenchless.nim
           nim c -d:release --hints:off \
@@ -61,15 +114,14 @@ jobs:
       # tests drive bash REPLs over a PTY. Manual integration tools
       # (test_tmux_remote, test_highlight_perf) take arguments and are not here.
       - name: Run tests
-        shell: bash
         run: |
           tests="test_bib test_cite test_collab_diverge test_diff test_hist
                  test_landmark test_logoot test_otd_spans test_regex
                  test_rmd_fold test_search test_session_view test_supplement
-                 test_tmuxctl test_utf8_cursor"
+                 test_tmuxctl test_tox_transport test_utf8_cursor"
           if [ "$RUNNER_OS" != "Windows" ]; then
             tests="$tests test_async_session test_blocks test_dag
-                   test_ssh_reconnect test_tox_transport"
+                   test_ssh_reconnect"
           fi
           failed=""
           for t in $tests; do
