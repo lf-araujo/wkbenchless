@@ -65,7 +65,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: lf-araujo/nim-tuntox
-          ref: be17e6535758f960030f35661710c83496ce59e7  # lf-araujo/nim-tuntox master
+          ref: 0079659e16b7d5f9bef858270c3dfc36cfa0143c  # lf-araujo/nim-tuntox master
           path: nim-tuntox
 
       - name: Cache toxcore
