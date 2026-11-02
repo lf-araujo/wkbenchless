@@ -65,7 +65,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: lf-araujo/nim-tuntox
-          ref: 680d038a6c07f168547369f2b1630ac892af3b6b  # lf-araujo/nim-tuntox master
+          ref: be17e6535758f960030f35661710c83496ce59e7  # lf-araujo/nim-tuntox master
           path: nim-tuntox
 
       - name: Cache toxcore
@@ -84,7 +84,13 @@ jobs:
           ws="$GITHUB_WORKSPACE"
           if command -v cygpath >/dev/null 2>&1; then ws="$(cygpath -m "$ws")"; fi
           echo "WKB_TUNTOX_DIR=$ws/nim-tuntox" >> "$GITHUB_ENV"
-          echo "WKB_PKG_CONFIG_PATH=$ws/.toxcore/lib/pkgconfig" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then
+            # every MSYS2 login shell resets PKG_CONFIG_PATH; prepend after it
+            echo "export PKG_CONFIG_PATH=\"$(cygpath -u "$ws")/.toxcore/lib/pkgconfig:\$PKG_CONFIG_PATH\"" \
+              > /etc/profile.d/wkb-toxcore.sh
+          else
+            echo "PKG_CONFIG_PATH=$ws/.toxcore/lib/pkgconfig" >> "$GITHUB_ENV"
+          fi
           echo "WKB_REQUIRE_TOX=1" >> "$GITHUB_ENV"
           PKG_CONFIG_PATH="$ws/.toxcore/lib/pkgconfig" pkg-config --static --libs toxcore
 
