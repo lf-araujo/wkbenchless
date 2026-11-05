@@ -1387,8 +1387,8 @@ proc main() =
           for c in vrow: rowStr.add (if c.ch.len == 0: " " else: c.ch)
           visText.add rowStr
         if ap[].alive and atTail:               # block cursor (inverse cell)
-          let cc = vt.grid[vt.cy][vt.cx]
-          let cxr = body.x + vt.cx * charW
+          let cc = vt.grid[vt.cy][vt.cursorCol]
+          let cxr = body.x + vt.cursorCol * charW
           let cyr = body.y + vt.cy * lineH
           fillRect(rect(cxr, cyr, charW, lineH), app.theme.termFg)
           discard drawText(app.font, cxr, cyr, (if cc.ch.len == 0: " " else: cc.ch),

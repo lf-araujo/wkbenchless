@@ -79,6 +79,8 @@ when not toxAvailable:
     nil
 
   proc poll*(t: ToxTransport): bool = false
+  proc friendConnected*(t: ToxTransport): bool = false
+  proc networkConnected*(t: ToxTransport): bool = false
   proc stop*(t: ToxTransport) = discard
 
 when toxAvailable:
@@ -118,6 +120,20 @@ when toxAvailable:
       t.announced = true
       return true
     false
+
+  proc friendConnected*(t: ToxTransport): bool =
+    ## Guest: the host's Tox accepted us and the friend link is up -- only
+    ## then can the forward carry data. A wrong shared secret is dropped by
+    ## the host without a reply, so this simply never turns true.
+    t != nil and t.client != nil and t.client.friendConnected
+
+  proc networkConnected*(t: ToxTransport): bool =
+    ## Whether we are on the Tox network at all. Stays false when a firewall
+    ## or endpoint filter (e.g. a corporate proxy agent) drops Tox traffic.
+    if t == nil: false
+    elif t.client != nil: t.client.networkConnected
+    elif t.server != nil: t.server.networkConnected
+    else: false
 
   proc stop*(t: ToxTransport) =
     ## Nothing to kill anymore -- the identity is persisted in toxDir and

@@ -1,0 +1,7 @@
+{
+  "name": "wkb-view",
+  "version": "0.1.0",
+  "description": "Display math and PNGs drawn as images, a Diffs pane that follows every edit, and edits collapsed to one line when running inside wkbenchless",
+  "types": "./types/index.d.ts",
+  "license": "MIT"
+}

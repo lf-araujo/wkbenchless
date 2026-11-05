@@ -159,7 +159,8 @@ proc configure*(app: var App) =
   # TRAMP methods from ~/.emacs.d/init.el, so the same headers work in both.
   # The env SHELL=/bin/sh mirrors their tramp-login-env.
   defineRemoteMethod("workq", "env SHELL=/bin/sh qsub -I -q workq -l ncpus=23")
-  defineRemoteMethod("magma", "env SHELL=/bin/sh qsub -I -q magma -lnodes=giant")
+  # magma runs on node27-node33 since Oct 2026; giant moved to workq.
+  defineRemoteMethod("magma", "env SHELL=/bin/sh qsub -I -q magma -l ncpus=23")
   # Max seconds to wait for each login step's shell (a busy queue may need longer).
   # Note: the editor waits while the job starts.
   gRemoteLaunchTimeout = 600
@@ -176,6 +177,8 @@ proc configure*(app: var App) =
   # launch claude with no injected hooks.
   gClaudeDiffHooks = true
   # gClaudeDiffHooks = false             # opt out of the diff-on-edit popups
+  # gClaudeMod = false                   # don't load the wkb-view mod (formulas and
+                                         # PNGs as pictures; claude-mod/wkb-view)
 
   # CriticMarkup (tracked changes) is fontified in org buffers automatically:
   # {++ins++} green, {--del--} red, {~~old~>new~~} red->green, {>>comment<<}

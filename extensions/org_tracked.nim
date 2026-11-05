@@ -126,6 +126,12 @@ proc fillEmptyTableRow*(ln: string): string =
   let lead = ln.len - ln.strip(trailing = false).len
   ln[0 ..< lead] & "|   " & s[s.find('|', 1) .. ^1]
 
+const orgToMdFormat* = "markdown-simple_tables-multiline_tables-grid_tables+pipe_tables"
+  ## The markdown pandoc writes for the org -> md pass. Pipe tables only: simple,
+  ## multiline and grid tables locate cells by column position, so swapping a
+  ## stashed CriticMarkup sentinel for its much longer `[..]{.insertion ..}' span
+  ## shifts text across column boundaries and the span leaks as literal text.
+
 const ruleMark* = "OTDRULEMARK"
   ## Sentinel put in the first cell of the row below an interior table rule;
   ## drawRuleRows turns it into a top border in the docx and removes it.
@@ -2934,7 +2940,7 @@ proc otdExport(app: var App) =
   writeFile(orgTmp, orgStashed)
   let md = getTempDir() / "otd-export.md"
   # -s carries #+TITLE etc. as YAML metadata into the markdown.
-  var (code, outp) = pandoc(@["-f", "org", "-t", "markdown", "--wrap=none", "-s", orgTmp, "-o", md])
+  var (code, outp) = pandoc(@["-f", "org", "-t", orgToMdFormat, "--wrap=none", "-s", orgTmp, "-o", md])
   if code != 0: (app.msg = "pandoc org->md failed: " & outp.strip(); return)
   var doneIds: seq[int]
   var options: seq[string]                          # sub/superscript etc. settings apply

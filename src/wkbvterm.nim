@@ -15,6 +15,8 @@ type
     ch*: string        ## one UTF-8 grapheme; "" renders as a blank
     fg*, bg*: Color
     inv*: bool         ## reverse video (swap fg/bg at draw time)
+    wide*: bool        ## primary cell of a double-width glyph (CJK, emoji, ...)
+    cont*: bool        ## trailing (blank) half of the double-width glyph before it
   VtState = enum vsGround, vsEsc, vsCsi, vsOsc
   VTerm* = ref object
     rows*, cols*: int
@@ -36,6 +38,12 @@ type
     par: string                ## collected CSI parameter bytes
     priv: bool                 ## CSI '?' private marker
     osc: string
+    pending: string             ## a UTF-8 sequence truncated at the end of the last
+                                 ## `write` (pty reads land wherever the kernel split
+                                 ## them, not on character boundaries); completed by
+                                 ## whatever `write` brings next instead of being torn
+                                 ## into a garbage lead byte plus orphaned continuation
+                                 ## bytes that each printed as their own stray glyph.
 
 const maxScrollback = 5000    ## cap history so a long-running shell stays bounded
 const scrollbackTrimAt = maxScrollback * 2   ## trim only past this, so the cap is amortized O(1)
@@ -143,13 +151,119 @@ proc lineFeed(t: VTerm) =
   if t.cy == t.bot: t.scrollUp()
   elif t.cy < t.rows - 1: inc t.cy
 
-proc putChar(t: VTerm; ch: string) =
-  if t.cx >= t.cols:            # wrap
+# --- Unicode display width ---------------------------------------------------
+# wkbenchless used to advance the cursor by exactly one column per grapheme,
+# full stop. That disagrees with whatever wrote the bytes in the first place:
+# once the producer and this terminal disagree on the column a redraw lands in,
+# every cursor move after such a glyph on the line is off, and partial repaints
+# leave old and new glyphs interleaved. Producers (wcwidth; `string-width`, as
+# used by Ink TUIs) give 2 columns only to East Asian Wide/Fullwidth characters,
+# so symbols such as the ● ❯ ✓ ▶ ⚠ a TUI prints are 1: treating whole symbol
+# blocks as 2 scrambled every line that held one. `wideSymbols` is therefore
+# the exact EAW=W list for the symbol and emoji planes, not block ranges.
+
+proc decodeRune(s: string): int =
+  ## Decode the single UTF-8 grapheme `s` (as sliced by `write`, so its length
+  ## already matches the lead byte) to its code point.
+  if s.len == 0: return 0
+  let b0 = s[0].uint8
+  case s.len
+  of 1: b0.int
+  of 2: ((b0.int and 0x1F) shl 6) or (s[1].uint8.int and 0x3F)
+  of 3: ((b0.int and 0x0F) shl 12) or ((s[1].uint8.int and 0x3F) shl 6) or
+        (s[2].uint8.int and 0x3F)
+  of 4: ((b0.int and 0x07) shl 18) or ((s[1].uint8.int and 0x3F) shl 12) or
+        ((s[2].uint8.int and 0x3F) shl 6) or (s[3].uint8.int and 0x3F)
+  else: 0xFFFD
+
+# Unicode 16.0.0 East_Asian_Width=W, U+2190..U+2BFF and U+1F000..U+1FAFF.
+const wideSymbols = [
+  (0x231A, 0x231B), (0x2329, 0x232A), (0x23E9, 0x23EC), (0x23F0, 0x23F0),
+  (0x23F3, 0x23F3), (0x25FD, 0x25FE), (0x2614, 0x2615), (0x2630, 0x2637),
+  (0x2648, 0x2653), (0x267F, 0x267F), (0x268A, 0x268F), (0x2693, 0x2693),
+  (0x26A1, 0x26A1), (0x26AA, 0x26AB), (0x26BD, 0x26BE), (0x26C4, 0x26C5),
+  (0x26CE, 0x26CE), (0x26D4, 0x26D4), (0x26EA, 0x26EA), (0x26F2, 0x26F3),
+  (0x26F5, 0x26F5), (0x26FA, 0x26FA), (0x26FD, 0x26FD), (0x2705, 0x2705),
+  (0x270A, 0x270B), (0x2728, 0x2728), (0x274C, 0x274C), (0x274E, 0x274E),
+  (0x2753, 0x2755), (0x2757, 0x2757), (0x2795, 0x2797), (0x27B0, 0x27B0),
+  (0x27BF, 0x27BF), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55),
+  (0x1F004, 0x1F004), (0x1F0CF, 0x1F0CF), (0x1F18E, 0x1F18E),
+  (0x1F191, 0x1F19A), (0x1F200, 0x1F202), (0x1F210, 0x1F23B),
+  (0x1F240, 0x1F248), (0x1F250, 0x1F251), (0x1F260, 0x1F265),
+  (0x1F300, 0x1F320), (0x1F32D, 0x1F335), (0x1F337, 0x1F37C),
+  (0x1F37E, 0x1F393), (0x1F3A0, 0x1F3CA), (0x1F3CF, 0x1F3D3),
+  (0x1F3E0, 0x1F3F0), (0x1F3F4, 0x1F3F4), (0x1F3F8, 0x1F43E),
+  (0x1F440, 0x1F440), (0x1F442, 0x1F4FC), (0x1F4FF, 0x1F53D),
+  (0x1F54B, 0x1F54E), (0x1F550, 0x1F567), (0x1F57A, 0x1F57A),
+  (0x1F595, 0x1F596), (0x1F5A4, 0x1F5A4), (0x1F5FB, 0x1F64F),
+  (0x1F680, 0x1F6C5), (0x1F6CC, 0x1F6CC), (0x1F6D0, 0x1F6D2),
+  (0x1F6D5, 0x1F6D7), (0x1F6DC, 0x1F6DF), (0x1F6EB, 0x1F6EC),
+  (0x1F6F4, 0x1F6FC), (0x1F7E0, 0x1F7EB), (0x1F7F0, 0x1F7F0),
+  (0x1F90C, 0x1F93A), (0x1F93C, 0x1F945), (0x1F947, 0x1F9FF),
+  (0x1FA70, 0x1FA7C), (0x1FA80, 0x1FA89), (0x1FA8F, 0x1FAC6),
+  (0x1FACE, 0x1FADC), (0x1FADF, 0x1FAE9), (0x1FAF0, 0x1FAF8)]
+
+proc runeWidth(cp: int): int =
+  ## Display columns for code point `cp`: 0 for combining marks / invisible
+  ## formatting characters, 2 for East-Asian-wide/fullwidth characters (see
+  ## note above), 1 otherwise.
+  if (cp >= 0x0300 and cp <= 0x036F) or (cp >= 0x1AB0 and cp <= 0x1AFF) or
+     (cp >= 0x1DC0 and cp <= 0x1DFF) or (cp >= 0x20D0 and cp <= 0x20FF) or
+     (cp >= 0xFE00 and cp <= 0xFE0F) or (cp >= 0xFE20 and cp <= 0xFE2F) or
+     cp in [0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF]:
+    return 0
+  if (cp >= 0x1100 and cp <= 0x115F) or                 # Hangul Jamo
+     (cp >= 0x2E80 and cp <= 0x303E) or                 # CJK radicals/symbols
+     (cp >= 0x3041 and cp <= 0x33FF) or                 # Hiragana..CJK compat
+     (cp >= 0x3400 and cp <= 0x4DBF) or                 # CJK ext A
+     (cp >= 0x4E00 and cp <= 0x9FFF) or                 # CJK unified
+     (cp >= 0xA000 and cp <= 0xA4CF) or                 # Yi
+     (cp >= 0xAC00 and cp <= 0xD7A3) or                 # Hangul syllables
+     (cp >= 0xF900 and cp <= 0xFAFF) or                 # CJK compat ideographs
+     (cp >= 0xFE30 and cp <= 0xFE4F) or                 # CJK compat forms
+     (cp >= 0xFF00 and cp <= 0xFF60) or                 # fullwidth forms
+     (cp >= 0xFFE0 and cp <= 0xFFE6) or                 # fullwidth signs
+     (cp >= 0x20000 and cp <= 0x3FFFD):                 # CJK ext B+
+    return 2
+  for (lo, hi) in wideSymbols:
+    if cp >= lo and cp <= hi: return 2
+  1
+
+proc cursorCol*(t: VTerm): int =
+  ## The cell the cursor is on. `cx` itself reaches `cols` after a character
+  ## lands in the last column (pending wrap, so the next character wraps), which
+  ## is one past the end of a row: anything indexing the grid at the cursor
+  ## between writes must use this instead.
+  max(0, min(t.cx, t.cols - 1))
+
+proc clearPairAt(t: VTerm; cy, cx: int) =
+  ## Writing into one half of a previously double-width glyph leaves the
+  ## other half dangling (still marked wide/cont, showing stale content) --
+  ## blank it out too.
+  if cx < 0 or cx >= t.cols: return
+  let cell = t.grid[cy][cx]
+  if cell.wide and cx + 1 < t.cols and t.grid[cy][cx + 1].cont:
+    t.grid[cy][cx + 1] = Cell(ch: "", fg: t.defFg, bg: t.defBg)
+  elif cell.cont and cx - 1 >= 0 and t.grid[cy][cx - 1].wide:
+    t.grid[cy][cx - 1] = Cell(ch: "", fg: t.defFg, bg: t.defBg)
+
+proc putChar(t: VTerm; ch: string; width = 1) =
+  if width == 0:                 # combining mark: merge into the previous cell
+    if t.cx > 0: t.grid[t.cy][t.cx - 1].ch.add ch
+    return
+  if t.cx + width > t.cols:      # not enough room left on this line -- wrap
     t.cx = 0
     t.lineFeed()
   t.clampCursor()
-  t.grid[t.cy][t.cx] = Cell(ch: ch, fg: t.curFg, bg: t.curBg, inv: t.inv)
-  inc t.cx
+  t.clearPairAt(t.cy, t.cx)
+  if width == 2 and t.cx + 1 < t.cols: t.clearPairAt(t.cy, t.cx + 1)
+  t.grid[t.cy][t.cx] = Cell(ch: ch, fg: t.curFg, bg: t.curBg, inv: t.inv, wide: width == 2)
+  if width == 2:
+    if t.cx + 1 < t.cols:
+      t.grid[t.cy][t.cx + 1] = Cell(ch: "", fg: t.curFg, bg: t.curBg, inv: t.inv, cont: true)
+    t.cx += 2
+  else:
+    inc t.cx
 
 proc eraseInLine(t: VTerm; mode: int) =
   let blank = Cell(ch: "", fg: t.defFg, bg: t.defBg)
@@ -185,9 +299,10 @@ proc deleteLines(t: VTerm; n: int) =
     t.grid[t.bot] = t.blankRow()
 
 proc insertChars(t: VTerm; n: int) =
+  let x = t.cursorCol
   for _ in 0 ..< n:
-    for c in countdown(t.cols - 1, t.cx + 1): t.grid[t.cy][c] = t.grid[t.cy][c - 1]
-    t.grid[t.cy][t.cx] = Cell(ch: "", fg: t.defFg, bg: t.defBg)
+    for c in countdown(t.cols - 1, x + 1): t.grid[t.cy][c] = t.grid[t.cy][c - 1]
+    t.grid[t.cy][x] = Cell(ch: "", fg: t.defFg, bg: t.defBg)
 
 proc deleteChars(t: VTerm; n: int) =
   for _ in 0 ..< n:
@@ -371,7 +486,16 @@ proc putCharRun(t: VTerm; s: string; a, b: int) =
       inc i
 
 proc write*(t: VTerm; s: string) =
-  ## Feed raw PTY bytes. UTF-8 multibyte sequences are reassembled into one cell.
+  ## Feed raw PTY bytes. UTF-8 multibyte sequences are reassembled into one
+  ## cell with the correct display width. A sequence truncated at the end of
+  ## this chunk (pty reads land wherever the kernel split them, not on
+  ## character boundaries) is buffered in `t.pending` and completed by the
+  ## start of the next call, instead of printing its lead byte(s) as one
+  ## grapheme and the orphaned continuation byte(s) as more, garbage, ones.
+  var s = s
+  if t.pending.len > 0:
+    s = t.pending & s
+    t.pending = ""
   var i = 0
   while i < s.len:
     let c = s[i]
@@ -380,9 +504,12 @@ proc write*(t: VTerm; s: string) =
       if (c.uint8 and 0xE0) == 0xC0: nbytes = 2
       elif (c.uint8 and 0xF0) == 0xE0: nbytes = 3
       elif (c.uint8 and 0xF8) == 0xF0: nbytes = 4
-      let stop = min(i + nbytes, s.len)
-      t.putChar(s[i ..< stop])
-      i = stop
+      if i + nbytes > s.len:          # sequence crosses the chunk boundary
+        t.pending = s[i ..< s.len]
+        return
+      let grapheme = s[i ..< i + nbytes]
+      t.putChar(grapheme, runeWidth(decodeRune(grapheme)))
+      i += nbytes
     elif t.st == vsGround and c >= ' ' and c < '\x7f':
       # Fast path: a run of plain printable ASCII (no escape/control bytes).
       var j = i + 1
@@ -417,7 +544,7 @@ proc serialize*(t: VTerm): string =
       if n > 0: result.add c.ch[0 ..< n]
       result.add chr(c.fg.r.int); result.add chr(c.fg.g.int); result.add chr(c.fg.b.int)
       result.add chr(c.bg.r.int); result.add chr(c.bg.g.int); result.add chr(c.bg.b.int)
-      result.add chr(if c.inv: 1 else: 0)
+      result.add chr((if c.inv: 1 else: 0) or (if c.wide: 2 else: 0) or (if c.cont: 4 else: 0))
 
 proc restore*(t: VTerm; blob: string) =
   ## Rebuild the screen from a `serialize` snapshot.
@@ -440,8 +567,10 @@ proc restore*(t: VTerm; blob: string) =
         if i < blob.len: (ch.add blob[i]; inc i)
       let fr = rd(); let fgc = rd(); let fb = rd()
       let br = rd(); let bgc = rd(); let bb = rd()
-      let inv = rd() == 1
+      let flags = rd()
       if r < t.grid.len and c < t.grid[r].len:
         t.grid[r][c] = Cell(ch: ch, fg: color(fr.uint8, fgc.uint8, fb.uint8),
-                            bg: color(br.uint8, bgc.uint8, bb.uint8), inv: inv)
+                            bg: color(br.uint8, bgc.uint8, bb.uint8),
+                            inv: (flags and 1) != 0, wide: (flags and 2) != 0,
+                            cont: (flags and 4) != 0)
   t.clampCursor()

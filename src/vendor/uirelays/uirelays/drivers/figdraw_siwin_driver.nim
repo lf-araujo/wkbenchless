@@ -23,6 +23,11 @@ import figdraw/common/[fontglyphs, fonttypes, fontutils, typefaces]
 
 import ../coords, ../input, ../screen
 
+when defined(linux):
+  import std/importutils
+  import siwin/platforms/wayland/window as siwinWayland
+  import siwin/platforms/wayland/libdecor as siwinLibdecor
+
 type
   DrawState = object
     clipActive: bool
@@ -68,6 +73,7 @@ var
   appWindow: siwin.Window
   renderer: FigRenderer[SiwinRenderBackend]
   useAutoScale: bool
+  decorationCloseRequested: bool
   eventQueue: Deque[input.Event]
   fontSlots: seq[FontSlot]
   images: seq[ImageSlot]
@@ -419,6 +425,24 @@ proc renderQueuedOps() =
   renderer.endFrame()
   drawOps.setLen(0)
 
+proc deferDecorationClose(window: siwin.Window) =
+  ## siwin's libdecor `close` callback releases the window on the spot, but
+  ## libdecor calls it from inside its own pointer_button handler and then
+  ## commits the frame through siwin's `commit` callback: on the surface just
+  ## destroyed, a nil deref that segfaults every click on the title bar's close
+  ## button. libdecor reads the callbacks through a pointer to this per-window
+  ## struct, so replace `close` with a request `pumpWindowStep` honors once
+  ## libdecor has returned. (Not `m_closed`: the pump stops stepping a closed
+  ## window, so nothing would ever finish the close.)
+  when defined(linux):
+    if window of WindowWayland:
+      privateAccess WindowWayland
+      let wl = WindowWayland(window)
+      if wl.useLibdecor:
+        wl.libdecorFrameIface.close =
+          proc(frame: LibdecorFrame; userData: pointer) {.cdecl.} =
+            decorationCloseRequested = true
+
 proc figCreateWindow(layout: var ScreenLayout) =
   if not siwinInitialized:
     # siwin takes the X11 WM_CLASS / Wayland app_id from the window's initial
@@ -446,6 +470,7 @@ proc figCreateWindow(layout: var ScreenLayout) =
         title = appName,
       )
       renderer = newFigRenderer(atlasSize = 1024, backendState = SiwinRenderBackend())
+    deferDecorationClose(appWindow)
     useAutoScale = appWindow.configureUiScale()
     renderer.setupBackend(appWindow)
     appWindow.eventsHandler = WindowEventsHandler(
@@ -678,6 +703,10 @@ proc figPutClipboardText(text: string) =
 
 proc pumpWindowStep() =
   if not appWindow.isNil and appWindow.opened:
+    if decorationCloseRequested:
+      decorationCloseRequested = false
+      appWindow.close()
+      return
     appWindow.step()
 
 proc figPollEvent(e: var input.Event; flags: set[InputFlag]): bool =

@@ -88,6 +88,43 @@ block interiorRules:
     prepTables(@["#+begin_example", "| a |", "|---|", "| b |", "|---|", "| c |",
                  "#+end_example"])[3 .. 5] == @["| b |", "|---|", "| c |"]
 
+# -- tracked changes in table cells: end to end through pandoc -----------------
+block trackedCells:
+  if findExe("pandoc").len == 0:
+    echo "skip tracked cells end-to-end: pandoc not on PATH"; break trackedCells
+  let dir = getTempDir() / "test_otd_cells"
+  createDir(dir)
+  let org = @["#+caption: Base {~~old cap~>new cap~~} tail.",
+    "| Var | Value |", "|---+---|",
+    "| one | {~~0.548~>0.340~~} |", "| {++added++} | 2.0 (0.1) |", "|---+---|",
+    "| below rule | {--gone--} |", "", "| plain | headerless |", "| second | row |"]
+  var toks: seq[string]
+  writeFile(dir / "t.org", stash(prepTables(org).join("\n") & "\n", toks))
+  let (_, c1) = execCmdEx("pandoc -f org -t " & orgToMdFormat & " --wrap=none -s " &
+    quoteShell(dir / "t.org") & " -o " & quoteShell(dir / "t.md"))
+  check "org to markdown", c1 == 0
+  var done: seq[int]
+  writeFile(dir / "t.md", criticToSpans(unstash(readFile(dir / "t.md"), toks), done))
+  let (_, c2) = execCmdEx("pandoc -f markdown -t docx " & quoteShell(dir / "t.md") &
+    " -o " & quoteShell(dir / "t.docx"))
+  check "markdown to docx", c2 == 0
+  check "drawRuleRows finds the interior rule", drawRuleRows(dir / "t.docx")
+  let xml = openZipArchive(dir / "t.docx").extractFile("word/document.xml")
+  check "cell and caption edits are real revisions",
+    xml.count("<w:ins ") == 3 and xml.count("<w:del ") == 3
+  check "both sides of a cell substitution survive",
+    "0.548" in xml and "0.340" in xml
+  check "no span attributes leak as text", "author=" notin
+    xml.multiReplace(("w:author=", ""))
+  check "the rule sentinel is gone", ruleMark notin xml
+  check "the two tables keep their rows", xml.count("<w:tbl>") == 2 and
+    xml.count("<w:tr>") + xml.count("<w:tr ") == 4 + 2
+  let last = xml[xml.rfind("<w:tbl>") .. ^1]
+  check "a headerless table gets no blank header row",
+    "w:tblHeader" notin last and
+    last[0 ..< last.find("plain")].count("<w:tr>") +
+    last[0 ..< last.find("plain")].count("<w:tr ") == 1
+
 # -- drawRuleRows: end to end through pandoc ----------------------------------
 block drawRules:
   if findExe("pandoc").len == 0:

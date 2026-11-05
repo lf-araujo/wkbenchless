@@ -85,6 +85,9 @@ type
     pendingToxPort: int           ## guest: port to (re)connect to while a link is due
     pendingLanHost: string        ## guest: LAN host to redial ("": the tox forward)
     joinDeadline: float           ## guest: epoch seconds to give up at
+    synced: bool                  ## guest: the host's first sync has arrived
+    joinStage: int                ## guest (tox): -1 unset, 0 off-network,
+                                  ## 1 on network, 2 friend link up
     redialHost: string            ## guest: "" = the tox forward, else the LAN host
     redialPort: int               ## guest: 0 = do not redial after a drop
     baseText: string             ## doc text when the link dropped (divergence base)
@@ -433,6 +436,7 @@ proc handleLine(app: var App; s: CollabSession; fd: int; line: string) =
         s.shadow = app.buffers[idx].ed.fullText()
         s.lastVersion = app.buffers[idx].ed.editVersion()
       s.busy = false
+      s.synced = true
       app.msg = "collab: synced (" & $s.doc.docLen & " chars)"
   of "ins":
     if s.resolving: return      # frozen: a divergence review is in progress
@@ -645,11 +649,46 @@ proc tick(app: var App; s: CollabSession) =
       s.peers[fd].sendLine(%*{"t": "hello", "v": wireVersion,
                               "name": collabName()})
       s.pendingToxPort = 0
-      app.msg = if s.baseText.len > 0: "collab: reconnected -- syncing ..."
-                else: "collab: tox tunnel up -- syncing ..."
+      # the LOCAL forward accepts at once -- that is not the tunnel. Only
+      # say "syncing" once the host's Tox has actually befriended us.
+      app.msg =
+        if s.tox != nil and not s.tox.networkConnected():
+          "collab: connecting to the Tox network ..."
+        elif s.tox != nil and not s.tox.friendConnected():
+          "collab: on the Tox network -- waiting for the host's Tox to accept " &
+            "(shared secret must match) ..."
+        elif s.baseText.len > 0: "collab: reconnected -- syncing ..."
+        else: "collab: tox tunnel up -- syncing ..."
     except CatchableError:
       try: sock.close()          # forward not listening yet; retry next tick
       except OSError, IOError: discard
+  # guest over tox, first join: the forward is connected but nothing can flow
+  # until the friend link is up. Report when it comes up, and give up (as
+  # above) if the host's first sync never arrives -- otherwise a host that
+  # ignores us (wrong secret, unreachable) leaves "syncing" up forever.
+  if not s.isHost and s.tox != nil and not s.synced and s.pendingToxPort == 0 and
+     s.baseText.len == 0:
+    # three stages, each with its own status, so a stuck join says WHERE:
+    # not on the Tox network (firewall) -> host not accepting -> no document
+    let net = s.tox.networkConnected()
+    let up = s.tox.friendConnected()
+    let stage = (if up: 2 elif net: 1 else: 0)
+    if stage != s.joinStage:
+      s.joinStage = stage
+      app.msg = case stage
+        of 0: "collab: connecting to the Tox network ..."
+        of 1: "collab: on the Tox network -- waiting for the host's Tox to accept " &
+              "(shared secret must match) ..."
+        else: "collab: tox tunnel up -- syncing ..."
+    if epochTime() > s.joinDeadline:
+      app.msg = case stage
+        of 0: "collab: never reached the Tox network -- a firewall or proxy agent " &
+              "(e.g. Zscaler) is likely blocking Tox; join with host:port instead"
+        of 1: "collab: the host's Tox never accepted us -- check TUNTOX_SHARED_SECRET " &
+              "matches on both sides (or both unset) and that the host is sharing"
+        else: "collab: tunnel up but the host never sent the document -- is it still sharing?"
+      endSession(app)
+      return
   var closed: seq[int]
   # first push any wire data a full socket window refused on an earlier tick
   for fd, p in s.peers.mpairs:
@@ -771,7 +810,7 @@ proc joinOverTox(app: var App; toxId: string; remotePort: int) =
   let t = spawnClient(toxId, localPort, remotePort)
   let s = CollabSession(
     isHost: false, site: 0, sel: newSelector[int](), filePath: app.filePath,
-    tox: t, pendingToxPort: localPort, joinDeadline: epochTime() + 120,
+    tox: t, pendingToxPort: localPort, joinDeadline: epochTime() + 120, joinStage: -1,
     redialPort: localPort)   # the forward outlives any one tunnel
   s.shadow = app.ed.fullText()      # don't broadcast pre-sync content
   s.lastVersion = app.ed.editVersion()

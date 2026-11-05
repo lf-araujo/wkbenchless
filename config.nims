@@ -31,13 +31,37 @@ when defined(linux) and not defined(wkbX11) and
 ## asks pkg-config for c-toxcore at compile time, so make the usual installs
 ## visible even when the shell that launched the editor didn't export
 ## PKG_CONFIG_PATH (C-c r's rebuild re-execs the compiler in-process).
-## The checkout is found beside this one, or at $WKB_TUNTOX_DIR -- set that for
-## `nimble install`, which builds in a copy under ~/.nimble/buildtemp where the
-## sibling path does not exist.
-let tuntoxDir =
-  if getEnv("WKB_TUNTOX_DIR").len > 0: getEnv("WKB_TUNTOX_DIR")
-  else: thisDir() & "/../nim-tuntox"
-switch("path", tuntoxDir & "/src")
+## The checkout is found at $WKB_TUNTOX_DIR, beside this one, or as an
+## installed nimble package (`nimble install` in nim-tuntox -> ~/.nimble/pkgs2/
+## tuntox-*). The last one is what keeps the tunnel in builds that run away from
+## the source tree: `nimble install` (a copy under ~/.nimble/buildtemp) and C-c r
+## rebuilding a nimble-installed editor in its pkgs2 dir.
+proc tuntoxSrc(dir: string): string =
+  ## The dir holding tuntox.nim for a checkout (src/) or an installed package.
+  if fileExists(dir & "/src/tuntox.nim"): dir & "/src"
+  elif fileExists(dir & "/tuntox.nim"): dir
+  else: ""
+let tuntoxDir = block:
+  var found = ""
+  if getEnv("WKB_TUNTOX_DIR").len > 0: found = getEnv("WKB_TUNTOX_DIR")
+  elif tuntoxSrc(thisDir() & "/../nim-tuntox").len > 0:
+    found = thisDir() & "/../nim-tuntox"
+  else:
+    let nimbleDir = if getEnv("NIMBLE_DIR").len > 0: getEnv("NIMBLE_DIR")
+                    else: getHomeDir() & ".nimble"
+    # several installs (each `nimble install` of a changed checkout adds a
+    # new tuntox-<ver>-<hash> dir): take the most recently installed one
+    var newest = ""
+    for d in listDirs(nimbleDir & "/pkgs2"):
+      if d.extractFilename.startsWith("tuntox-") and tuntoxSrc(d).len > 0:
+        let stamp = gorge("stat -f %m " & quoteShell(d) & " 2>/dev/null || stat -c %Y " &
+                          quoteShell(d))
+        if newest.len == 0 or stamp.strip.parseInt > newest.parseInt:
+          newest = stamp.strip; found = d
+  if found.len == 0: found = thisDir() & "/../nim-tuntox"   # for the error text
+  found
+let tuntoxPath = tuntoxSrc(tuntoxDir)
+if tuntoxPath.len > 0: switch("path", tuntoxPath)
 block:
   if getEnv("PKG_CONFIG_PATH").len == 0:
     for pc in [getHomeDir() & ".local/lib64/pkgconfig",
@@ -54,19 +78,22 @@ block:
       if dirExists(pc):
         putEnv("PKG_CONFIG_PATH", pc)
         break
-## The Tox tunnel is built (`wkbTox`) when the nim-tuntox checkout AND a
-## pkg-config-visible toxcore are both here; without them collab is LAN /
-## host:port only (src/wkbtox.nim). CI and release.yml provide both
-## (scripts/build-toxcore.sh) and set WKB_REQUIRE_TOX=1, so a build that lost
-## the tunnel fails instead of shipping without it. -d:wkbNoTox leaves it out.
+## The Tox tunnel is built (`wkbTox`) when nim-tuntox AND a pkg-config-visible
+## toxcore are both here; without them collab is LAN / host:port only
+## (src/wkbtox.nim). CI and release.yml provide both (scripts/build-toxcore.sh)
+## and set WKB_REQUIRE_TOX=1, so a build that lost the tunnel fails instead of
+## shipping without it. On macOS the tunnel is required by default (brew
+## install toxcore pkg-config; nimble install in nim-tuntox). -d:wkbNoTox
+## leaves it out on any platform.
 when not defined(wkbNoTox):
-  if fileExists(tuntoxDir & "/src/tuntox.nim") and
+  if tuntoxPath.len > 0 and
      gorgeEx("pkg-config --exists toxcore").exitCode == 0:
     switch("define", "wkbTox")
-  elif getEnv("WKB_REQUIRE_TOX") == "1":
-    raise newException(OSError, "WKB_REQUIRE_TOX=1 but the Tox tunnel is " &
-      "unavailable: need nim-tuntox at " & tuntoxDir &
-      " and toxcore via pkg-config (PKG_CONFIG_PATH=" & getEnv("PKG_CONFIG_PATH") & ")")
+  elif defined(macosx) or getEnv("WKB_REQUIRE_TOX") == "1":
+    raise newException(OSError, "the Tox tunnel is required on this build " &
+      "but unavailable: need nim-tuntox (at " & tuntoxDir & ", $WKB_TUNTOX_DIR, " &
+      "or `nimble install` it) and toxcore via pkg-config (PKG_CONFIG_PATH=" &
+      getEnv("PKG_CONFIG_PATH") & "). Build with -d:wkbNoTox to leave it out.")
 
 ## User config: ~/.config/wkbenchless/wkbconfig.nim (XDG_CONFIG_HOME, or
 ## %APPDATA% on Windows) is compiled in place of src/wkbconfig.nim when it exists,

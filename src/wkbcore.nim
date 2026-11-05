@@ -218,6 +218,9 @@ var
   gClaudeDiffHooks* = true                 ## inject --settings diff-on-edit hooks when
                                            ## launching claude, so its file edits pop into
                                            ## this editor's diff pane (config; set false off)
+  gClaudeMod* = true                       ## load the wkb-view Claude Code mod (formulas and
+                                           ## PNGs as pictures, diffs only in this editor's
+                                           ## pane) into claude via --plugin-dir (config)
   gSshPersist* = "600"                    ## seconds an ssh master connection persists
   gRemoteMethods*: Table[string, string]  ## TRAMP-style :dir method -> login command
                                           ## run on the host first (defineRemoteMethod)
@@ -552,6 +555,14 @@ proc specFor*(base: ReplSpec; name: string; dir = ""): ReplSpec =
 proc sshMasterUp(host: string): bool    # fwd: the ssh reconnect machinery, below
 proc sshRefusal*(host: string): string   # fwd
 
+proc sessionHost*(name: string): string =
+  ## The ssh host of a remote session name "name@user@host|method": the part
+  ## after the first '@', without the "|method" login step (qsub -I ...),
+  ## which is run on the host, not part of its address.
+  result = name[name.find('@') + 1 .. ^1]
+  let bar = result.find('|')
+  if bar >= 0: result.setLen bar
+
 proc getSession*(app: var App; lang, name: string; dir = ""): Session =
   ## A session named "name@host" runs on `host` over ssh (remote REPL, in `dir`
   ## if given); a plain name runs locally. `dir` is used only when creating.
@@ -568,7 +579,7 @@ proc getSession*(app: var App; lang, name: string; dir = ""): Session =
     # (fail2ban-style daemons ban for exactly that). The watch loop probes
     # the host with exponential backoff and reattaches the sessions once a
     # master is up; M-x remote-login <host> does it right now.
-    let host = name[name.find('@') + 1 .. ^1]
+    let host = sessionHost(name)
     if not sshMasterUp(host):
       gSessionRefusal = sshRefusal(host)
       app.msg = "remote: " & gSessionRefusal
@@ -3248,7 +3259,7 @@ proc pollJobs*(app: var App): bool =
   for key, s in app.sessions.mpairs:       # collect first: finishing runs hooks
     done.add pollSession(s)
     if s != nil and '@' in key:
-      let host = key[key.find('@') + 1 .. ^1]
+      let host = sessionHost(key)
       if s.phase == spFailed and s.startFailed.len > 0:
         # a remote login attempt died: count it on the host's shared clock (a
         # timeout or an abandoned prompt only backs off; the probe's own
@@ -4104,16 +4115,66 @@ proc writeClaudeSettings*(): bool =
     result = true
   except CatchableError: result = false
 
-proc withClaudeSettings*(cmd, settingsPath: string): string =
-  ## Insert `--settings <path>` after each leading `claude` in the (possibly
-  ## `||`-joined) launch command, leaving the rest of each segment intact.
+proc withClaudeFlag*(cmd, flag: string): string =
+  ## Insert `flag` (already shell-quoted) after each leading `claude` in the
+  ## (possibly `||`-joined) launch command, leaving the rest of each segment
+  ## intact.
   var parts: seq[string]
   for seg in cmd.split("||"):
     var s = seg.strip()
     if s.startsWith("claude"):
-      s = "claude --settings " & quoteShell(settingsPath) & s[len("claude") .. ^1]
+      s = "claude " & flag & s[len("claude") .. ^1]
     parts.add s
   parts.join(" || ")
+
+proc withClaudeSettings*(cmd, settingsPath: string): string =
+  ## Insert `--settings <path>` after each leading `claude` in the launch command.
+  withClaudeFlag(cmd, "--settings " & quoteShell(settingsPath))
+
+# -- the wkb-view Claude Code mod (claude-mod/wkb-view) ------------------------
+# Embedded so a release binary carries it: formulas and PNGs drawn as images in
+# Claude's replies, and edit diffs left to this editor's diff pane. Literal "/"
+# joins, as in wkbdesktop: the `/` operator emits "\" under a cross target.
+const
+  wkbSrcFile = currentSourcePath()
+  claudeModSrc = wkbSrcFile[0 ..< wkbSrcFile.rfind({'/', '\\'})] & "/../claude-mod/wkb-view/"
+  claudeModFiles = [
+    (".claude-plugin/plugin.json", staticRead(claudeModSrc & ".claude-plugin/plugin.json")),
+    ("hooks/hooks.json", staticRead(claudeModSrc & "hooks/hooks.json")),
+    ("hooks/register.tsx", staticRead(claudeModSrc & "hooks/register.tsx")),
+    ("types/index.d.ts", staticRead(claudeModSrc & "types/index.d.ts")),
+    ("README.md", staticRead(claudeModSrc & "README.md"))]
+  claudeModMinVersion = (2, 1, 287)   ## Claude Code's first build with mods
+
+proc claudeModDir*(): string = getCacheDir() / "wkbenchless" / "claude-mod" / "wkb-view"
+
+proc writeClaudeMod*(): string =
+  ## Write the embedded mod to claudeModDir() and return it ("" on failure).
+  ## Unchanged files are left alone: Claude Code reloads a --plugin-dir mod
+  ## whenever its files change.
+  let dir = claudeModDir()
+  try:
+    for (rel, body) in claudeModFiles:
+      let path = dir / rel
+      createDir(path.parentDir)
+      if not fileExists(path) or readFile(path) != body:
+        writeFile(path, body)
+    result = dir
+  except CatchableError: result = ""
+
+var gClaudeVersion: (int, int, int) = (-1, 0, 0)   ## cached `claude --version`
+
+proc claudeSupportsMods*(): bool =
+  ## Whether the claude on PATH is new enough to load a --plugin-dir mod.
+  if gClaudeVersion[0] < 0:
+    gClaudeVersion = (0, 0, 0)
+    let (o, c) = runCmd("claude --version")
+    if c == 0:
+      let v = o.strip().split({' ', '\n'})[0].split('.')
+      if v.len >= 3:
+        try: gClaudeVersion = (parseInt(v[0]), parseInt(v[1]), parseInt(v[2]))
+        except ValueError: discard
+  gClaudeVersion >= claudeModMinVersion
 
 proc showPanel*(app: var App) =
   app.sessionHidden = false; app.focus = "session"; app.msg = "panel shown"
@@ -4356,7 +4417,13 @@ proc registerBuiltins*() =
                # Only inject --settings if the hooks file was actually written,
                # so a failed write can never break the claude launch.
                if gClaudeDiffHooks and writeClaudeSettings():
-                 cmd = withClaudeSettings(gClaudeCmd, claudeSettingsPath())
+                 cmd = withClaudeSettings(cmd, claudeSettingsPath())
+               # The wkb-view mod: formulas/PNGs as pictures, diffs left to
+               # this editor. Skipped for a claude too old to load mods.
+               if gClaudeMod and claudeSupportsMods():
+                 let modDir = writeClaudeMod()
+                 if modDir.len > 0:
+                   cmd = withClaudeFlag(cmd, "--plugin-dir " & quoteShell(modDir))
                openTerminal(app, cmd, kind = tkAgent))
   defcommand("show-panel", "Show the bottom panel", showPanel)
   defcommand("toggle-panel", "Show/hide the bottom panel", togglePanel)
