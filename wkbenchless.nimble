@@ -13,8 +13,8 @@ requires "nim >= 2.0.0"
 requires "pixie == 6.1.0"   # inline image decode (was vendored; never edited locally)
 requires "checksums"        # sha1/md5, extracted out of the stdlib (std/sha1, std/md5 deprecated)
 # TextMate highlighting for R blocks, compiled in with -d:wkbMatter (src/wkbmatter.nim).
-requires "matter >= 0.6.2"
-requires "reni >= 0.2.0"
+requires "https://github.com/elcritch/matter >= 0.6.2"
+requires "https://github.com/fox0430/reni >= 0.2.0"
 requires "unicodedb >= 0.14.1"
 # uirelays is vendored in src/vendor/uirelays (patched for inline images), so
 # there is no external UI dependency to fetch -- config.nims puts it on the path.
