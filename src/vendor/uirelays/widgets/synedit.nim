@@ -3286,14 +3286,9 @@ proc drawRun(db: var DrawBuf; a, b: int; fg, bg: Color) =
   while ra <= b:
     # The last character that still fits in what is left of the row, or
     # `ra - 1` when not even the first one does.
-    # Grown a character at a time: rebuilding the run for every probe is
-    # quadratic, which froze the app on long lines such as a .bib abstract.
     var last = ra - 1
-    db.tempStr.setLen 0
-    while last < b:
-      db.tempStr.add db.chars[last + 1]
-      if db.dim.x + db.spaceWidth + textWidth(db.font, db.tempStr) > db.dim.w:
-        break
+    while last < b and
+        db.dim.x + db.spaceWidth + db.runWidth(ra, last + 1) <= db.dim.w:
       inc last
     let wrapping = last < b
     if wrapping: last = db.smartWrap(ra, last, critical)
