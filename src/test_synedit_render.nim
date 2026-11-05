@@ -3,7 +3,7 @@
 ## conflict: heading fonts, prose wrapping, no-wrap tables, folded blocks.
 ##   nim c -r --hints:off src/test_synedit_render.nim
 
-import std/strutils
+import std/[sequtils, strutils]
 import uirelays
 import widgets/synedit
 
@@ -109,6 +109,71 @@ block folding:
   check "a folded block hides its body", "HIDDENBODY" notin closed.joined
   check "a folded block keeps its header", "begin_src" in closed.joined
   check "text after a fold still draws", "after" in closed.joined
+
+# A fake styler: every body byte becomes a keyword, and each call is counted.
+var styled: seq[string]
+proc fakeHandles(lang: string): bool = lang == "r"
+proc fakeStyler(lang, code: string; runs: var seq[StyleRun]) =
+  styled.add code
+  if code.len > 0: runs.add (0, code.high, TokenClass.Keyword)
+
+proc styleAt(s: SynEdit; needle: string; text: string): TokenClass =
+  s.getCell(text.find(needle)).s
+
+const twoBlocks = "#+begin_src R\nrcode <- 1\n#+end_src\n\n#+begin_src python\npycode = 1\n#+end_src\n"
+
+block code_styler_relay:
+  let area = rect(0, 0, 400, 600)
+  var plain = createSynEdit(Font(1))
+  plain.lang = langOrg
+  plain.setText(twoBlocks)
+  render(plain, area, false)
+  check "without a styler nothing is styled by it", styled.len == 0
+  check "without a styler the tokenizer colors R",
+    plain.styleAt("rcode", twoBlocks) != TokenClass.Keyword
+
+  codeStylerHandles = fakeHandles
+  codeStyler = fakeStyler
+  var s = createSynEdit(Font(1))
+  s.lang = langOrg
+  s.setText(twoBlocks)
+  render(s, area, false)
+  echo "     styler calls: ", styled
+  check "the styler gets a claimed block's body", styled.len > 0 and
+    styled.allIt(it == "rcode <- 1\n")
+  check "its runs reach the cells", s.styleAt("rcode", twoBlocks) == TokenClass.Keyword
+  check "an unclaimed language keeps its tokenizer",
+    s.styleAt("pycode", twoBlocks) != TokenClass.Keyword
+
+  styled.setLen 0
+  var f = createSynEdit(Font(1))
+  f.lang = langOrg
+  f.foldAllPending = true
+  f.setText(twoBlocks)
+  render(f, area, false)
+  check "a folded block is not styled", styled.len == 0
+  check "block ranges are still found while folded", f.blockRangeAt(0).a == 0
+  check "fold-all folded both blocks", f.foldedBlocks.len == 2
+  f.toggleFold(f.foldedBlocks[0])
+  render(f, area, false)
+  check "opening a block styles it", styled == @["rcode <- 1\n"] and
+    f.styleAt("rcode", twoBlocks) == TokenClass.Keyword
+  styled.setLen 0
+  f.foldAllBlocks()
+  f.unfoldAll()
+  render(f, area, false)
+  check "unfold-all styles what it reveals", styled.len >= 1
+
+  styled.setLen 0
+  var rmd = createSynEdit(Font(1))
+  rmd.lang = langMarkdown
+  rmd.setText("text\n\n```{r}\nchunk <- 1\n```\n")
+  render(rmd, area, false)
+  echo "     styler calls: ", styled
+  check "an Rmd chunk reaches the styler", styled.len > 0 and
+    styled.allIt(it == "chunk <- 1\n")
+  codeStylerHandles = nil
+  codeStyler = nil
 
 if fails > 0:
   echo "test_synedit_render: ", fails, " FAILED"

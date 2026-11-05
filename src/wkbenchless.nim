@@ -615,6 +615,9 @@ proc diffLayout(app: App; width: int): seq[seq[DiffPiece]] =
   gDiffLayout = lines
   lines
 
+when defined(wkbMatter):
+  import wkbmatter
+
 proc main() =
   # Multi-call binary: `wkbenchless ctl <verb...>` -- or the binary invoked as
   # `wkbctl` (e.g. via a symlink) -- runs the control client and exits, so
@@ -710,6 +713,7 @@ proc main() =
                             # is seeded, so latex/dvipng are found
   # Themes come from the config; guarantee one so the chrome is never unstyled,
   # and honor a default the config may already have applied.
+  when defined(wkbMatter): wkbmatter.install()
   if gThemes.len == 0: registerTheme("default", defaultBase16())
   if app.theme.name.len == 0: applyTheme(app, 0)
   loadState()                               # persisted UI state (XDG config dir)

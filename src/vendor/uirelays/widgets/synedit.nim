@@ -1263,9 +1263,42 @@ proc styleMarkdownLine(s: var SynEdit; lineStart, lineEnd, last: int) =
   if lineEnd <= last:
     s.setCellStyle(lineEnd, TokenClass.None)
 
+# --- Code styler relay ---------------------------------------------------------
+# An outside highlighter can style the body of org src blocks and Rmd chunks.
+# SynEdit knows nothing about the engine: both relays are nil by default, and a
+# language the engine does not claim stays with the tokenizers in this file.
+
+type
+  StyleRun* = tuple[first, last: int; tc: TokenClass]
+    ## Byte offsets into the `code` the styler was given, `last` included.
+
+var
+  codeStylerHandles*: proc (lang: string): bool {.nimcall.}
+  codeStyler*: proc (lang, code: string; runs: var seq[StyleRun]) {.nimcall.}
+
+proc usesCodeStyler(lang: string): bool =
+  codeStyler != nil and codeStylerHandles != nil and lang.len > 0 and
+    codeStylerHandles(lang.toLowerAscii)
+
+proc styleBlockBody(s: var SynEdit; lang: string; blockStart, a, b: int) =
+  ## Style the cells `a ..< b`, the body of the block opened at `blockStart`.
+  ## A folded block is not on screen, so it waits until it is opened.
+  if s.foldAllPending or blockStart in s.foldedBlocks or a >= b: return
+  var code = newStringOfCap(b - a)
+  for j in a ..< b: code.add s[j]
+  var runs: seq[StyleRun]
+  codeStyler(lang.toLowerAscii, code, runs)
+  for j in a ..< b: s.setCellStyle(j, TokenClass.None)
+  for r in runs:
+    for k in r.first .. min(r.last, code.high):
+      s.setCellStyle(a + k, r.tc)
+
 proc highlightMarkdown(s: var SynEdit; first, last: int) =
   var insideFence = false
   var fenceLang = langNone
+  var fenceName = ""
+  var fenceStyled = false
+  var chunkBody = first
   var chunkStart = first
   s.srcBlockRanges.setLen(0)             # rebuild (Rmd chunks are foldable)
   var pos = first
@@ -1293,12 +1326,19 @@ proc highlightMarkdown(s: var SynEdit; first, last: int) =
         let sp = langTok.find({' ', ',', '}'})
         if sp >= 0: langTok = langTok[0 ..< sp]
         fenceLang = strToLanguage(langTok)
+        fenceName = langTok
+        fenceStyled = usesCodeStyler(langTok)
         insideFence = true
         chunkStart = lineStart
+        chunkBody = lineEnd + 1
       elif insideFence:
+        if fenceStyled: s.styleBlockBody(fenceName, chunkStart, chunkBody, lineStart)
         insideFence = false
         fenceLang = langNone
+        fenceStyled = false
         s.srcBlockRanges.add(chunkStart .. lineEnd)
+    elif insideFence and fenceStyled:
+      discard                            # styled as a whole at the closing fence
     elif insideFence and fenceLang != langNone:
       var g: GeneralTokenizer
       g.buf = addr s
@@ -1428,15 +1468,20 @@ proc isFolded*(s: SynEdit; blockStart: int): bool = blockStart in s.foldedBlocks
 
 proc toggleFold*(s: var SynEdit; blockStart: int) =
   let idx = s.foldedBlocks.find(blockStart)
-  if idx >= 0: s.foldedBlocks.delete(idx)
-  else: s.foldedBlocks.add blockStart
+  if idx >= 0:
+    s.foldedBlocks.delete(idx)
+    s.highlighter.version = s.version - 1   # the styler skipped it while folded
+  else:
+    s.foldedBlocks.add blockStart
 
 proc foldAllBlocks*(s: var SynEdit) =
   ## Collapse every src block (used to start documents with code hidden).
   s.foldedBlocks.setLen 0
   for r in s.srcBlockRanges: s.foldedBlocks.add r.a
 
-proc unfoldAll*(s: var SynEdit) = s.foldedBlocks.setLen 0
+proc unfoldAll*(s: var SynEdit) =
+  s.foldedBlocks.setLen 0
+  s.highlighter.version = s.version - 1     # the styler skipped them while folded
 
 proc lineStartOf(s: SynEdit; offset: int): int =
   ## Buffer offset of the start of the line containing `offset`.
@@ -1480,6 +1525,9 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
   ## carries the in-block state that a per-token tokenizer cannot.
   var insideBlock = false
   var blockLang = langNone
+  var blockName = ""
+  var blockStyled = false
+  var blockBody = first
   var blockStart = first
   s.srcBlockRanges.setLen(0)             # org calls this full-buffer, so rebuild
   for j in first .. last: s.setCellFlags(j, {})   # rebuilt below each pass
@@ -1497,12 +1545,19 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       for j in lineStart ..< min(lineEnd, last + 1): s.setCellStyle(j, TokenClass.Directive)
       let parts = stripped.splitWhitespace()
       blockLang = if parts.len >= 2: strToLanguage(parts[1]) else: langNone
+      blockName = if parts.len >= 2: parts[1] else: ""
+      blockStyled = usesCodeStyler(blockName)
       insideBlock = true
       blockStart = lineStart
+      blockBody = lineEnd + 1
     elif ls.startsWith("#+end_src"):
       for j in lineStart ..< min(lineEnd, last + 1): s.setCellStyle(j, TokenClass.Directive)
-      if insideBlock: s.srcBlockRanges.add(blockStart .. lineEnd)
-      insideBlock = false; blockLang = langNone
+      if insideBlock:
+        s.srcBlockRanges.add(blockStart .. lineEnd)
+        if blockStyled: s.styleBlockBody(blockName, blockStart, blockBody, lineStart)
+      insideBlock = false; blockLang = langNone; blockStyled = false
+    elif insideBlock and blockStyled:
+      discard                            # styled as a whole at #+end_src
     elif insideBlock and blockLang != langNone:
       var g: GeneralTokenizer
       g.buf = addr s
