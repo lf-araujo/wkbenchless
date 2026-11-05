@@ -39,6 +39,7 @@ type
     dopPoint
     dopText
     dopImage
+    dopPixels
 
   DrawOp = object
     state: DrawState
@@ -60,6 +61,10 @@ type
     of dopImage:
       image: screen.Image
       src, dst: coords.Rect
+    of dopPixels:
+      pixels: pixie.Image
+      pixelsKey: Hash
+      pixelsDst: coords.Rect
 
 var
   appWindow: Window
@@ -102,29 +107,39 @@ proc queueEvent(e: input.Event) =
   eventQueue.addLast(e)
 
 proc resolveFontPath(path: string): string =
+  ## An empty path means "the platform default", and for this library that is
+  ## a *monospaced* font: the native drivers pick Consolas (Windows) and
+  ## fontconfig's `monospace` (X11), and the apps are text editors that expect
+  ## a fixed advance. So the candidate lists here are mono-only too -- a
+  ## proportional fallback would silently break column arithmetic.
+  ##
+  ## Only `.ttf`/`.otf` are listed: pixie's `readTypeface` rejects anything
+  ## else, so macOS' `.ttc` collections (Menlo, Courier) are unreachable from
+  ## here, and SFNSMono.ttf is a variable font whose default instance is the
+  ## too-thin Light weight.
   if path.len > 0:
     return path
 
   when defined(windows):
     let candidates = [
-      "Segoe UI",
-      "segoeui.ttf",
-      "Arial",
-      "arial.ttf"
+      "Consolas",
+      "consola.ttf",
+      "Courier New",
+      "cour.ttf"
     ]
   elif defined(macosx):
     let candidates = [
-      "SFNS.ttf",
-      "Helvetica",
-      "Arial Unicode.ttf",
-      "Arial.ttf"
+      "Monaco.ttf",
+      "Andale Mono.ttf",
+      "Courier New.ttf",
+      "DejaVuSansMono.ttf"
     ]
   else:
     let candidates = [
-      "NotoSans[wght].ttf",
-      "LiberationSans-Regular.ttf",
-      "Cantarell-VF.otf",
-      "DejaVuSans.ttf"
+      "DejaVuSansMono.ttf",
+      "LiberationMono-Regular.ttf",
+      "NotoSansMono[wdth,wght].ttf",
+      "monospace"
     ]
 
   for candidate in candidates:
@@ -345,6 +360,26 @@ proc replayImage(ctx: BackendContext; op: DrawOp) =
     false,
   )
 
+proc replayPixels(ctx: BackendContext; op: DrawOp) =
+  ## The blit path. It goes through the atlas like everything else, keyed on
+  ## what the pixels are rather than on where they came from: a caller that
+  ## hands over the same picture every frame -- which is the ordinary case,
+  ## an editor redrawing a document that has not changed -- puts one entry in
+  ## and hits it forever after. A caller whose pixels really do change every
+  ## frame puts in a new entry every frame, so this is not the road to a video
+  ## player; `blitRGBA` is for a picture, a chart, a page.
+  if op.pixels.isNil:
+    return
+  if op.pixelsKey notin ctx.entries():
+    ctx.putImage(op.pixelsKey, op.pixels)
+  ctx.drawImage(
+    op.pixelsKey,
+    vec2(scaledF(op.pixelsDst.x), scaledF(op.pixelsDst.y)),
+    toFigColor(color(255, 255, 255, 255)),
+    vec2(scaledF(op.pixelsDst.w), scaledF(op.pixelsDst.h)),
+    false,
+  )
+
 proc renderQueuedOps() =
   if appWindow.isNil or renderer.isNil:
     return
@@ -385,6 +420,8 @@ proc renderQueuedOps() =
       replayText(ctx, op)
     of dopImage:
       replayImage(ctx, op)
+    of dopPixels:
+      replayPixels(ctx, op)
     if hasClip:
       ctx.popMask()
   ctx.restoreTransform()
@@ -392,7 +429,14 @@ proc renderQueuedOps() =
   renderer.endFrame()
   drawOps.setLen(0)
 
-proc figCreateWindow(layout: var ScreenLayout) =
+proc figCreateWindow(layout: var ScreenLayout; icon: pointer; iconLen: int) =
+  # MaxWindowWidth/MaxWindowHeight arrive as negative sizes. Neither backend
+  # is available to test against here, so this driver does the safe half of
+  # the contract: it substitutes a sane size instead of handing a negative one
+  # to the toolkit. The window is then merely large, not maximized -- wiring
+  # that up is a one-liner once the backend's own maximize can be verified.
+  if layout.width < 0: layout.width = 1024
+  if layout.height < 0: layout.height = 768
   if not windyInitialized:
     appWindow = newWindyWindow(
       size = ivec2(layout.width.int32, layout.height.int32),
@@ -517,7 +561,13 @@ proc figSetClipRect(r: coords.Rect) =
   currentState.clipActive = true
   currentState.clipRect = r
 
-proc figOpenFont(path: string; size: int; metrics: var FontMetrics): screen.Font =
+proc figOpenFont(path: string; size: int; style: FontStyles;
+                 metrics: var FontMetrics): screen.Font =
+  # `style` is accepted and ignored: pixie draws the typeface in the file it
+  # was handed and has nothing to synthesize a bold or an italic cut with, so
+  # styled text comes out upright here. Picking a sibling file -- the
+  # `-Bold.ttf` next to the `-Regular.ttf` -- is the way to fix that, once
+  # there is a machine to try it on.
   let resolvedPath = resolveFontPath(path)
   if resolvedPath.len == 0:
     return screen.Font(0)
@@ -568,6 +618,30 @@ proc figDrawText(f: screen.Font; x, y: int; text: string;
     bg: bg,
   )
 
+proc figRenderText(f: screen.Font; text: string; fg: screen.Color;
+                   pixels: var seq[uint32]): TextExtent =
+  ## Pixie fills the run into an image of its own, premultiplied as the
+  ## pixels `renderText` hands out are.
+  pixels.setLen 0
+  let slot = getFontSlot(f)
+  if slot.isNil or slot.pixieFont.isNil or text.len == 0:
+    return
+  let size = figMeasureText(f, text)
+  if size.w <= 0 or size.h <= 0:
+    return
+  let font = slot.pixieFont.copy()
+  font.paint = toFigColor(fg)
+  let image = newImage(size.w, size.h)
+  try:
+    image.fillText(font.typeset(text))
+  except PixieError:
+    return
+  pixels.setLen size.w * size.h
+  for i, c in image.data:
+    pixels[i] = (c.a.uint32 shl 24) or (c.r.uint32 shl 16) or
+                (c.g.uint32 shl 8) or c.b.uint32
+  result = size
+
 proc figGetFontMetrics(f: screen.Font): FontMetrics =
   let slot = getFontSlot(f)
   if not slot.isNil:
@@ -604,6 +678,47 @@ proc figDrawImage(img: screen.Image; src, dst: coords.Rect) =
     return
   drawOps.add DrawOp(kind: dopImage, state: currentState, image: img, src: src, dst: dst)
 
+proc figImageSize(img: screen.Image): tuple[w, h: int] =
+  ## Without this a caller can crop a picture but cannot ask for all of it,
+  ## because "all of it" is a rectangle in the picture's own pixels and it had
+  ## no way to learn how many there are.
+  let slot = getImageSlot(img)
+  if slot.isNil or slot.image.isNil: (0, 0)
+  else: (slot.image.width, slot.image.height)
+
+proc queueRGBA(pixels: ptr UncheckedArray[uint32]; w, h, stride: int;
+               dst: coords.Rect; format: RGBAFormat): bool =
+  if pixels == nil or w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0:
+    return false
+  # Deferred replay owns a copy; the caller may reuse its buffer on return.
+  var img = pixie.newImage(w, h)
+  var key = hash((w, h, format))
+  for y in 0 ..< h:
+    for x in 0 ..< w:
+      let p = pixels[y * stride + x]
+      img.data[y * w + x] = rgbx(uint8((p shr 16) and 0xFF),
+                                uint8((p shr 8) and 0xFF),
+                                uint8(p and 0xFF),
+                                if format == RGBAFormat.argbPremultiplied: uint8(p shr 24) else: 255'u8)
+      key = key !& hash(p)
+  drawOps.add DrawOp(kind: dopPixels, state: currentState,
+                    pixels: img, pixelsKey: !$key, pixelsDst: dst)
+  true
+
+proc figDrawRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  queueRGBA(pixels, w, h, w, dst, format)
+
+proc figBlitRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  if pixels == nil or w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0:
+    return false
+  # Preserve blitRGBA's clipping-only contract, including the source stride.
+  let cw = min(w, dst.w)
+  let ch = min(h, dst.h)
+  queueRGBA(pixels, cw, ch, w, coords.rect(dst.x, dst.y, cw, ch), format)
+
+
 proc figSetCursor(c: screen.CursorKind) =
   if appWindow.isNil:
     return
@@ -621,8 +736,16 @@ proc figSetWindowTitle(title: string) =
     appWindow.title = title
 
 proc figGetClipboardText(): string =
-  if TextContent in getClipboardContentKinds(): getClipboardString()
-  else: ""
+  # Windy has `getClipboardContentKinds` on Windows and macOS and not on its
+  # X11 platform, which is why this only ever failed to build on Linux.
+  # Asking first is an optimisation and nothing more: `getClipboardString`
+  # answers "" for a clipboard holding a picture either way. So ask where
+  # asking is possible, and read where it is not.
+  when compiles(getClipboardContentKinds()):
+    if TextContent in getClipboardContentKinds(): getClipboardString()
+    else: ""
+  else:
+    getClipboardString()
 
 proc figPutClipboardText(text: string) =
   setClipboardString(text)
@@ -693,6 +816,7 @@ proc initFigDrawWindyDriver*() =
     getFontMetrics: figGetFontMetrics,
     measureText: figMeasureText,
     drawText: figDrawText,
+    renderText: figRenderText,
   )
   drawRelays = DrawRelays(
     fillRect: figFillRect,
@@ -701,6 +825,9 @@ proc initFigDrawWindyDriver*() =
     loadImage: figLoadImage,
     freeImage: figFreeImage,
     drawImage: figDrawImage,
+    imageSize: figImageSize,
+    blitRGBA: figBlitRGBA,
+    drawRGBA: figDrawRGBA,
   )
   inputRelays = InputRelays(
     pollEvent: figPollEvent,

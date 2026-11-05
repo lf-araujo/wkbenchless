@@ -21,7 +21,9 @@ proc toSdlColor(c: screen.Color): sdl2.Color =
   result.a = c.a
 
 proc toSdlRect(r: coords.Rect): sdl2.Rect {.inline.} =
-  (r.x, r.y, r.w, r.h)
+  # `sdl2.Rect` is a tuple of `cint`, and a tuple does not convert a field at
+  # a time the way an assignment would.
+  (r.x.cint, r.y.cint, r.w.cint, r.h.cint)
 
 proc getFontPtr(f: Font): FontPtr {.inline.} =
   let idx = f.int - 1
@@ -42,15 +44,22 @@ var
 # all. So this driver reports `uiScale = 100` and text stays small on a HiDPI
 # display -- use the SDL3 driver there.
 
-proc sdlCreateWindow(layout: var ScreenLayout) =
-  let flags =
+proc sdlCreateWindow(layout: var ScreenLayout; icon: pointer; iconLen: int) =
+  # A negative dimension is MaxWindowWidth/MaxWindowHeight; the window
+  # manager's maximize keeps taskbars visible, unlike FULLSCREEN_DESKTOP. The
+  # positive size is what the window returns to when it is unmaximized.
+  let maximized = layout.width < 0 or layout.height < 0
+  let reqW = if layout.width < 0: 1024 else: layout.width
+  let reqH = if layout.height < 0: 768 else: layout.height
+  var flags =
     if layout.fullScreen:
       SDL_WINDOW_FULLSCREEN_DESKTOP or SDL_WINDOW_SHOWN
     else:
       SDL_WINDOW_RESIZABLE or SDL_WINDOW_SHOWN
+  if maximized: flags = flags or SDL_WINDOW_MAXIMIZED
   window = createWindow("NimEdit",
     SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-    layout.width.cint, layout.height.cint, flags)
+    reqW.cint, reqH.cint, flags)
   renderer = createRenderer(window, -1, Renderer_Software)
   var w, h: cint
   window.getSize(w, h)
@@ -82,10 +91,27 @@ proc sdlSetClipRect(r: coords.Rect) =
   var sdlRect = toSdlRect(r)
   discard renderer.setClipRect(addr sdlRect)
 
-proc sdlOpenFont(path: string; size: int;
+const
+  TtfStyleBold = 0x01'i32
+  TtfStyleItalic = 0x02'i32
+
+proc ttfSetFontStyle(font: FontPtr; style: cint)
+  {.importc: "TTF_SetFontStyle", cdecl.}
+  ## Declared here rather than taken from the wrapper: the C name is the one
+  ## thing about SDL_ttf that cannot drift.
+
+proc sdlOpenFont(path: string; size: int; style: FontStyles;
                  metrics: var FontMetrics): Font =
   let f = openFont(cstring(path), size.cint)
   if f == nil: return Font(0)
+  # SDL_ttf has no notion of a font family, so it emboldens and shears the
+  # face it was given. Cruder than a real bold or italic cut, but it is what
+  # this backend can do, and the metrics below are read afterwards so the
+  # widened glyphs are accounted for.
+  var flags = 0'i32
+  if FontStyle.bold in style: flags = flags or TtfStyleBold
+  if FontStyle.italics in style: flags = flags or TtfStyleItalic
+  if flags != 0: ttfSetFontStyle(f, flags.cint)
   metrics.ascent = fontAscent(f)
   metrics.descent = fontDescent(f)
   metrics.lineHeight = fontLineSkip(f)
@@ -98,29 +124,57 @@ proc sdlCloseFont(f: Font) =
     close(fonts[idx].sdlFont)
     fonts[idx].sdlFont = nil
 
-proc sdlMeasureText(f: Font; text: cstring): TextExtent =
+proc sdlMeasureText(f: Font; text: string): TextExtent =
   let fp = getFontPtr(f)
-  if fp != nil and text[0] != '\0':
+  if fp != nil and text.len > 0:
     var w, h: cint
-    discard sizeUtf8(fp, text, addr w, addr h)
+    discard sizeUtf8(fp, text.cstring, addr w, addr h)
     result = TextExtent(w: w, h: h)
 
-proc sdlDrawTextShaded(f: Font; x, y: cint; text: cstring;
+proc sdlDrawTextShaded(f: Font; x, y: int; text: string;
                        fg, bg: screen.Color): TextExtent =
   let fp = getFontPtr(f)
-  if fp == nil or text[0] == '\0': return
-  let surf = renderUtf8Shaded(fp, text, toSdlColor(fg), toSdlColor(bg))
+  if fp == nil or text.len == 0: return
+  let surf = renderUtf8Shaded(fp, text.cstring, toSdlColor(fg), toSdlColor(bg))
   if surf == nil: return
   let tex = renderer.createTextureFromSurface(surf)
   if tex == nil:
     freeSurface(surf)
     return
   var src: sdl2.Rect = (0.cint, 0.cint, surf.w, surf.h)
-  var dst: sdl2.Rect = (x, y, surf.w, surf.h)
+  var dst: sdl2.Rect = (x.cint, y.cint, surf.w, surf.h)
   renderer.copy(tex, addr src, addr dst)
   result = TextExtent(w: surf.w, h: surf.h)
   freeSurface(surf)
   destroy(tex)
+
+proc sdlRenderText(f: Font; text: string; fg: screen.Color;
+                   pixels: var seq[uint32]): TextExtent =
+  ## SDL_ttf blends the run onto transparency in straight alpha; the pixels
+  ## handed out are premultiplied.
+  pixels.setLen 0
+  let fp = getFontPtr(f)
+  if fp == nil or text.len == 0: return
+  let blended = renderUtf8Blended(fp, text.cstring, toSdlColor(fg))
+  if blended == nil: return
+  let surf = convertSurfaceFormat(blended, SDL_PIXELFORMAT_ARGB8888, 0)
+  freeSurface(blended)
+  if surf == nil: return
+  let w = surf.w.int
+  let h = surf.h.int
+  let src = cast[ptr UncheckedArray[uint8]](surf.pixels)
+  pixels.setLen w * h
+  for y in 0 ..< h:
+    let row = cast[ptr UncheckedArray[uint32]](addr src[y * surf.pitch.int])
+    for x in 0 ..< w:
+      let p = row[x]
+      let a = p shr 24
+      pixels[y * w + x] = (a shl 24) or
+        ((((p shr 16) and 0xFF) * a div 255) shl 16) or
+        ((((p shr 8) and 0xFF) * a div 255) shl 8) or
+        ((p and 0xFF) * a div 255)
+  freeSurface(surf)
+  result = TextExtent(w: w, h: h)
 
 proc sdlGetFontMetrics(f: Font): FontMetrics =
   let idx = f.int - 1
@@ -132,13 +186,54 @@ proc sdlFillRect(r: coords.Rect; color: screen.Color) =
   var sdlRect = toSdlRect(r)
   discard renderer.fillRect(sdlRect)
 
-proc sdlDrawLine(x1, y1, x2, y2: cint; color: screen.Color) =
+proc sdlDrawLine(x1, y1, x2, y2: int; color: screen.Color) =
   renderer.setDrawColor(color.r, color.g, color.b, color.a)
-  renderer.drawLine(x1, y1, x2, y2)
+  renderer.drawLine(x1.cint, y1.cint, x2.cint, y2.cint)
 
-proc sdlDrawPoint(x, y: cint; color: screen.Color) =
+proc sdlDrawPoint(x, y: int; color: screen.Color) =
   renderer.setDrawColor(color.r, color.g, color.b, color.a)
-  renderer.drawPoint(x, y)
+  renderer.drawPoint(x.cint, y.cint)
+
+# One texture, kept between calls and remade only when the size changes.
+# A caller blits its picture every frame, because everything here is redrawn
+# every frame, and asking the GPU for a new texture that often is the one
+# cost worth avoiding.
+var
+  blitTex: TexturePtr
+  blitTexW, blitTexH: cint
+
+proc sdlBlitRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  if format != RGBAFormat.rgbOpaque: return false
+  ## This driver decodes no pictures, so it fills in none of the image
+  ## relays. What it can do is take finished pixels from whoever does, and
+  ## that is all `blitRGBA` is.
+  if renderer == nil or pixels == nil or w <= 0 or h <= 0 or
+      dst.w <= 0 or dst.h <= 0:
+    return false
+  if blitTex == nil or blitTexW != w.cint or blitTexH != h.cint:
+    if blitTex != nil:
+      destroyTexture(blitTex)
+      blitTex = nil
+    # `RGB888` is SDL2's name for 32 bits a pixel with the top one ignored,
+    # which is the word `blitRGBA` hands over. Its alpha-carrying cousin
+    # would read that ignored byte as "fully transparent" and draw nothing.
+    blitTex = renderer.createTexture(uint32(SDL_PIXELFORMAT_RGB888),
+                                     cint(SDL_TEXTUREACCESS_STATIC),
+                                     w.cint, h.cint)
+    if blitTex == nil:
+      return false
+    blitTexW = w.cint
+    blitTexH = h.cint
+  discard blitTex.updateTexture(nil, cast[pointer](pixels), cint(w * 4))
+  # `dst` clips and does not scale, so the source rectangle shrinks with it
+  # rather than the destination stretching to fit.
+  let cw = min(w, dst.w)
+  let ch = min(h, dst.h)
+  var srcRect = toSdlRect(coords.rect(0, 0, cw, ch))
+  var dstRect = toSdlRect(coords.rect(dst.x, dst.y, cw, ch))
+  discard renderer.copy(blitTex, addr srcRect, addr dstRect)
+  result = true
 
 proc sdlSetCursor(c: CursorKind) =
   let sdlCursor = case c
@@ -354,9 +449,10 @@ proc initSdl2Driver*() =
   fontRelays = FontRelays(
     openFont: sdlOpenFont, closeFont: sdlCloseFont,
     getFontMetrics: sdlGetFontMetrics, measureText: sdlMeasureText,
-    drawText: sdlDrawTextShaded)
+    drawText: sdlDrawTextShaded, renderText: sdlRenderText)
   drawRelays = DrawRelays(
-    fillRect: sdlFillRect, drawLine: sdlDrawLine, drawPoint: sdlDrawPoint)
+    fillRect: sdlFillRect, drawLine: sdlDrawLine, drawPoint: sdlDrawPoint,
+    blitRGBA: sdlBlitRGBA)
   inputRelays = InputRelays(
     pollEvent: sdlPollEvent, waitEvent: sdlWaitEvent,
     getTicks: sdlGetTicks, sleep: sdlDelay,

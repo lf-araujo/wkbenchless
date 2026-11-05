@@ -216,9 +216,46 @@ static int translateKeyCode(unsigned short kc) {
   }
 }
 
+static int translateKeyEvent(NSEvent *event) {
+  /* A keyCode is a physical position on the keyboard and the layout decides
+     what that position types. The table above is ANSI, so on a German
+     keyboard it gets Y and Z backwards -- 0x06 types 'y' there and 0x10 types
+     'z' -- which puts undo on the key labelled Y and redo on the one labelled
+     Z. Punctuation moves too: '-' is 0x2C and '+' is 0x1E, so Cmd+plus and
+     Cmd+minus land on neither.
+
+     So anything that produces a character is identified by the character the
+     current layout actually gives, and only the keys that produce none
+     (arrows, F-keys, Home/End, ...) stay a lookup by position.
+     charactersIgnoringModifiers drops every modifier but Shift, so Ctrl+Z
+     still reports a plain "z" rather than a control code. */
+  NSString *chars = [event charactersIgnoringModifiers];
+  if (chars.length == 1) {
+    unichar c = [chars characterAtIndex:0];
+    if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    if (c >= 'a' && c <= 'z') return 1 + (c - 'a');           /* keyA..keyZ */
+    if (c == '0') return 27;                                  /* key0 */
+    if (c >= '1' && c <= '9') return 28 + (c - '1');          /* key1..key9 */
+    switch (c) {
+      case ',': return 65;  /* keyComma */
+      case '.': return 66;  /* keyPeriod */
+      case '/': return 67;  /* keySlash */
+      case '-': return 68;  /* keyMinus */
+      case '=': return 69;  /* keyEqual */
+      case '+': return 70;  /* keyPlus */
+    }
+    /* Shifted digits ('!' for 1) and everything else fall through to the
+       position, which is what the apps that bind digits expect. */
+  }
+  return translateKeyCode(event.keyCode);
+}
+
 /* ---- Font management -------------------------------------------------- */
 
-#define MAX_FONTS 64
+/* A slot is 40 bytes, and one logical font size now costs up to four of them
+   -- regular, bold, italic and bold italic -- so an editor that lets every
+   panel be zoomed separately gets through the old 64 quickly. */
+#define MAX_FONTS 256
 
 typedef struct {
   CTFontRef font;
@@ -228,15 +265,31 @@ typedef struct {
 static FontSlot fonts[MAX_FONTS];
 static int fontCount = 0;
 
-int cocoa_openFont(const char *path, int size,
+int cocoa_openFont(const char *path, int size, int bold, int italic,
                    int *outAscent, int *outDescent, int *outLineHeight) {
-  if (fontCount >= MAX_FONTS) return 0;
+  /* Take a slot that cocoa_closeFont freed before growing the table. Without
+     the reuse this is append-only and MAX_FONTS is a lifetime budget, not a
+     concurrent one: focim keeps one font per logical size and closes and
+     reopens the whole cache every time the window moves to a display of
+     another density, so a few drags between monitors would exhaust the table
+     and openFont would start handing back 0 -- i.e. no text at all. */
+  int idx = -1;
+  for (int i = 0; i < fontCount; i++)
+    if (!fonts[i].font) { idx = i; break; }
+  if (idx < 0 && fontCount >= MAX_FONTS) return 0;
 
   CTFontRef ctFont = NULL;
 
   if (path[0] == '\0') {
-    /* Empty path = platform default (system) font */
-    ctFont = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, (CGFloat)size, NULL);
+    /* Empty path = platform default font, and every other driver reads that
+       as "monospaced" (Consolas on Windows, fontconfig's `monospace` on X11).
+       kCTFontUIFontSystem would hand back San Francisco, which is
+       proportional -- so ask for the fixed-pitch UI font instead; it resolves
+       to Menlo. Do NOT reach for "SF Mono" by name: CTFontCreateWithName
+       falls back to Helvetica without an error when a name is unknown, and SF
+       Mono is not name-accessible on a stock system. */
+    ctFont = CTFontCreateUIFontForLanguage(kCTFontUIFontUserFixedPitch,
+                                           (CGFloat)size, NULL);
   } else {
     /* Create font from file path */
     CFStringRef cfPath = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
@@ -260,7 +313,26 @@ int cocoa_openFont(const char *path, int size,
 
   if (!ctFont) return 0;
 
-  int idx = fontCount++;
+  if (bold || italic) {
+    /* Ask the family for the face, rather than emboldening or shearing the
+       regular one: Menlo has real Bold, Italic and Bold Italic faces, and
+       they keep the advance width of the regular face, so a monospaced grid
+       stays a grid. A family without the face returns NULL here -- then the
+       upright font stands in, which is what the styled text falls back to
+       anyway. */
+    CTFontSymbolicTraits traits = 0;
+    if (bold) traits |= kCTFontTraitBold;
+    if (italic) traits |= kCTFontTraitItalic;
+    CTFontRef styled = CTFontCreateCopyWithSymbolicTraits(ctFont, 0.0, NULL,
+                                                          traits, traits);
+    if (styled) {
+      CFRelease(ctFont);
+      ctFont = styled;
+    }
+  }
+
+  if (idx < 0) idx = fontCount++;  /* fontCount stays the high-water mark, so
+                                      the `idx < fontCount` guards below hold */
   fonts[idx].font = ctFont;
   fonts[idx].ascent = (int)ceil(CTFontGetAscent(ctFont));
   fonts[idx].descent = (int)ceil(CTFontGetDescent(ctFont));
@@ -324,42 +396,136 @@ void cocoa_measureText(int handle, const char *text, int *outW, int *outH) {
   CFRelease(str);
 }
 
+/* Draw text into `pixels` (w * h premultiplied 0xAARRGGBB, zeroed by the
+   caller) instead of the window: the run as Core Text lays it out, its line
+   placed the way cocoa_drawText places it. */
+void cocoa_renderText(int handle, const char *text, int w, int h,
+                      int r, int g, int b, int a, uint32_t *pixels) {
+  int idx = handle - 1;
+  if (idx < 0 || idx >= fontCount || !fonts[idx].font || !text || !text[0]) return;
+  if (w <= 0 || h <= 0 || !pixels) return;
+
+  CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  /* Premultiplied ARGB in a little-endian 32-bit word: the bytes are B, G,
+     R, A, which is what a uint32_t 0xAARRGGBB is on every Mac. */
+  CGContextRef ctx = CGBitmapContextCreate(pixels, w, h, 8, w * 4, space,
+    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+  CGColorSpaceRelease(space);
+  if (!ctx) return;
+
+  CFStringRef str = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
+  if (!str) { CGContextRelease(ctx); return; }
+  CGColorRef color = CGColorCreateSRGB(r/255.0, g/255.0, b/255.0, a/255.0);
+  CFStringRef keys[] = { kCTFontAttributeName, kCTForegroundColorAttributeName };
+  CFTypeRef vals[] = { fonts[idx].font, color };
+  CFDictionaryRef attrs = CFDictionaryCreate(NULL,
+    (const void **)keys, (const void **)vals, 2,
+    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  CFAttributedStringRef attrStr = CFAttributedStringCreate(NULL, str, attrs);
+  CTLineRef line = CTLineCreateWithAttributedString(attrStr);
+
+  /* A bitmap context is bottom-up already, and its first row in memory is
+     the top one, so the baseline is measured from the bottom as in
+     cocoa_drawText after its un-flip. */
+  int lh = fonts[idx].lineHeight;
+  CGFloat baseline = fonts[idx].descent +
+                     (lh - fonts[idx].ascent - fonts[idx].descent) * 0.5;
+  if (baseline < fonts[idx].descent) baseline = fonts[idx].descent;
+  CGContextSetTextPosition(ctx, 0, baseline + (h - lh));
+  CTLineDraw(line, ctx);
+  CGContextFlush(ctx);
+
+  CFRelease(line);
+  CFRelease(attrStr);
+  CFRelease(attrs);
+  CGColorRelease(color);
+  CFRelease(str);
+  CGContextRelease(ctx);
+}
+
 /* ---- Backing bitmap context ------------------------------------------- */
 
 static CGContextRef backingCtx = NULL;
 static int backingW = 0, backingH = 0;
 static CGFloat backingScale = 1.0;
-
 /* Clip rect stack (simple, max 32 deep) */
 #define MAX_CLIP_STACK 32
 static CGRect clipStack[MAX_CLIP_STACK];
 static int clipTop = 0;
 
 static void ensureBacking(int w, int h, CGFloat scale) {
-  if (backingCtx && backingW == w && backingH == h) return;
-  if (backingCtx) CGContextRelease(backingCtx);
-
-  backingW = w;
-  backingH = h;
-  backingScale = scale;
+  if (w <= 0 || h <= 0 || scale <= 0) return;
+  if (backingCtx && backingW == w && backingH == h && backingScale == scale) return;
 
   int pw = (int)(w * scale);
   int ph = (int)(h * scale);
-
   CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-  backingCtx = CGBitmapContextCreate(NULL, pw, ph, 8, pw * 4,
+  CGContextRef next = CGBitmapContextCreate(NULL, pw, ph, 8, pw * 4,
     cs, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Host);
   CGColorSpaceRelease(cs);
+  if (!next) return;
+
+  /* Drawing APIs use point coordinates, with their origin at the top left. */
+  CGContextScaleCTM(next, scale, scale);
+  CGContextTranslateCTM(next, 0, h);
+  CGContextScaleCTM(next, 1.0, -1.0);
+  CGContextSetShouldAntialias(next, true);
+  CGContextSetShouldSmoothFonts(next, true);
 
   if (backingCtx) {
-    /* Scale so we can draw in point coordinates */
-    CGContextScaleCTM(backingCtx, scale, scale);
-    /* Flip coordinate system: Core Graphics is bottom-up, we want top-down */
-    CGContextTranslateCTM(backingCtx, 0, h);
-    CGContextScaleCTM(backingCtx, 1.0, -1.0);
-    CGContextSetShouldAntialias(backingCtx, true);
-    CGContextSetShouldSmoothFonts(backingCtx, true);
+    /* Cocoa's live-resize loop can block the application's event pump.
+       Retain the last frame at its original point size until the application
+       redraws. A newly allocated blank bitmap makes the content disappear. */
+    CGImageRef previous = CGBitmapContextCreateImage(backingCtx);
+    if (previous) {
+      CGContextSaveGState(next);
+      CGContextTranslateCTM(next, 0, backingH);
+      CGContextScaleCTM(next, 1.0, -1.0);
+      CGContextSetInterpolationQuality(next, kCGInterpolationNone);
+      CGContextDrawImage(next, CGRectMake(0, 0, backingW, backingH), previous);
+      CGContextRestoreGState(next);
+      CGImageRelease(previous);
+    }
+    CGContextRelease(backingCtx);
   }
+  backingCtx = next;
+  backingW = w;
+  backingH = h;
+  backingScale = scale;
+}
+
+/* A persistent native compositor, separate from Siwin's transient pixel buffer. */
+int cocoa_prepareSiwinSurface(int pw, int ph, double scale) {
+  if (pw <= 0 || ph <= 0 || scale <= 0) return 0;
+  ensureBacking((int)lround(pw / scale), (int)lround(ph / scale), scale);
+  return backingCtx != NULL;
+}
+
+int cocoa_presentSiwinSurface(void *pixels, int pw, int ph) {
+  if (!backingCtx || !pixels || pw <= 0 || ph <= 0) return 0;
+  CGContextFlush(backingCtx);
+  const unsigned char *source = CGBitmapContextGetData(backingCtx);
+  size_t stride = CGBitmapContextGetBytesPerRow(backingCtx);
+  size_t width = CGBitmapContextGetWidth(backingCtx);
+  size_t height = CGBitmapContextGetHeight(backingCtx);
+  unsigned char *destination = pixels;
+  for (int y = 0; y < ph; ++y)
+    for (int x = 0; x < pw; ++x) {
+      uint32_t p = (x < width && y < height)
+        ? ((const uint32_t *)(source + (size_t)y * stride))[x] : 0;
+      size_t offset = ((size_t)y * pw + x) * 4;
+      destination[offset] = (p >> 16) & 255;
+      destination[offset + 1] = (p >> 8) & 255;
+      destination[offset + 2] = p & 255;
+      destination[offset + 3] = p >> 24;
+    }
+  return 1;
+}
+
+void cocoa_detachSurface(void) {
+  if (backingCtx) CGContextRelease(backingCtx);
+  backingCtx = NULL;
+  backingW = backingH = 0;
 }
 
 /* ---- Drawing primitives ----------------------------------------------- */
@@ -456,9 +622,6 @@ static int imageCount = 0;
 
 int cocoa_loadImage(const char *path) {
   if (!path || path[0] == '\0') return 0;
-  int haveFree = 0;
-  for (int i = 0; i < imageCount; i++) if (!imageSlots[i]) { haveFree = 1; break; }
-  if (!haveFree && imageCount >= MAX_IMAGES) return 0;
 
   CFStringRef cfPath = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8);
   if (!cfPath) return 0;
@@ -474,10 +637,17 @@ int cocoa_loadImage(const char *path) {
   CFRelease(source);
   if (!cgImage) return 0;
 
-  /* reuse a slot freed by cocoa_freeImage, else take a new one */
+  /* Take a slot cocoa_freeImage emptied before growing the table, the way
+     cocoa_openFont does. Without it a document that opens and closes the
+     same picture often runs a fixed table out. */
   int idx = -1;
-  for (int i = 0; i < imageCount; i++) if (!imageSlots[i]) { idx = i; break; }
-  if (idx < 0) idx = imageCount++;
+  for (int i = 0; i < imageCount; i++) {
+    if (!imageSlots[i]) { idx = i; break; }
+  }
+  if (idx < 0) {
+    if (imageCount >= MAX_IMAGES) { CGImageRelease(cgImage); return 0; }
+    idx = imageCount++;
+  }
   imageSlots[idx] = cgImage;
   return idx + 1; /* 1-based handle */
 }
@@ -489,11 +659,65 @@ void cocoa_freeImage(int handle) {
   imageSlots[idx] = NULL;
 }
 
-void cocoa_getImageSize(int handle, int *outW, int *outH) {
+void cocoa_imageSize(int handle, int *outW, int *outH) {
+  if (outW) *outW = 0;
+  if (outH) *outH = 0;
   int idx = handle - 1;
-  if (idx < 0 || idx >= imageCount || !imageSlots[idx]) { *outW = 0; *outH = 0; return; }
-  *outW = (int)CGImageGetWidth(imageSlots[idx]);
-  *outH = (int)CGImageGetHeight(imageSlots[idx]);
+  if (idx < 0 || idx >= imageCount || !imageSlots[idx]) return;
+  if (outW) *outW = (int)CGImageGetWidth(imageSlots[idx]);
+  if (outH) *outH = (int)CGImageGetHeight(imageSlots[idx]);
+}
+
+/* Finished pixels: host-order RGB (format 0) or premultiplied ARGB (format 1).
+   blitRGBA clips only; drawRGBA maps the whole image into its destination. */
+static int drawRGBA(const uint32_t *pixels, int w, int h,
+                    int dstX, int dstY, int dstW, int dstH, int scaleImage, int format) {
+  if (!backingCtx || !pixels || w <= 0 || h <= 0 || dstW <= 0 || dstH <= 0)
+    return 0;
+
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  if (!cs) return 0;
+  CGDataProviderRef prov =
+    CGDataProviderCreateWithData(NULL, pixels, (size_t)w * (size_t)h * 4, NULL);
+  if (!prov) { CGColorSpaceRelease(cs); return 0; }
+
+  /* Interpret the pixel words in host byte order; only alpha mode reads A. */
+  CGImageRef img = CGImageCreate(
+    (size_t)w, (size_t)h, 8, 32, (size_t)w * 4, cs,
+    kCGBitmapByteOrder32Host | (format == 1 ? kCGImageAlphaPremultipliedFirst : kCGImageAlphaNoneSkipFirst),
+    prov, NULL, false, kCGRenderingIntentDefault);
+  CGDataProviderRelease(prov);
+  CGColorSpaceRelease(cs);
+  if (!img) return 0;
+
+  int cw = scaleImage ? dstW : (w < dstW ? w : dstW);
+  int ch = scaleImage ? dstH : (h < dstH ? h : dstH);
+  int drawW = scaleImage ? dstW : w;
+  int drawH = scaleImage ? dstH : h;
+
+  CGContextSaveGState(backingCtx);
+  CGContextSetBlendMode(backingCtx, kCGBlendModeNormal);
+  CGContextClipToRect(backingCtx, CGRectMake(dstX, dstY, cw, ch));
+  /* The view is flipped and a CGImage is bottom-up, so the destination is
+     flipped back around itself before the picture goes down in it. */
+  CGContextTranslateCTM(backingCtx, dstX, dstY + drawH);
+  CGContextScaleCTM(backingCtx, 1.0, -1.0);
+  if (scaleImage) CGContextSetInterpolationQuality(backingCtx, kCGInterpolationNone);
+  CGContextDrawImage(backingCtx, CGRectMake(0, 0, drawW, drawH), img);
+  CGContextRestoreGState(backingCtx);
+
+  CGImageRelease(img);
+  return 1;
+}
+
+int cocoa_blitRGBA(const uint32_t *pixels, int w, int h,
+                   int dstX, int dstY, int dstW, int dstH, int format) {
+  return drawRGBA(pixels, w, h, dstX, dstY, dstW, dstH, 0, format);
+}
+
+int cocoa_drawRGBA(const uint32_t *pixels, int w, int h,
+                   int dstX, int dstY, int dstW, int dstH, int format) {
+  return drawRGBA(pixels, w, h, dstX, dstY, dstW, dstH, 1, format);
 }
 
 void cocoa_drawImage(int handle, int srcX, int srcY, int srcW, int srcH,
@@ -627,7 +851,7 @@ void cocoa_delay(uint32_t ms) {
 - (void)keyDown:(NSEvent *)event {
   NEEvent e = {0};
   e.kind = NE_KEY_DOWN;
-  e.key = translateKeyCode(event.keyCode);
+  e.key = translateKeyEvent(event);
   e.mods = translateModifiers(event.modifierFlags);
   pushEvent(e);
 
@@ -670,7 +894,7 @@ void cocoa_delay(uint32_t ms) {
 - (void)keyUp:(NSEvent *)event {
   NEEvent e = {0};
   e.kind = NE_KEY_UP;
-  e.key = translateKeyCode(event.keyCode);
+  e.key = translateKeyEvent(event);
   e.mods = translateModifiers(event.modifierFlags);
   pushEvent(e);
 }
@@ -875,12 +1099,18 @@ static int currentButtons(NSEvent *event) {
   NSRect frame = [[w contentView] frame];
   CGFloat scale = [w backingScaleFactor];
   ensureBacking((int)frame.size.width, (int)frame.size.height, scale);
+  [[w contentView] setNeedsDisplay:YES];
 
   NEEvent e = {0};
   e.kind = NE_WINDOW_RESIZE;
   e.x = (int)frame.size.width;
   e.y = (int)frame.size.height;
   pushEvent(e);
+}
+
+- (void)windowDidChangeBackingProperties:(NSNotification *)n {
+  /* A screen-density change can leave the point dimensions unchanged. */
+  [self windowDidResize:n];
 }
 
 - (void)windowDidBecomeKey:(NSNotification *)n {
@@ -892,6 +1122,18 @@ static int currentButtons(NSEvent *event) {
 - (void)windowDidResignKey:(NSNotification *)n {
   NEEvent e = {0};
   e.kind = NE_WINDOW_FOCUS_LOST;
+  pushEvent(e);
+}
+
+- (void)requestQuit:(id)sender {
+  /* The app menu's Quit item lands here instead of on NSApp's terminate:,
+     which would kill the process from inside the menu's own event handling --
+     the app would never see the keystroke and never get to run its shutdown
+     path. Queueing NE_QUIT lets Cmd+Q reach the app like every other Cmd
+     combination, and matches what windowShouldClose: above already does for
+     the close button. */
+  NEEvent e = {0};
+  e.kind = NE_QUIT;
   pushEvent(e);
 }
 
@@ -914,6 +1156,9 @@ void cocoa_createWindow(int w, int h, int *outW, int *outH,
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
+    /* The delegate is created up front: the Quit menu item below targets it. */
+    winDelegate = [[NimEditWindowDelegate alloc] init];
+
     /* Create menu bar (minimal: just app menu with Quit) */
     NSMenu *menubar = [[NSMenu alloc] init];
     NSMenuItem *appMenuItem = [[NSMenuItem alloc] init];
@@ -923,15 +1168,35 @@ void cocoa_createWindow(int w, int h, int *outW, int *outH,
     NSMenu *appMenu = [[NSMenu alloc] init];
     NSMenuItem *quitItem = [[NSMenuItem alloc]
       initWithTitle:@"Quit NimEdit"
-             action:@selector(terminate:)
+             action:@selector(requestQuit:)
       keyEquivalent:@"q"];
+    [quitItem setTarget:winDelegate];
     [appMenu addItem:quitItem];
     [appMenuItem setSubmenu:appMenu];
 
-    /* Create window */
-    NSRect rect = NSMakeRect(100, 100, w, h);
+    /* Create window. A negative dimension is MaxWindowWidth/MaxWindowHeight:
+       take the screen's visibleFrame, which is the screen minus the menu bar
+       and the Dock -- every bit of space a window is allowed to have. This is
+       not fullscreen: the window keeps its title bar, the menu bar stays
+       visible and the window stays out of a Space of its own. A window that
+       maxes out in one direction is placed at that edge of the visible area
+       and keeps its requested size in the other. */
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                        NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
+    /* initWithContentRect: wants the CONTENT rect, so the visible frame has
+       to have the title bar taken off it -- handing it over as-is would make
+       the window taller than the space it is supposed to fit in. */
+    NSRect visible = [[NSScreen mainScreen] visibleFrame];
+    NSRect maxContent = [NSWindow contentRectForFrameRect:visible styleMask:style];
+    NSRect rect = NSMakeRect(100, 100, w, h);
+    if (w < 0) {
+      rect.size.width = maxContent.size.width;
+      rect.origin.x = maxContent.origin.x;
+    }
+    if (h < 0) {
+      rect.size.height = maxContent.size.height;
+      rect.origin.y = maxContent.origin.y;
+    }
     mainWindow = [[NSWindow alloc] initWithContentRect:rect
                                              styleMask:style
                                                backing:NSBackingStoreBuffered
@@ -944,8 +1209,7 @@ void cocoa_createWindow(int w, int h, int *outW, int *outH,
     [mainWindow setContentView:mainView];
     [mainWindow makeFirstResponder:mainView];
 
-    /* Window delegate */
-    winDelegate = [[NimEditWindowDelegate alloc] init];
+    /* Window delegate (already allocated above for the Quit menu item) */
     [mainWindow setDelegate:winDelegate];
 
     /* Show */

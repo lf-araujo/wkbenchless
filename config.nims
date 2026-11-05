@@ -17,9 +17,9 @@ switch("path", "src/vendor/uirelays")
 ## X11 + Xft driver instead (also the fallback if the GPU build misbehaves).
 ## macOS and Windows keep their native drivers.
 when defined(linux) and not defined(wkbX11) and
-     not defined(feature.uirelays.figDrawWindy) and not defined(figDrawWindy):
+     not defined(features.uirelays.figDrawWindy) and not defined(figDrawWindy):
   when (NimMajor, NimMinor) >= (2, 4):
-    switch("define", "feature.uirelays.figDrawSiwin")
+    switch("define", "features.uirelays.figDrawSiwinGpu")
     switch("define", "figdrawTextBackend=pixie")
   else:
     echo "wkbenchless: Nim " & NimVersion & " < 2.4 -- building the CPU X11 " &

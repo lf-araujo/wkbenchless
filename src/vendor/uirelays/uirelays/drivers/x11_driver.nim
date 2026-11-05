@@ -3,6 +3,7 @@
 # Double-buffered via X Pixmap.
 
 import ../coords, ../input, ../screen
+from ../pixelutils import resizedRGBA
 import std/[strutils, os]
 when defined(nimony):
   {.feature: "lenientnils".}
@@ -28,10 +29,23 @@ type
     tv_sec: clong
     tv_nsec: clong
 
+proc c_setlocale(category: cint; locale: cstring): cstring
+  {.importc: "setlocale", header: "<locale.h>".}
+var LC_CTYPE {.importc: "LC_CTYPE", header: "<locale.h>".}: cint
+
 proc clock_gettime(clk: ClockId; tp: var Timespec): cint
   {.importc, header: "<time.h>".}
 proc nanosleep(req: var Timespec; rem: var Timespec): cint
   {.importc, header: "<time.h>".}
+
+# ---- POSIX environment (libc) ----
+# Read and unread directly rather than through `std/os`, which the second
+# compiler this file is built with does not have all of.
+
+proc c_getenv(name: cstring): cstring
+  {.importc: "getenv", header: "<stdlib.h>".}
+proc c_unsetenv(name: cstring): cint
+  {.importc: "unsetenv", header: "<stdlib.h>".}
 
 proc sleepMs(ms: int) =
   var req = Timespec(tv_sec: clong(ms div 1000),
@@ -56,6 +70,10 @@ type
   XRectangle {.pure.} = object
     x, y: cshort
     width, height: cushort
+
+  XClassHint {.pure.} = object
+    res_name: cstring
+    res_class: cstring
 
   XColor {.pure, used.} = object
     pixel: culong
@@ -225,6 +243,7 @@ const
   CurrentTime = 0.XTime
   XA_ATOM = 4.Atom
   XA_STRING = 31.Atom
+  XA_CARDINAL = 6.Atom
   PropModeReplace = 0.cint
 
   # Event types
@@ -249,7 +268,10 @@ const
   ButtonReleaseMask = 1 shl 3
   PointerMotionMask = 1 shl 6
   StructureNotifyMask = 1 shl 17
+  SubstructureNotifyMask = 1 shl 19
+  SubstructureRedirectMask = 1 shl 20
   FocusChangeMask = 1 shl 21
+  PropertyChangeMask = 1 shl 22
 
   # Modifier masks
   ShiftMask = 1'u32
@@ -279,6 +301,8 @@ const
   # KeySyms
   XK_a = 0x61'u
   XK_z = 0x7a'u
+  XK_CapitalA = 0x41'u
+  XK_CapitalZ = 0x5a'u
   XK_0 = 0x30'u
   XK_9 = 0x39'u
   XK_F1 = 0xffbe'u
@@ -305,6 +329,15 @@ const
   XK_period = 0x2e'u
   XK_minus = 0x2d'u
   XK_equal = 0x3d'u
+  XK_slash = 0x2f'u
+
+  # Input method
+  XIMPreeditNothing = 0x0008
+  XIMStatusNothing = 0x0400
+  XBufferOverflow = -1.cint
+  XLookupChars = 2.cint
+  XLookupKeySymVal = 3.cint
+  XLookupBoth = 4.cint
 
 # ---- POSIX select for timeout waiting ----
 
@@ -379,8 +412,42 @@ proc XDrawPoint(dpy: pointer; d: XID; gc: pointer; x, y: cint): cint
 proc XCopyArea(dpy: pointer; src, dst: XID; gc: pointer;
   srcX, srcY: cint; w, h: cuint; dstX, dstY: cint): cint
   {.cdecl, dynlib: libX11, importc.}
-proc XPutImage(dpy: pointer; d: XID; gc: pointer; image: pointer;
-  srcX, srcY, dstX, dstY: cint; w, h: cuint): cint
+
+type
+  XImageObj = object
+    ## The front of Xlib's `XImage`, which is longer than this. Only a prefix
+    ## is declared because only a prefix is touched, and a prefix of a C
+    ## struct is at the same offsets as the whole of it. Nothing here is ever
+    ## allocated on this side -- `XCreateImage` makes it and the fields are
+    ## read back through the pointer it returns.
+    width, height: cint
+    xoffset: cint
+    format: cint
+    data: pointer
+    byteOrder: cint         ## LSBFirst / MSBFirst, the *server's*
+    bitmapUnit: cint
+    bitmapBitOrder: cint
+    bitmapPad: cint
+    depth: cint
+    bytesPerLine: cint
+    bitsPerPixel: cint      ## 32 for the depth-24 visual nearly everything
+                            ## has; the one field worth asking about
+    redMask, greenMask, blueMask: culong
+
+const
+  ZPixmap = 2
+  LSBFirst = 0
+  MSBFirst = 1
+
+proc XCreateImage(dpy: pointer; visual: pointer; depth: cuint; format: cint;
+  offset: cint; data: pointer; w, h: cuint;
+  bitmapPad, bytesPerLine: cint): ptr XImageObj
+  {.cdecl, dynlib: libX11, importc.}
+proc XGetImage(dpy: pointer; d: XID; x, y: cint; w, h: cuint;
+  planeMask: culong; format: cint): ptr XImageObj
+  {.cdecl, dynlib: libX11, importc.}
+proc XPutImage(dpy: pointer; d: XID; gc: pointer; image: ptr XImageObj;
+  srcX, srcY: cint; dstX, dstY: cint; w, h: cuint): cint
   {.cdecl, dynlib: libX11, importc.}
 proc XSetClipRectangles(dpy: pointer; gc: pointer;
   x, y: cint; rects: ptr XRectangle; n, ordering: cint): cint
@@ -389,15 +456,18 @@ proc XSetClipMask(dpy: pointer; gc: pointer; pixmap: XID): cint
   {.cdecl, dynlib: libX11, importc.}
 proc XNextEvent(dpy: pointer; ev: ptr XEvent): cint
   {.cdecl, dynlib: libX11, importc.}
+proc XPeekEvent(dpy: pointer; ev: ptr XEvent): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XkbSetDetectableAutoRepeat(dpy: pointer; detectable: XBool;
+                                supported: ptr XBool): XBool
+  {.cdecl, dynlib: libX11, importc.}
 proc XPending(dpy: pointer): cint
   {.cdecl, dynlib: libX11, importc.}
 proc XFlush(dpy: pointer): cint
   {.cdecl, dynlib: libX11, importc.}
 proc XStoreName(dpy: pointer; w: XID; name: cstring): cint
   {.cdecl, dynlib: libX11, importc.}
-type XClassHint = object
-  resName, resClass: cstring
-proc XSetClassHint(dpy: pointer; w: XID; hint: ptr XClassHint): cint
+proc XSetClassHint(dpy: pointer; w: XID; class_hints: ptr XClassHint): cint
   {.cdecl, dynlib: libX11, importc.}
 proc XInternAtom(dpy: pointer; name: cstring; onlyIfExists: XBool): Atom
   {.cdecl, dynlib: libX11, importc.}
@@ -409,6 +479,29 @@ proc XDefineCursor(dpy: pointer; w: XID; cursor: XID): cint
   {.cdecl, dynlib: libX11, importc.}
 proc XLookupString(ev: ptr XKeyEvent; buf: cstring; bufSize: cint;
   keysym: ptr XKeySym; compose: pointer): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XSetLocaleModifiers(modifiers: cstring): cstring
+  {.cdecl, dynlib: libX11, importc.}
+proc XOpenIM(dpy: pointer; rdb: pointer; resName, resClass: cstring): pointer
+  {.cdecl, dynlib: libX11, importc.}
+proc XCloseIM(im: pointer): XStatus
+  {.cdecl, dynlib: libX11, importc.}
+# The two varargs calls take a NULL-terminated list of name/value pairs. Every
+# argument is passed as a pointer, so the list is of one type.
+proc XCreateIC(im: pointer): pointer
+  {.cdecl, dynlib: libX11, importc, varargs.}
+proc XGetICValues(ic: pointer): cstring
+  {.cdecl, dynlib: libX11, importc, varargs.}
+proc XDestroyIC(ic: pointer)
+  {.cdecl, dynlib: libX11, importc.}
+proc XSetICFocus(ic: pointer)
+  {.cdecl, dynlib: libX11, importc.}
+proc XUnsetICFocus(ic: pointer)
+  {.cdecl, dynlib: libX11, importc.}
+proc Xutf8LookupString(ic: pointer; ev: ptr XKeyEvent; buf: cstring;
+  bufSize: cint; keysym: ptr XKeySym; status: ptr cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XFilterEvent(ev: ptr XEvent; w: XID): XBool
   {.cdecl, dynlib: libX11, importc.}
 proc XSetSelectionOwner(dpy: pointer; selection: Atom; owner: XID; time: XTime): cint
   {.cdecl, dynlib: libX11, importc.}
@@ -448,6 +541,8 @@ proc XftDrawStringUtf8(draw: pointer; color: ptr XftColor; font: ptr XftFont;
   {.cdecl, dynlib: libXft, importc.}
 proc XftTextExtentsUtf8(dpy: pointer; font: ptr XftFont;
   text: cstring; len: cint; extents: ptr XGlyphInfo): void
+  {.cdecl, dynlib: libXft, importc.}
+proc XftDrawCreateAlpha(dpy: pointer; pixmap: XID; depth: cint): pointer
   {.cdecl, dynlib: libXft, importc.}
 proc XftDrawRect(draw: pointer; color: ptr XftColor;
   x, y: cint; w, h: cuint): void
@@ -507,11 +602,91 @@ var
   gClipboardText: string
   gClipProperty: Atom
   gUiScale: int = 100
+  gXim: pointer        # input method, nil if none could be opened
+  gXic: pointer        # its input context for `gWindow`
 
 var eventQueue: seq[input.Event]
 
+type XRenderPictFormat = ptr object
+
+proc XRenderFindStandardFormat(display: pointer; format: cint): XRenderPictFormat
+  {.cdecl, dynlib: "libXrender.so(|.1)", importc.}
+proc XRenderFindVisualFormat(display, visual: pointer): XRenderPictFormat
+  {.cdecl, dynlib: "libXrender.so(|.1)", importc.}
+proc XRenderCreatePicture(display: pointer; drawable: XID;
+    format: XRenderPictFormat; mask: culong; attributes: pointer): XID
+  {.cdecl, dynlib: "libXrender.so(|.1)", importc.}
+proc XRenderFreePicture(display: pointer; picture: XID)
+  {.cdecl, dynlib: "libXrender.so(|.1)", importc.}
+proc XRenderComposite(display: pointer; operation: cint; source, mask, dest: XID;
+    sx, sy, mx, my, dx, dy: cint; width, height: cuint)
+  {.cdecl, dynlib: "libXrender.so(|.1)", importc.}
+proc XRenderFillRectangle(display: pointer; operation: cint; dest: XID;
+    color: ptr XRenderColor; x, y: cint; width, height: cuint)
+  {.cdecl, dynlib: "libXrender.so(|.1)", importc.}
+proc XRenderSetPictureClipRectangles(display: pointer; picture: XID;
+    x, y: cint; rectangles: ptr XRectangle; count: cint)
+  {.cdecl, dynlib: "libXrender.so(|.1)", importc.}
+
+var
+  rgbaClipActive: bool
+  rgbaClip: XRectangle
+
 proc pushEvent(e: input.Event) =
-  eventQueue.add e
+  # Pointer motion is coalesced: X11 sends one event per hardware sample --
+  # a thousand a second with the mice that report that fast -- and a host that
+  # repaints per event would repaint a thousand times to follow one sweep of
+  # the pointer. Only the newest position is of any use, so a motion that
+  # arrives behind another that nobody has read yet replaces it. Anything
+  # else in between (a click, a key) ends the run and is kept in order.
+  if e.kind == MouseMoveEvent and eventQueue.len > 0 and
+     eventQueue[^1].kind == MouseMoveEvent:
+    eventQueue[^1] = e
+  else:
+    eventQueue.add e
+
+# ---- Frame de-duplication ----
+#
+# What puts a frame on screen is a copy of the whole back pixmap over the
+# window, and that copy is the expensive half of drawing one: a maximized
+# window on a large display is ten megapixels for the X server to read and
+# write, and every one of them is damage the compositor then has to work
+# through. An app written as a redraw-and-present loop asks for that copy
+# once per turn of the loop whether or not the turn had anything new to show,
+# and most turns do not -- a caret that did not blink, a progress line that
+# still says what it said thirty milliseconds ago, a timeout that expired
+# with nothing behind it.
+#
+# So the driver checksums the drawing. Everything that can change a pixel of
+# the back pixmap folds its arguments into a running hash, and `x11Refresh`
+# skips the copy when the hash matches the picture the window is already
+# showing: the same calls with the same arguments in the same order cannot
+# have produced a different picture, so the copy that is skipped is provably
+# the window onto itself. Nothing else depends on it -- `Expose` repaints
+# from the pixmap on its own, so a window that was covered still comes back,
+# and a resize throws the pixmap away and forces the next copy.
+
+const FrameHashSeed = 0xcbf29ce484222325'u64
+
+var
+  gFrameHash = FrameHashSeed  ## the frame being drawn now
+  gShownHash = FrameHashSeed  ## the frame the window is showing
+  gFrameForced = true         ## the window is showing nothing yet
+
+proc mixFrame(x: uint64) {.inline.} =
+  var h = (gFrameHash xor x) * 0x9E3779B97F4A7C15'u64
+  gFrameHash = h xor (h shr 29)
+
+proc mixFrame(x: int) {.inline.} =
+  mixFrame(cast[uint64](x))
+
+proc mixFrame(c: screen.Color) {.inline.} =
+  mixFrame(c.r.uint64 or (c.g.uint64 shl 8) or
+           (c.b.uint64 shl 16) or (c.a.uint64 shl 24))
+
+proc mixFrameText(t: cstring; len: cint) =
+  let bytes = cast[ptr UncheckedArray[char]](t)
+  for i in 0 ..< len.int: mixFrame(bytes[i].uint64)
 
 # ---- Back-buffer management ----
 
@@ -526,12 +701,20 @@ proc recreateBackBuffer() =
   discard XSetForeground(gDisplay, gGC, 0)
   discard XFillRectangle(gDisplay, gBackPixmap, gGC, 0, 0,
     gWidth.cuint, gHeight.cuint)
+  # A new pixmap is a new window: whatever the next frame hashes to, it has
+  # never been on screen.
+  gFrameForced = true
 
 # ---- Key translation ----
 
 proc translateKeySym(ks: XKeySym): input.KeyCode =
   if ks >= XK_a and ks <= XK_z:
     return input.KeyCode(ord(KeyA) + (ks.int - XK_a.int))
+  # With Shift (or Caps Lock) down, X hands over the capital's keysym. It is
+  # the same key: a press has to say so, and a release all the more -- the
+  # release of W is what stops the running, Shift or not.
+  if ks >= XK_CapitalA and ks <= XK_CapitalZ:
+    return input.KeyCode(ord(KeyA) + (ks.int - XK_CapitalA.int))
   if ks >= XK_0 and ks <= XK_9:
     return input.KeyCode(ord(Key0) + (ks.int - XK_0.int))
   if ks >= XK_F1 and ks <= XK_F12:
@@ -558,6 +741,7 @@ proc translateKeySym(ks: XKeySym): input.KeyCode =
   of XK_period: KeyPeriod
   of XK_minus: KeyMinus
   of XK_equal: KeyEqual
+  of XK_slash: KeySlash
   else: KeyNone
 
 proc translateMods(state: cuint): set[Modifier] =
@@ -603,6 +787,24 @@ proc handleSelectionRequest(req: XSelectionRequestEvent) =
 
 # ---- Event processing ----
 
+var gRepeatsPaired = true
+  ## Whether the server still sends a held key's auto-repeat as release/press
+  ## pairs -- set once, by asking for XKB's detectable auto-repeat.
+
+proc isAutoRepeatRelease(xev: XEvent): bool =
+  ## A release that auto-repeat made up: the very next event is a press of
+  ## the same key with the same timestamp. Only asked where the server could
+  ## not be told to leave those out, and only of an event straight off the
+  ## queue: an input method that wants releases takes them in through
+  ## `XFilterEvent` and hands them back later, by which time the press that
+  ## came with a made-up one is no longer next to it.
+  if not gRepeatsPaired or XPending(gDisplay) == 0: return false
+  var next {.noinit.}: XEvent
+  discard XPeekEvent(gDisplay, addr next)
+  result = next.xkey.theType == KeyPress and
+           next.xkey.keycode == xev.xkey.keycode and
+           next.xkey.time == xev.xkey.time
+
 var lastClickTime: XTime
 var lastClickX, lastClickY: int
 var clickCount: int
@@ -613,6 +815,12 @@ proc processXEvent(xev: XEvent) =
     if xev.xexpose.count == 0 and gBackPixmap != None:
       discard XCopyArea(gDisplay, gBackPixmap, gWindow, gGC,
         0, 0, gWidth.cuint, gHeight.cuint, 0, 0)
+      # This copy was of a pixmap the frame in progress is halfway through
+      # drawing -- an app asks for events in the middle of a frame, and the
+      # background it cleared to is all that is on the pixmap by then. So the
+      # window is not showing any frame now, and the next `x11Refresh` has to
+      # copy however little the frame it finishes turns out to have changed.
+      gFrameForced = true
 
   of ConfigureNotify:
     let newW = xev.xconfigure.width
@@ -634,27 +842,62 @@ proc processXEvent(xev: XEvent) =
       pushEvent(input.Event(kind: WindowCloseEvent))
 
   of FocusIn:
+    if gXic != nil: XSetICFocus(gXic)
     pushEvent(input.Event(kind: WindowFocusGainedEvent))
 
   of FocusOut:
+    if gXic != nil: XUnsetICFocus(gXic)
     pushEvent(input.Event(kind: WindowFocusLostEvent))
 
   of KeyPress:
-    var buf {.noinit.}: array[8, char]
-    var ks {.noinit.}: XKeySym
-    let textLen = XLookupString(unsafeAddr xev.xkey, cast[cstring](addr buf[0]),
-      8, addr ks, nil)
-    # Key event
-    var e = input.Event(kind: KeyDownEvent)
-    e.key = translateKeySym(ks)
-    e.mods = translateMods(xev.xkey.state)
-    pushEvent(e)
-    # Text input (if printable)
-    if textLen > 0 and buf[0].uint8 >= 32 and buf[0].uint8 != 127:
-      var te = input.Event(kind: TextInputEvent)
-      for i in 0 ..< min(textLen, 4):
-        te.text[i] = buf[i]
-      pushEvent(te)
+    # The text a key types is UTF-8 from the input method, which is also what
+    # composes dead keys and runs an IME. `XLookupString` is only the fallback
+    # for a display without one: it speaks ISO 8859-1, so its byte for an 'ä'
+    # is re-encoded here -- passed on as it is, it is not UTF-8.
+    var buf {.noinit.}: array[64, char]
+    var ks: XKeySym = 0
+    var text = ""
+    var hasKey = true
+    if gXic != nil:
+      var status: cint = 0
+      var n = Xutf8LookupString(gXic, unsafeAddr xev.xkey,
+        cast[cstring](addr buf[0]), buf.len.cint, addr ks, addr status)
+      if status == XBufferOverflow:
+        text = newString(n)
+        n = Xutf8LookupString(gXic, unsafeAddr xev.xkey, cstr(text),
+          n.cint, addr ks, addr status)
+        text.setLen(max(n, 0))
+      elif status == XLookupChars or status == XLookupBoth:
+        for i in 0 ..< n: text.add buf[i]
+      # Text an IME commits arrives without a key to go with it.
+      hasKey = status == XLookupKeySymVal or status == XLookupBoth
+    else:
+      let n = XLookupString(unsafeAddr xev.xkey, cast[cstring](addr buf[0]),
+        buf.len.cint, addr ks, nil)
+      for i in 0 ..< n:
+        let b = buf[i].uint8
+        if b < 0x80:
+          text.add buf[i]
+        else:
+          text.add char(0xC0'u8 or (b shr 6))
+          text.add char(0x80'u8 or (b and 0x3F))
+    if hasKey:
+      var e = input.Event(kind: KeyDownEvent)
+      e.key = translateKeySym(ks)
+      e.mods = translateMods(xev.xkey.state)
+      pushEvent(e)
+    # Text input (if printable), one event per codepoint
+    if text.len > 0 and text[0].uint8 >= 32 and text[0].uint8 != 127:
+      var i = 0
+      while i < text.len:
+        var te = input.Event(kind: TextInputEvent)
+        var k = 0
+        while true:
+          if k < te.text.len: te.text[k] = text[i]
+          inc k
+          inc i
+          if i >= text.len or (text[i].uint8 and 0xC0) != 0x80: break
+        pushEvent(te)
 
   of KeyRelease:
     var ks {.noinit.}: XKeySym
@@ -711,11 +954,19 @@ proc processXEvent(xev: XEvent) =
   else:
     discard
 
+proc dispatchXEvent(xev: var XEvent) =
+  ## One event just taken off the queue: a release that auto-repeat made up
+  ## goes nowhere, the input method gets the first look at the rest, and
+  ## what it leaves is ours.
+  if xev.xkey.theType == KeyRelease and isAutoRepeatRelease(xev): return
+  if XFilterEvent(addr xev, None) == 0:
+    processXEvent(xev)
+
 proc drainXEvents() =
   while XPending(gDisplay) > 0:
     var xev {.noinit.}: XEvent
     discard XNextEvent(gDisplay, addr xev)
-    processXEvent(xev)
+    dispatchXEvent(xev)
 
 # ---- Display density ----
 
@@ -759,8 +1010,86 @@ proc computeUiScale(): int =
 
 # ---- Screen hook implementations ----
 
-proc x11CreateWindow(layout: var ScreenLayout) =
-  gDisplay = XOpenDisplay(nil)
+# ---- Startup notification ----
+#
+# A desktop that launches an application from a `.desktop` entry shows launch
+# feedback while it comes up: the busy pointer, a bouncing icon, a greyed
+# placeholder in the taskbar. It stops when the application says it is up --
+# and an application that never says so is fed back until the window manager
+# gives up on waiting for it, which is fifteen seconds under mutter and more
+# elsewhere. The window is on screen for all but the first of those seconds,
+# which is what makes it look like the desktop is stuck rather than the app.
+#
+# Saying so is `_NET_STARTUP_INFO`: the launcher puts an id in the
+# environment, the window carries it as `_NET_STARTUP_ID` so the window
+# manager can tell which launch this window is the answer to, and a `remove:`
+# message on the root window ends the sequence for the desktops that watch
+# for it instead. The id is taken back out of the environment on the way
+# past, because it names this one launch: a program started from inside this
+# one -- everything a built-in terminal ever runs -- would otherwise inherit
+# it and end somebody else's launch feedback with a window of its own.
+
+proc snQuote(s: string): string =
+  ## `_NET_STARTUP_INFO` fields are separated by spaces, so a value holding
+  ## one -- or a quote, or a backslash -- is quoted and escaped.
+  var special = false
+  for c in s:
+    if c == ' ' or c == '"' or c == '\\': special = true
+  if not special: return s
+  result = "\""
+  for c in s:
+    if c == '"' or c == '\\': result.add '\\'
+    result.add c
+  result.add '"'
+
+proc sendStartupInfo(msg: string) =
+  let beginAtom = XInternAtom(gDisplay, "_NET_STARTUP_INFO_BEGIN", 0)
+  let moreAtom = XInternAtom(gDisplay, "_NET_STARTUP_INFO", 0)
+  if beginAtom == 0 or moreAtom == 0: return
+  let root = XRootWindow(gDisplay, gScreen)
+  var ev = XEvent()
+  ev.xclient.theType = ClientMessage
+  ev.xclient.window = gWindow
+  ev.xclient.format = 8
+  ev.xclient.message_type = beginAtom
+  # Twenty bytes to a message, the terminating NUL among them -- so a message
+  # whose length is a multiple of twenty still gets the chunk that ends it.
+  var i = 0
+  while true:
+    let bytes = cast[ptr UncheckedArray[char]](addr ev.xclient.data[0])
+    for k in 0 ..< 20:
+      let j = i + k
+      bytes[k] = if j < msg.len: msg[j] else: '\0'
+    discard XSendEvent(gDisplay, root, 0, PropertyChangeMask.clong, addr ev)
+    ev.xclient.message_type = moreAtom
+    i += 20
+    if i > msg.len: break
+  discard XFlush(gDisplay)
+
+proc openInputMethod() =
+  ## The input method the environment asks for (`XMODIFIERS`, an IBus or
+  ## Fcitx say), else the one built into Xlib, which does dead keys and
+  ## Compose. Either hands out UTF-8. The locale's character type is what
+  ## picks the Compose table, so it is taken from the environment first.
+  discard c_setlocale(LC_CTYPE, "")
+  discard XSetLocaleModifiers("")
+  gXim = XOpenIM(gDisplay, nil, nil, nil)
+  if gXim == nil:
+    discard XSetLocaleModifiers("@im=none")
+    gXim = XOpenIM(gDisplay, nil, nil, nil)
+  if gXim == nil: return
+  gXic = XCreateIC(gXim,
+    cstring"inputStyle", cast[pointer](XIMPreeditNothing or XIMStatusNothing),
+    cstring"clientWindow", cast[pointer](gWindow),
+    cstring"focusWindow", cast[pointer](gWindow),
+    nil)
+  if gXic == nil:
+    discard XCloseIM(gXim)
+    gXim = nil
+
+proc x11CreateWindow(layout: var ScreenLayout; icon: pointer; iconLen: int) =
+  # Fonts opened before the window already have the connection.
+  if gDisplay == nil: gDisplay = XOpenDisplay(nil)
   if gDisplay == nil:
     quit("Cannot open X11 display")
   gUiScale = computeUiScale()
@@ -773,14 +1102,42 @@ proc x11CreateWindow(layout: var ScreenLayout) =
     layout.width = XDisplayWidth(gDisplay, gScreen)
     layout.height = XDisplayHeight(gDisplay, gScreen)
 
+  # A negative dimension is MaxWindowWidth/MaxWindowHeight. The window is
+  # created at the display size and then asked to maximize below: the window
+  # manager is the one that knows where its panels are, and it answers with a
+  # ConfigureNotify carrying the size that was actually granted.
+  let maximized = layout.width < 0 or layout.height < 0
+  if layout.width < 0: layout.width = XDisplayWidth(gDisplay, gScreen)
+  if layout.height < 0: layout.height = XDisplayHeight(gDisplay, gScreen)
+
   gWindow = XCreateSimpleWindow(gDisplay, XRootWindow(gDisplay, gScreen),
     0, 0, layout.width.cuint, layout.height.cuint, 0,
     XBlackPixel(gDisplay, gScreen), XBlackPixel(gDisplay, gScreen))
 
+  openInputMethod()
+  # Key releases are reported, as every other backend reports them: a game
+  # moves for as long as a key is *held*, and only the release says when that
+  # ends. What they must not be is one release per auto-repeat. Plain X11
+  # repeats a held key as release/press pairs, and a host that repaints per
+  # event would pay a frame for every one of them -- the one place where the
+  # keyboard produces events faster than a person types. XKB's "detectable
+  # auto-repeat" makes the server send the presses alone, so a `KeyUpEvent`
+  # means a finger came off the key. A server without XKB gets the pairs, and
+  # `isAutoRepeatRelease` takes them apart on this side instead.
+  #
+  # An input method may ask for events of its own (IBus wants the releases
+  # too); it takes what it asked for out again in `XFilterEvent`, before any
+  # of it becomes an event here.
+  var imEvents: clong = 0
+  if gXic != nil:
+    discard XGetICValues(gXic, cstring"filterEvents", addr imEvents, nil)
   discard XSelectInput(gDisplay, gWindow,
     (ExposureMask or KeyPressMask or KeyReleaseMask or
      ButtonPressMask or ButtonReleaseMask or PointerMotionMask or
-     StructureNotifyMask or FocusChangeMask).clong)
+     StructureNotifyMask or FocusChangeMask).clong or imEvents)
+  var detectable: XBool = 0
+  discard XkbSetDetectableAutoRepeat(gDisplay, 1, addr detectable)
+  gRepeatsPaired = detectable == 0
 
   # Register WM_DELETE_WINDOW
   gWmDeleteWindow = XInternAtom(gDisplay, "WM_DELETE_WINDOW", 0)
@@ -792,14 +1149,90 @@ proc x11CreateWindow(layout: var ScreenLayout) =
   gTargets = XInternAtom(gDisplay, "TARGETS", 0)
   gClipProperty = XInternAtom(gDisplay, "NIMEDIT_CLIP", 0)
 
-  discard XStoreName(gDisplay, gWindow, "NimEdit")
-  # WM_CLASS = the program's own name, so docks/taskbars can match the window to
-  # its .desktop entry (StartupWMClass) and show the app icon. Without it the
-  # window has no class and desktops fall back to a generic icon.
-  let appName = splitFile(getAppFilename()).name
-  var classHint = XClassHint(resName: cstring(appName), resClass: cstring(appName))
+  # See "Startup notification" above. Both names are cleared: X11 launches
+  # set the first, Wayland ones the second, and this window is the answer to
+  # whichever it was.
+  var startupId = ""
+  let rawId = c_getenv("DESKTOP_STARTUP_ID")
+  if rawId != nil: startupId = $rawId
+  discard c_unsetenv("DESKTOP_STARTUP_ID")
+  discard c_unsetenv("XDG_ACTIVATION_TOKEN")
+
+  # WM_CLASS: who this window belongs to, which is what groups the windows of
+  # one application in a taskbar and what a `.desktop` file's StartupWMClass
+  # has to match. It is the name of the executable -- the convention every X11
+  # toolkit follows, and the one thing about the window that cannot change
+  # while it runs, unlike its title. Nothing configures it: the file that is
+  # running is a fact of the running program, so an installed entry that names
+  # it cannot be pointing at the wrong thing.
+  # Set before mapping: ICCCM has the window manager read it at that point.
+  var instName = getAppFilename().extractFilename.changeFileExt("")
+  var className = instName
+  if className.len > 0: className[0] = className[0].toUpperAscii
+  var classHint = XClassHint(res_name: cstr(instName),
+                             res_class: cstr(className))
   discard XSetClassHint(gDisplay, gWindow, addr classHint)
+
+  # `_NET_WM_ICON`: the taskbar bitmap, for a window whose application has no
+  # installed entry to look one up in. Also before the map, so the window
+  # manager has it the first time it draws the window rather than a frame or
+  # two later. Xlib's format-32 `XChangeProperty` wants an array of `clong`
+  # (8 bytes each on LP64) with the value in the low 32 bits, so the packed
+  # `uint32` payload is expanded on the way in.
+  if icon != nil and iconLen > 0:
+    let iconAtom = XInternAtom(gDisplay, "_NET_WM_ICON", 0)
+    if iconAtom != 0:
+      let src = cast[ptr UncheckedArray[uint32]](icon)
+      var longs = newSeq[clong](iconLen)
+      for i in 0 ..< iconLen:
+        longs[i] = clong(src[i])
+      discard XChangeProperty(gDisplay, gWindow, iconAtom, XA_CARDINAL, 32,
+                              PropModeReplace, addr longs[0], iconLen.cint)
+
+  # Before the map, like `WM_CLASS` and for the same reason: this is what the
+  # window manager reads the window's identity out of when it takes it over.
+  if startupId.len > 0:
+    let startupAtom = XInternAtom(gDisplay, "_NET_STARTUP_ID", 0)
+    if startupAtom != 0:
+      discard XChangeProperty(gDisplay, gWindow, startupAtom, gUtf8String, 8,
+                              PropModeReplace,
+                              cast[pointer](cstr(startupId)),
+                              startupId.len.cint)
+
+  discard XStoreName(gDisplay, gWindow, instName.cstr)
   discard XMapWindow(gDisplay, gWindow)
+
+  if maximized:
+    # _NET_WM_STATE_MAXIMIZED_{HORZ,VERT} is what a panel's maximize button
+    # sends, so the window manager keeps its panels and docks visible --
+    # unlike the _NET_WM_STATE_FULLSCREEN that `layout.fullScreen` asks for.
+    # The message goes to the root window, as the EWMH spec requires, and only
+    # after XMapWindow: a window manager ignores state changes for a window it
+    # has not taken over yet.
+    const NetWmStateAdd = 1
+    let wmState = XInternAtom(gDisplay, "_NET_WM_STATE", 0)
+    let maxHorz = XInternAtom(gDisplay, "_NET_WM_STATE_MAXIMIZED_HORZ", 0)
+    let maxVert = XInternAtom(gDisplay, "_NET_WM_STATE_MAXIMIZED_VERT", 0)
+    if wmState != 0 and maxHorz != 0 and maxVert != 0:
+      var ev = XEvent()
+      ev.xclient.theType = ClientMessage
+      ev.xclient.window = gWindow
+      ev.xclient.message_type = wmState
+      ev.xclient.format = 32
+      ev.xclient.data[0] = NetWmStateAdd
+      ev.xclient.data[1] = maxHorz.clong
+      ev.xclient.data[2] = maxVert.clong
+      ev.xclient.data[3] = 1  # a normal application, per the spec's source field
+      discard XSendEvent(gDisplay, XRootWindow(gDisplay, gScreen), 0,
+                         (SubstructureNotifyMask or SubstructureRedirectMask).clong,
+                         addr ev)
+      discard XFlush(gDisplay)
+
+  # The window is up, so the launch is over. After the map: a desktop that
+  # acts on this message drops the feedback the moment it arrives, and it
+  # should not drop it before there is a window to drop it for.
+  if startupId.len > 0:
+    sendStartupInfo("remove: ID=" & snQuote(startupId))
 
   gGC = XCreateGC(gDisplay, gWindow, 0, nil)
 
@@ -822,33 +1255,53 @@ proc x11GetWindowLayout(): ScreenLayout =
                scaleX: 1, scaleY: 1, uiScale: gUiScale)
 
 proc x11Refresh() =
-  if gBackPixmap != None:
+  if gBackPixmap != None and (gFrameForced or gFrameHash != gShownHash):
     discard XCopyArea(gDisplay, gBackPixmap, gWindow, gGC,
       0, 0, gWidth.cuint, gHeight.cuint, 0, 0)
+    gShownHash = gFrameHash
+    gFrameForced = false
+  gFrameHash = FrameHashSeed
   discard XFlush(gDisplay)
 
 proc x11SaveState() = discard
 proc x11RestoreState() =
+  rgbaClipActive = false
   # Reset clip on both GC and XftDraw
+  mixFrame(1)
   discard XSetClipMask(gDisplay, gGC, None)
   discard XftDrawSetClip(gXftDraw, nil)
 
 proc x11SetClipRect(r: coords.Rect) =
+  mixFrame(2); mixFrame(r.x); mixFrame(r.y); mixFrame(r.w); mixFrame(r.h)
   var xr = XRectangle(
     x: r.x.cshort, y: r.y.cshort,
     width: r.w.cushort, height: r.h.cushort)
+  rgbaClipActive = true
+  rgbaClip = xr
   discard XSetClipRectangles(gDisplay, gGC, 0, 0, addr xr, 1, 0)
   discard XftDrawSetClipRectangles(gXftDraw, 0, 0, addr xr, 1)
 
-proc x11OpenFont(path: string; size: int;
+proc ensureDisplay(): bool =
+  ## Fonts are opened before the window, and without one by a renderer that
+  ## draws in a window of its own; either way they need the connection.
+  if gDisplay == nil:
+    gDisplay = XOpenDisplay(nil)
+    if gDisplay == nil: return false
+    gScreen = XDefaultScreen(gDisplay)
+  true
+
+proc x11OpenFont(path: string; size: int; style: FontStyles;
                  metrics: var FontMetrics): screen.Font =
-  # Detect bold/italic from filename.
+  if not ensureDisplay(): return screen.Font(0)
+  # Asked for outright, or -- for a path that names one face of a family --
+  # detected from the filename.
   # Note: `substr in str` is avoided on purpose -- Nimony's system `in`
   # template early-binds `contains` and never sees strutils' string overload,
   # so we call `.contains` explicitly here.
   let lpath = path.toLowerAscii()
-  let isBold = lpath.contains("bold")
-  let isItalic = lpath.contains("italic") or lpath.contains("oblique")
+  let isBold = FontStyle.bold in style or lpath.contains("bold")
+  let isItalic = FontStyle.italics in style or
+                 lpath.contains("italic") or lpath.contains("oblique")
 
   # Map known font filenames to fontconfig names
   var faceName = "monospace"  # safe default
@@ -906,6 +1359,19 @@ proc x11MeasureText(f: screen.Font; text: string): TextExtent =
     XftTextExtentsUtf8(gDisplay, fp, cstr(t), text.len.cint, addr extents)
     result = TextExtent(w: extents.xOff.int, h: fp.height.int)
 
+proc paintText(fp: ptr XftFont; x, y: int; t: cstring; len: cint;
+               w: cuint; fg, bg: screen.Color) =
+  ## The drawing both entry points below share, once the width of the
+  ## background is known -- by measuring, or because the caller said so.
+  mixFrame(3); mixFrame(cast[int](fp)); mixFrame(x); mixFrame(y)
+  mixFrame(w.int); mixFrame(fg); mixFrame(bg); mixFrameText(t, len)
+  var bgColor = toXftColor(bg)
+  XftDrawRect(gXftDraw, addr bgColor, x.cint, y.cint, w, fp.height.cuint)
+  # `y` is the top of the line, Xft draws from the baseline.
+  var fgColor = toXftColor(fg)
+  XftDrawStringUtf8(gXftDraw, addr fgColor, fp,
+    x.cint, (y + fp.ascent).cint, t, len)
+
 proc x11DrawText(f: screen.Font; x, y: int; text: string;
                  fg, bg: screen.Color): TextExtent =
   result = TextExtent(w: 0, h: 0)
@@ -916,14 +1382,62 @@ proc x11DrawText(f: screen.Font; x, y: int; text: string;
   var extents {.noinit.}: XGlyphInfo
   XftTextExtentsUtf8(gDisplay, fp, cstr(t), text.len.cint, addr extents)
   result = TextExtent(w: extents.xOff.int, h: fp.height.int)
-  # Fill background
-  var bgColor = toXftColor(bg)
-  XftDrawRect(gXftDraw, addr bgColor, x.cint, y.cint,
-    extents.xOff.cuint, fp.height.cuint)
-  # Draw text (y is baseline, not top)
-  var fgColor = toXftColor(fg)
-  XftDrawStringUtf8(gXftDraw, addr fgColor, fp,
-    x.cint, (y + fp.ascent).cint, cstr(t), text.len.cint)
+  paintText(fp, x, y, cstr(t), text.len.cint, extents.xOff.cuint, fg, bg)
+
+proc x11DrawMeasuredText(f: screen.Font; x, y: int; text: string;
+                         fg, bg: screen.Color; size: TextExtent) =
+  ## `x11DrawText` without the measuring: an editor measures every run it
+  ## draws anyway, to know where it ends, and walking the same glyphs again
+  ## here was a second pass over every character on the screen per frame.
+  let fp = getFontPtr(f)
+  if fp == nil or text.len == 0: return
+  var t = text
+  paintText(fp, x, y, cstr(t), text.len.cint, size.w.cuint, fg, bg)
+
+proc x11RenderText(f: screen.Font; text: string; fg: screen.Color;
+                  pixels: var seq[uint32]): TextExtent =
+  ## Xft draws the run into an 8-bit alpha pixmap of its own: what lands
+  ## there is coverage, and coverage times `fg` is the premultiplied pixel.
+  pixels.setLen 0
+  let fp = getFontPtr(f)
+  if fp == nil or text.len == 0: return
+  var t = text
+  var extents {.noinit.}: XGlyphInfo
+  XftTextExtentsUtf8(gDisplay, fp, cstr(t), text.len.cint, addr extents)
+  let w = extents.xOff.int
+  let h = fp.height.int
+  if w <= 0 or h <= 0: return
+  let pixmap = XCreatePixmap(gDisplay, XRootWindow(gDisplay, gScreen),
+    w.cuint, h.cuint, 8)
+  let draw = XftDrawCreateAlpha(gDisplay, pixmap, 8)
+  if draw == nil:
+    discard XFreePixmap(gDisplay, pixmap)
+    return
+  # A new pixmap holds garbage; Xft fills rectangles with PictOpSrc.
+  var clear = XftColor()
+  XftDrawRect(draw, addr clear, 0, 0, w.cuint, h.cuint)
+  var ink = XftColor(color: XRenderColor(red: 0xFFFF, green: 0xFFFF,
+                                         blue: 0xFFFF, alpha: 0xFFFF))
+  XftDrawStringUtf8(draw, addr ink, fp, 0, fp.ascent, cstr(t), text.len.cint)
+  let image = XGetImage(gDisplay, pixmap, 0, 0, w.cuint, h.cuint,
+    not 0.culong, ZPixmap)
+  XftDrawDestroy(draw)
+  discard XFreePixmap(gDisplay, pixmap)
+  if image == nil: return
+  defer:
+    # What `XDestroyImage` -- a macro -- does for an image Xlib allocated.
+    discard XFree(image.data)
+    discard XFree(cast[pointer](image))
+  if image.depth != 8 or image.bitsPerPixel != 8: return
+  let src = cast[ptr UncheckedArray[uint8]](image.data)
+  pixels.setLen w * h
+  for y in 0 ..< h:
+    for x in 0 ..< w:
+      let a = src[y * image.bytesPerLine.int + x].uint32 * fg.a.uint32 div 255
+      pixels[y * w + x] = (a shl 24) or ((fg.r.uint32 * a div 255) shl 16) or
+                          ((fg.g.uint32 * a div 255) shl 8) or
+                          (fg.b.uint32 * a div 255)
+  result = TextExtent(w: w, h: h)
 
 proc x11GetFontMetrics(f: screen.Font): FontMetrics =
   let idx = f.int - 1
@@ -931,15 +1445,40 @@ proc x11GetFontMetrics(f: screen.Font): FontMetrics =
   else: screen.FontMetrics()
 
 proc x11FillRect(r: coords.Rect; color: screen.Color) =
+  if r.w <= 0 or r.h <= 0 or color.a == 0: return
+  mixFrame(4); mixFrame(r.x); mixFrame(r.y); mixFrame(r.w); mixFrame(r.h)
+  mixFrame(color)
   var c = toXftColor(color)
-  XftDrawRect(gXftDraw, addr c, r.x.cint, r.y.cint, r.w.cuint, r.h.cuint)
+  # XRender's source channels are premultiplied, including solid Xft fills.
+  let alpha = color.a.uint32
+  c.color.red = ((c.color.red.uint32 * alpha + 127) div 255).cushort
+  c.color.green = ((c.color.green.uint32 * alpha + 127) div 255).cushort
+  c.color.blue = ((c.color.blue.uint32 * alpha + 127) div 255).cushort
+  if color.a < 255:
+    # XftDrawRect replaces destination pixels; translucent fills need Over.
+    let format = XRenderFindVisualFormat(gDisplay, gVisual)
+    if format == nil:
+      raise newException(ValueError, "Cannot find the XRender destination format")
+    let dest = XRenderCreatePicture(gDisplay, gBackPixmap, format, 0, nil)
+    if dest == None:
+      raise newException(ValueError, "Cannot create the XRender destination")
+    defer: XRenderFreePicture(gDisplay, dest)
+    if rgbaClipActive:
+      XRenderSetPictureClipRectangles(gDisplay, dest, 0, 0, addr rgbaClip, 1)
+    XRenderFillRectangle(gDisplay, 3, dest, addr c.color,
+      r.x.cint, r.y.cint, r.w.cuint, r.h.cuint)
+  else:
+    XftDrawRect(gXftDraw, addr c, r.x.cint, r.y.cint, r.w.cuint, r.h.cuint)
 
 proc x11DrawLine(x1, y1, x2, y2: int; color: screen.Color) =
+  mixFrame(5); mixFrame(x1); mixFrame(y1); mixFrame(x2); mixFrame(y2)
+  mixFrame(color)
   discard XSetForeground(gDisplay, gGC, toPixel(color))
   discard XDrawLine(gDisplay, gBackPixmap, gGC,
     x1.cint, y1.cint, x2.cint, y2.cint)
 
 proc x11DrawPoint(x, y: int; color: screen.Color) =
+  mixFrame(6); mixFrame(x); mixFrame(y); mixFrame(color)
   discard XSetForeground(gDisplay, gGC, toPixel(color))
   discard XDrawPoint(gDisplay, gBackPixmap, gGC, x.cint, y.cint)
 
@@ -951,10 +1490,6 @@ proc x11DrawPoint(x, y: int; color: screen.Color) =
 # little-endian TrueColor 24-bit visual is exactly the BGRX byte order the
 # server wants. A per-size scaled Pixmap is cached so redraws are a cheap
 # server-side XCopyArea rather than re-uploading pixels every frame.
-
-const
-  ZPixmap = 2.cint
-  LSBFirst = 0.cint
 
 type
   XImage {.pure.} = object      # field order/offsets must match Xlib's _XImage
@@ -1055,7 +1590,7 @@ proc buildScaledPixmap(s: ptr ImageSlot; dw, dh: int) =
     byteOrder: LSBFirst, bitmapUnit: 32, bitmapBitOrder: LSBFirst,
     bitmapPad: 32, depth: gDepth, bytesPerLine: (dw * 4).cint, bitsPerPixel: 32,
     redMask: 0xFF0000, greenMask: 0x00FF00, blueMask: 0x0000FF)
-  discard XPutImage(gDisplay, s.pixmap, gImgGC, addr ximg, 0, 0, 0, 0,
+  discard XPutImage(gDisplay, s.pixmap, gImgGC, cast[ptr XImageObj](addr ximg), 0, 0, 0, 0,
     dw.cuint, dh.cuint)
 
 proc x11DrawImage(img: screen.Image; src, dst: coords.Rect) =
@@ -1067,6 +1602,121 @@ proc x11DrawImage(img: screen.Image; src, dst: coords.Rect) =
     buildScaledPixmap(s, dst.w, dst.h)
   discard XCopyArea(gDisplay, s.pixmap, gBackPixmap, gGC,
     0, 0, dst.w.cuint, dst.h.cuint, dst.x.cint, dst.y.cint)
+
+# ---- Pixel blitting ----
+
+var gBlitVerdict = 0
+  ## 0 = nobody has asked yet, 1 = the surface takes pixels, -1 = it does not.
+  ## Whether it does is a property of the visual, which does not change while
+  ## the program runs, so the answer is worth keeping rather than building a
+  ## throwaway XImage every frame to hear it again.
+
+proc x11BlendRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                  dst: coords.Rect): bool =
+  if gDisplay == nil or gBackPixmap == None: return false
+  if w > 65535 or h > 65535: return false # X11 pixmap dimensions are CARD16.
+  let sourceFormat = XRenderFindStandardFormat(gDisplay, 0) # PictStandardARGB32
+  let destFormat = XRenderFindVisualFormat(gDisplay, gVisual)
+  if sourceFormat == nil or destFormat == nil: return false
+  let pixmap = XCreatePixmap(gDisplay, gWindow, w.cuint, h.cuint, 32)
+  if pixmap == None: return false
+  defer: discard XFreePixmap(gDisplay, pixmap)
+  let gc = XCreateGC(gDisplay, pixmap, 0, nil)
+  if gc == nil: return false
+  defer: discard XFreeGC(gDisplay, gc)
+  let image = XCreateImage(gDisplay, gVisual, 32, ZPixmap, 0,
+    cast[pointer](pixels), w.cuint, h.cuint, 32, (w * 4).cint)
+  if image == nil: return false
+  defer:
+    image.data = nil
+    discard XFree(cast[pointer](image))
+  when cpuEndian == littleEndian:
+    let hostOrder = LSBFirst
+  else:
+    let hostOrder = MSBFirst
+  if image.bitsPerPixel != 32 or image.byteOrder != hostOrder:
+    return false
+  discard XPutImage(gDisplay, pixmap, gc, image, 0, 0, 0, 0, w.cuint, h.cuint)
+  let source = XRenderCreatePicture(gDisplay, pixmap, sourceFormat, 0, nil)
+  if source == None: return false
+  defer: XRenderFreePicture(gDisplay, source)
+  let dest = XRenderCreatePicture(gDisplay, gBackPixmap, destFormat, 0, nil)
+  if dest == None: return false
+  defer: XRenderFreePicture(gDisplay, dest)
+  if rgbaClipActive:
+    XRenderSetPictureClipRectangles(gDisplay, dest, 0, 0, addr rgbaClip, 1)
+  let cw = min(w, dst.w)
+  let ch = min(h, dst.h)
+  mixFrame(8); mixFrame(dst.x); mixFrame(dst.y)
+  mixFrame(w); mixFrame(h); mixFrame(cw); mixFrame(ch)
+  for i in 0 ..< w * h: mixFrame(pixels[i].uint64)
+  XRenderComposite(gDisplay, 3, source, None, dest, 0, 0, 0, 0,
+    dst.x.cint, dst.y.cint, cw.cuint, ch.cuint) # PictOpOver
+  true
+
+proc x11BlitRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  if pixels == nil or w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0: return false
+  if format == RGBAFormat.argbPremultiplied:
+    return x11BlendRGBA(pixels, w, h, dst)
+  if gDisplay == nil or gBackPixmap == None or gBlitVerdict < 0: return false
+  if pixels == nil or w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0: return false
+
+  var img = XCreateImage(gDisplay, gVisual, gDepth.cuint, ZPixmap.cint, 0,
+                         cast[pointer](pixels), w.cuint, h.cuint, 32, 0)
+  if img == nil:
+    gBlitVerdict = -1
+    return false
+
+  # What came in is one `uint32` per pixel in this machine's byte order, so
+  # the server has to want exactly that: 32 bits to a pixel, and the same end
+  # of the word first. Both hold on every ordinary desktop -- the depth-24
+  # TrueColor visual nearly everything has is padded to 32 bits a pixel, and
+  # a client almost always talks to a server on its own machine. Where they
+  # do not hold there is no fix worth having here, so the answer is no, once,
+  # and the caller draws whatever it draws when there is no picture.
+  let hostOrder = (if cpuEndian == littleEndian: LSBFirst else: MSBFirst).cint
+  if img.bitsPerPixel != 32 or img.byteOrder != hostOrder:
+    img.data = nil
+    discard XFree(cast[pointer](img))
+    gBlitVerdict = -1
+    return false
+  gBlitVerdict = 1
+
+  let cw = min(w, dst.w)
+  let ch = min(h, dst.h)
+
+  # Every pixel that lands has to reach the frame hash. The hash is what
+  # decides whether the finished back buffer is worth copying to the window,
+  # and two different pictures of one size in one place are the same frame to
+  # a hash that only saw the rectangle -- the second one would never appear.
+  # Walking the buffer costs a fraction of sending it to the server, which is
+  # the very next thing that happens to it.
+  mixFrame(7); mixFrame(dst.x); mixFrame(dst.y)
+  mixFrame(w); mixFrame(h); mixFrame(cw); mixFrame(ch)
+  for i in 0 ..< w * h: mixFrame(pixels[i].uint64)
+
+  discard XPutImage(gDisplay, gBackPixmap, gGC, img, 0, 0,
+                    dst.x.cint, dst.y.cint, cw.cuint, ch.cuint)
+
+  # `XDestroyImage` is a C macro, not a symbol to bind, and it frees the
+  # pixels along with the struct -- but the pixels are the caller's and it
+  # still wants them. Letting go of them first leaves `XFree` exactly what
+  # `XCreateImage` allocated, which is the struct.
+  img.data = nil
+  discard XFree(cast[pointer](img))
+  result = true
+
+proc x11DrawRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  if pixels == nil or w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0:
+    return false
+  if w == dst.w and h == dst.h:
+    return x11BlitRGBA(pixels, w, h, dst, format)
+  let resized = resizedRGBA(pixels, w, h, dst.w, dst.h,
+    preserveAlpha = format == RGBAFormat.argbPremultiplied)
+  x11BlitRGBA(cast[ptr UncheckedArray[uint32]](unsafeAddr resized[0]),
+              dst.w, dst.h, dst, format)
 
 proc x11SetCursor(c: CursorKind) =
   let shape = case c
@@ -1150,7 +1800,7 @@ proc x11GetClipboardText(): string =
             discard XFree(data)
         return
       else:
-        processXEvent(xev)
+        dispatchXEvent(xev)
     else:
       sleepMs(5)
 
@@ -1175,6 +1825,8 @@ proc x11Delay(ms: int) =
 
 proc x11QuitRequest() =
   if gDisplay != nil:
+    if gXic != nil: XDestroyIC(gXic)
+    if gXim != nil: discard XCloseIM(gXim)
     discard XDestroyWindow(gDisplay, gWindow)
     discard XCloseDisplay(gDisplay)
 
@@ -1191,14 +1843,68 @@ proc initX11Driver*() =
   fontRelays = FontRelays(
     openFont: x11OpenFont, closeFont: x11CloseFont,
     getFontMetrics: x11GetFontMetrics, measureText: x11MeasureText,
-    drawText: x11DrawText)
+    drawText: x11DrawText, drawMeasuredText: x11DrawMeasuredText,
+    renderText: x11RenderText)
   drawRelays = DrawRelays(
     fillRect: x11FillRect, drawLine: x11DrawLine, drawPoint: x11DrawPoint,
     loadImage: x11LoadImage, freeImage: x11FreeImage, drawImage: x11DrawImage,
-    imageSize: x11ImageSize)
+    imageSize: x11ImageSize, blitRGBA: x11BlitRGBA, drawRGBA: x11DrawRGBA)
   inputRelays = InputRelays(
     pollEvent: x11PollEvent, waitEvent: x11WaitEvent,
     getTicks: x11GetTicks, sleep: x11Delay,
     shutdown: x11QuitRequest)
   clipboardRelays = ClipboardRelays(
     getText: x11GetClipboardText, putText: x11PutClipboardText)
+
+proc attachSiwinSurface*(display: pointer; window: uint64; width, height: int) =
+  ## Borrow Siwin's X11 connection/window, retaining native Xft/XRender drawing.
+  if gDisplay != display or gWindow != XID(window) or gGC == nil:
+    gDisplay = display
+    gWindow = XID(window)
+    gScreen = XDefaultScreen(display)
+    gVisual = XDefaultVisual(display, gScreen)
+    gColormap = XDefaultColormap(display, gScreen)
+    gDepth = XDefaultDepth(display, gScreen)
+    gGC = XCreateGC(display, gWindow, 0, nil)
+  if gWidth != width.cint or gHeight != height.cint or gBackPixmap == None:
+    let previousPixmap = gBackPixmap
+    let previousDraw = gXftDraw
+    let previousWidth = gWidth
+    let previousHeight = gHeight
+    gBackPixmap = None
+    gXftDraw = nil
+    gWidth = width.cint
+    gHeight = height.cint
+    recreateBackBuffer()
+    if previousPixmap != None:
+      let copyGC = XCreateGC(gDisplay, gBackPixmap, 0, nil)
+      discard XCopyArea(gDisplay, previousPixmap, gBackPixmap, copyGC, 0, 0,
+        min(previousWidth, gWidth).cuint, min(previousHeight, gHeight).cuint, 0, 0)
+      discard XFreeGC(gDisplay, copyGC)
+      XftDrawDestroy(previousDraw)
+      discard XFreePixmap(gDisplay, previousPixmap)
+
+proc presentSiwinSurface*() =
+  ## Repaint exposed areas even when the application's frame hash is unchanged.
+  if gDisplay != nil and gBackPixmap != None:
+    discard XCopyArea(gDisplay, gBackPixmap, gWindow, gGC, 0, 0,
+      gWidth.cuint, gHeight.cuint, 0, 0)
+    discard XFlush(gDisplay)
+
+proc detachSiwinSurface*() =
+  ## Release our drawing resources without closing Siwin's borrowed connection.
+  if gDisplay != nil:
+    for font in fonts.mitems:
+      if font.xftFont != nil: XftFontClose(gDisplay, font.xftFont)
+      font.xftFont = nil
+    if gXftDraw != nil: XftDrawDestroy(gXftDraw)
+    if gBackPixmap != None: discard XFreePixmap(gDisplay, gBackPixmap)
+    if gGC != nil: discard XFreeGC(gDisplay, gGC)
+  fonts.setLen(0)
+  gXftDraw = nil
+  gBackPixmap = None
+  gGC = nil
+  gDisplay = nil
+  gWindow = None
+  gWidth = 0
+  gHeight = 0

@@ -174,27 +174,37 @@ proc evictTextCacheIfNeeded() =
 # --- Screen hook implementations ---
 
 proc resolveFontPath(path: string): string =
+  ## An empty path means "the platform default", and for this library that is
+  ## a *monospaced* font: the native drivers pick Consolas (Windows) and
+  ## fontconfig's `monospace` (X11), and the apps are text editors that expect
+  ## a fixed advance. So the candidate lists here are mono-only too -- a
+  ## proportional fallback would silently break column arithmetic.
   if path.len > 0:
     return path
 
   when defined(windows):
     let candidates = [
-      r"C:\Windows\Fonts\segoeui.ttf",
-      r"C:\Windows\Fonts\arial.ttf"
+      r"C:\Windows\Fonts\consola.ttf",
+      r"C:\Windows\Fonts\cour.ttf"
     ]
   elif defined(macosx):
+    # SDL_ttf goes through FreeType, which reads face 0 out of a .ttc, so the
+    # collections are fine here. SFNSMono.ttf is deliberately absent: it is a
+    # variable font and its default instance is the too-thin Light weight.
     let candidates = [
-      "/System/Library/Fonts/SFNS.ttf",
-      "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-      "/System/Library/Fonts/Supplemental/Arial.ttf"
+      "/System/Library/Fonts/Menlo.ttc",
+      "/System/Library/Fonts/Monaco.ttf",
+      "/System/Library/Fonts/Supplemental/Andale Mono.ttf",
+      "/System/Library/Fonts/Supplemental/Courier New.ttf"
     ]
   else:
     let candidates = [
-      "/usr/share/fonts/google-noto-vf/NotoSans[wght].ttf",
-      "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf",
-      "/usr/share/fonts/abattis-cantarell-vf-fonts/Cantarell-VF.otf",
-      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-      "/usr/share/fonts/TTF/DejaVuSans.ttf"
+      "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+      "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+      "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+      "/usr/share/fonts/liberation-mono-fonts/LiberationMono-Regular.ttf",
+      "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+      "/usr/share/fonts/google-noto-vf/NotoSansMono[wdth,wght].ttf"
     ]
 
   for candidate in candidates:
@@ -235,14 +245,22 @@ template toPixelCoord(v: untyped): int =
   ## lands at a fraction of where it looked.
   int(v.float * currentLayout.uiScale.float / 100.0 + 0.5)
 
-proc sdlCreateWindow(layout: var ScreenLayout) =
+proc sdlCreateWindow(layout: var ScreenLayout; icon: pointer; iconLen: int) =
   if ren != nil or win != nil:
     resetSdlState()
-  let winFlags =
+  # A negative dimension is MaxWindowWidth/MaxWindowHeight. WINDOW_MAXIMIZED
+  # is the window manager's own maximize, so taskbars and docks stay visible;
+  # the size it picks comes back through syncWindowLayout below. SDL still
+  # needs a positive size to fall back on for when the window is unmaximized.
+  let maximized = layout.width < 0 or layout.height < 0
+  let reqW = if layout.width < 0: 1024 else: layout.width
+  let reqH = if layout.height < 0: 768 else: layout.height
+  var winFlags =
     if layout.fullScreen: WINDOW_FULLSCREEN or WINDOW_HIGH_PIXEL_DENSITY
     else: WINDOW_RESIZABLE or WINDOW_HIGH_PIXEL_DENSITY
+  if maximized: winFlags = winFlags or WINDOW_MAXIMIZED
   discard createWindowAndRenderer(cstring"NimEdit",
-    layout.width.cint, layout.height.cint, winFlags, win, ren)
+    reqW.cint, reqH.cint, winFlags, win, ren)
   discard startTextInput(win)
   syncWindowLayout(layout)
   currentClip = ClipState()
@@ -267,7 +285,16 @@ proc sdlSetClipRect(r: coords.Rect) =
     rect: sdl3.Rect(x: r.x.cint, y: r.y.cint, w: r.w.cint, h: r.h.cint))
   applyClipState()
 
-proc sdlOpenFont(path: string; size: int;
+const
+  TtfStyleBold = 0x01'u32
+  TtfStyleItalic = 0x02'u32
+
+proc ttfSetFontStyle(font: sdl3_ttf.Font; style: uint32)
+  {.importc: "TTF_SetFontStyle", cdecl.}
+  ## Declared here rather than taken from the wrapper: the C name is the one
+  ## thing about SDL_ttf that cannot drift.
+
+proc sdlOpenFont(path: string; size: int; style: FontStyles;
                  metrics: var FontMetrics): screen.Font =
   let resolvedPath = resolveFontPath(path)
   if resolvedPath.len == 0:
@@ -275,6 +302,14 @@ proc sdlOpenFont(path: string; size: int;
   let f = sdl3_ttf.openFont(cstring(resolvedPath), size.cfloat)
   if f == nil: return screen.Font(0)
   sdl3_ttf.setFontHinting(f, sdl3_ttf.hintingLightSubpixel)
+  # SDL_ttf has no notion of a font family, so it emboldens and shears the
+  # face it was given. Cruder than a real bold or italic cut, but it is what
+  # this backend can do, and the metrics below are read afterwards so the
+  # widened glyphs are accounted for.
+  var flags = 0'u32
+  if FontStyle.bold in style: flags = flags or TtfStyleBold
+  if FontStyle.italics in style: flags = flags or TtfStyleItalic
+  if flags != 0: ttfSetFontStyle(f, flags)
   metrics.ascent = sdl3_ttf.getFontAscent(f)
   metrics.descent = sdl3_ttf.getFontDescent(f)
   metrics.lineHeight = sdl3_ttf.getFontLineSkip(f)
@@ -348,6 +383,33 @@ proc sdlDrawText(f: screen.Font; x, y: int; text: string;
   discard renderTexture(ren, entry.texture, addr src, addr dst)
   result = entry.extent
 
+proc sdlRenderText(f: screen.Font; text: string; fg: screen.Color;
+                   pixels: var seq[uint32]): TextExtent =
+  ## SDL_ttf blends the run onto transparency in straight alpha; the pixels
+  ## handed out are premultiplied.
+  pixels.setLen 0
+  let fp = getFontPtr(f)
+  if fp == nil or text.len == 0: return
+  let blended = sdl3_ttf.renderTextBlended(fp, cstring(text), 0, toColor(fg))
+  if blended == nil: return
+  let surf = convertSurface(blended, PIXELFORMAT_ARGB8888)
+  destroySurface(blended)
+  if surf == nil: return
+  let w = surf.w.int
+  let h = surf.h.int
+  pixels.setLen w * h
+  for y in 0 ..< h:
+    let row = cast[ptr UncheckedArray[uint32]](addr surf.pixels[y * surf.pitch.int])
+    for x in 0 ..< w:
+      let p = row[x]
+      let a = p shr 24
+      pixels[y * w + x] = (a shl 24) or
+        ((((p shr 16) and 0xFF) * a div 255) shl 16) or
+        ((((p shr 8) and 0xFF) * a div 255) shl 8) or
+        ((p and 0xFF) * a div 255)
+  destroySurface(surf)
+  result = TextExtent(w: w, h: h)
+
 proc sdlGetFontMetrics(f: screen.Font): FontMetrics =
   let idx = f.int - 1
   if idx >= 0 and idx < fonts.len: fonts[idx].metrics
@@ -399,6 +461,53 @@ proc sdlFreeImage(img: screen.Image) =
     slot[].texture = nil
   slot[].w = 0
   slot[].h = 0
+
+proc sdlImageSize(img: screen.Image): tuple[w, h: int] =
+  ## The size the slot has held all along -- `drawImage`'s `src` rectangle is
+  ## in these pixels, so without a way to ask, a caller could crop a picture
+  ## but never ask for the whole of it.
+  let slot = getImageSlot(img)
+  if slot == nil or slot[].texture == nil: (0, 0)
+  else: (slot[].w, slot[].h)
+
+# One texture, kept between calls and remade only when the size changes.
+# Blitting is a per-frame thing -- the caller redraws its picture every frame
+# because everything else here is redrawn every frame -- and asking the GPU
+# for a new texture that often is the one cost worth avoiding.
+var
+  blitTex: sdl3.Texture
+  blitTexW, blitTexH: int
+
+proc sdlBlitRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  if format != RGBAFormat.rgbOpaque: return false
+  if ren == nil or pixels == nil or w <= 0 or h <= 0 or
+      dst.w <= 0 or dst.h <= 0:
+    return false
+  if blitTex == nil or blitTexW != w or blitTexH != h:
+    if blitTex != nil:
+      destroyTexture(blitTex)
+      blitTex = nil
+    blitTex = createTexture(ren, PIXELFORMAT_XRGB8888, TEXTUREACCESS_STATIC,
+                            w.cint, h.cint)
+    if blitTex == nil:
+      return false
+    blitTexW = w
+    blitTexH = h
+  # `XRGB8888` is the top byte ignored and the rest `0xRRGGBB`, which is the
+  # word `blitRGBA` is handed. So the rows go over as they are: no channel
+  # walk, no alpha to resolve -- the caller resolved it.
+  discard updateTexture(blitTex, nil,
+                        cast[ptr UncheckedArray[uint8]](pixels), cint(w * 4))
+  # `dst` clips and does not scale, so the source rectangle shrinks with it
+  # rather than the destination stretching to fit.
+  let cw = min(w, dst.w)
+  let ch = min(h, dst.h)
+  var srcRect = FRect(x: 0, y: 0, w: cw.cfloat, h: ch.cfloat)
+  var dstRect = FRect(x: dst.x.cfloat, y: dst.y.cfloat,
+                      w: cw.cfloat, h: ch.cfloat)
+  discard renderTexture(ren, blitTex, addr srcRect, addr dstRect)
+  result = true
 
 proc sdlDrawImage(img: screen.Image; src, dst: coords.Rect) =
   let slot = getImageSlot(img)
@@ -650,10 +759,11 @@ proc initSdl3Driver*() =
   fontRelays = FontRelays(
     openFont: sdlOpenFont, closeFont: sdlCloseFont,
     getFontMetrics: sdlGetFontMetrics, measureText: sdlMeasureText,
-    drawText: sdlDrawText)
+    drawText: sdlDrawText, renderText: sdlRenderText)
   drawRelays = DrawRelays(
     fillRect: sdlFillRect, drawLine: sdlDrawLine, drawPoint: sdlDrawPoint,
-    loadImage: sdlLoadImage, freeImage: sdlFreeImage, drawImage: sdlDrawImage)
+    loadImage: sdlLoadImage, freeImage: sdlFreeImage, drawImage: sdlDrawImage,
+    imageSize: sdlImageSize, blitRGBA: sdlBlitRGBA)
   inputRelays = InputRelays(
     pollEvent: sdlPollEvent, waitEvent: sdlWaitEvent,
     getTicks: sdlGetTicks, sleep: sdlDelay,

@@ -64,6 +64,26 @@ type
   WINAPIRECT {.pure.} = object
     left, top, right, bottom: LONG
 
+  BITMAPINFOHEADER {.pure.} = object
+    biSize: DWORD
+    biWidth: LONG
+    biHeight: LONG
+    biPlanes: uint16
+    biBitCount: uint16
+    biCompression: DWORD
+    biSizeImage: DWORD
+    biXPelsPerMeter: LONG
+    biYPelsPerMeter: LONG
+    biClrUsed: DWORD
+    biClrImportant: DWORD
+
+  BITMAPINFO {.pure.} = object
+    ## The colour table after the header is what a palettised bitmap needs and
+    ## a 32-bit `BI_RGB` one does not, so the one entry here is only there to
+    ## make the struct the shape the API expects.
+    bmiHeader: BITMAPINFOHEADER
+    bmiColors: array[1, DWORD]
+
   PAINTSTRUCT {.pure.} = object
     hdc: HDC
     fErase: BOOL
@@ -134,10 +154,13 @@ const
   MK_MBUTTON = 0x0010'u32
 
   SW_SHOW = 5'i32
+  SW_MAXIMIZE = 3'i32
   TRANSPARENT = 1
   OPAQUE = 2
 
   SRCCOPY = 0x00CC0020'u32
+  BI_RGB = 0'u32          ## uncompressed, and for 32 bits a pixel that is
+                          ## one `0x00RRGGBB` word each -- what `blitRGBA` has
   DIB_RGB_COLORS = 0'u32
 
   IDC_ARROW = cast[ptr uint16](32512)
@@ -248,6 +271,8 @@ proc SetWindowTextW(hWnd: HWND; lpString: ptr uint16): BOOL
   {.stdcall, dynlib: "user32", importc.}
 proc LoadCursorW(hInstance: HINSTANCE; lpCursorName: ptr uint16): HCURSOR
   {.stdcall, dynlib: "user32", importc.}
+proc LoadIconW(hInstance: HINSTANCE; lpIconName: ptr uint16): HICON
+  {.stdcall, dynlib: "user32", importc.}
 proc SetCursorWin(hCursor: HCURSOR): HCURSOR
   {.stdcall, dynlib: "user32", importc: "SetCursor".}
 proc GetKeyState(nVirtKey: int32): int16
@@ -287,6 +312,8 @@ proc SetTextColor(hdc: HDC; color: COLORREF): COLORREF
   {.stdcall, dynlib: "gdi32", importc.}
 proc TextOutW(hdc: HDC; x, y: int32; lpString: ptr uint16; c: int32): BOOL
   {.stdcall, dynlib: "gdi32", importc.}
+proc GdiFlush(): BOOL
+  {.stdcall, dynlib: "gdi32", importc.}
 proc GetTextExtentPoint32W(hdc: HDC; lpString: ptr uint16; c: int32;
   lpSize: ptr SIZE): BOOL
   {.stdcall, dynlib: "gdi32", importc.}
@@ -309,6 +336,23 @@ proc CreatePen(iStyle, cWidth: int32; color: COLORREF): HGDIOBJ
   {.stdcall, dynlib: "gdi32", importc.}
 proc SetPixel(hdc: HDC; x, y: int32; color: COLORREF): COLORREF
   {.stdcall, dynlib: "gdi32", importc.}
+proc StretchDIBits(hdc: HDC; xDest, yDest, destW, destH: int32;
+  xSrc, ySrc, srcW, srcH: int32; lpBits: pointer; lpbmi: pointer;
+  iUsage: uint32; rop: DWORD): int32
+  {.stdcall, dynlib: "gdi32", importc.}
+proc SaveDC(hdc: HDC): int32
+  {.stdcall, dynlib: "gdi32", importc.}
+type BlendFunction {.bycopy.} = object
+  operation, flags, alpha, format: uint8
+
+proc AlphaBlend(dst: HDC; x, y, w, h: int32; src: HDC;
+                sx, sy, sw, sh: int32; blend: BlendFunction): BOOL
+  {.stdcall, dynlib: "msimg32", importc.}
+proc CreateDIBSection(dc: HDC; info: ptr BITMAPINFO; usage: UINT;
+                      bits: ptr pointer; section: HANDLE; offset: DWORD): HBITMAP
+  {.stdcall, dynlib: "gdi32", importc.}
+proc RestoreDC(hdc: HDC; nSavedDC: int32): BOOL
+  {.stdcall, dynlib: "gdi32", importc.}
 proc IntersectClipRect(hdc: HDC; left, top, right, bottom: int32): int32
   {.stdcall, dynlib: "gdi32", importc.}
 proc SelectClipRgn(hdc: HDC; hrgn: HRGN): int32
@@ -316,6 +360,8 @@ proc SelectClipRgn(hdc: HDC; hrgn: HRGN): int32
 proc CreateRectRgn(x1, y1, x2, y2: int32): HRGN
   {.stdcall, dynlib: "gdi32", importc.}
 proc AddFontResourceExW(name: ptr uint16; fl: DWORD; res: pointer): int32
+  {.stdcall, dynlib: "gdi32", importc.}
+proc RemoveFontResourceExW(name: ptr uint16; fl: DWORD; res: pointer): BOOL
   {.stdcall, dynlib: "gdi32", importc.}
 
 # ---- Helpers ----
@@ -337,6 +383,7 @@ type
     metrics: FontMetrics
     faceName: string
     size: int
+    registeredPath: string
 
 var fonts: seq[FontSlot]
 
@@ -624,7 +671,13 @@ proc wndProc(hwnd: HWND; msg: UINT; wp: WPARAM; lp: LPARAM): LRESULT {.stdcall.}
 
 # ---- Screen hook implementations ----
 
-proc winCreateWindow(layout: var ScreenLayout) =
+proc winCreateWindow(layout: var ScreenLayout; icon: pointer; iconLen: int) =
+  # Seed the scale before there is a window: `CreateWindowExW` and `ShowWindow`
+  # below both send WM_SIZE synchronously, and the event that lands in the
+  # queue carries `gUiScale` with it. Left at the 100 default, that event
+  # reaches the app one frame later and tells it the display is a 96 dpi one,
+  # undoing the real scale this proc goes on to report.
+  gUiScale = currentUiScale()
   gHinstance = GetModuleHandleW(nil)
   let className = newWideCString("NimEditWinAPI")
 
@@ -633,6 +686,11 @@ proc winCreateWindow(layout: var ScreenLayout) =
   wc.style = CS_HREDRAW or CS_VREDRAW
   wc.lpfnWndProc = wndProc
   wc.hInstance = gHinstance
+  # Resource ID 1 is the app icon when the binary was linked with a `.res`
+  # -- `1 ICON "app.ico"` in the `.rc` the application compiled. Nil is fine
+  # when no such resource was linked.
+  wc.hIcon = LoadIconW(gHinstance, cast[ptr uint16](1))
+  wc.hIconSm = LoadIconW(gHinstance, cast[ptr uint16](1))
   wc.hCursor = LoadCursorW(nil, IDC_ARROW)
   wc.lpszClassName = cast[ptr uint16](className[0].addr)
 
@@ -645,13 +703,19 @@ proc winCreateWindow(layout: var ScreenLayout) =
     cast[ptr uint16](title[0].addr),
     WS_OVERLAPPEDWINDOW or WS_VISIBLE,
     0x80000000'i32, 0x80000000'i32, # CW_USEDEFAULT
-    layout.width.int32, layout.height.int32,
+    (if layout.width < 0: 0x80000000'i32 else: layout.width.int32),
+    (if layout.height < 0: 0x80000000'i32 else: layout.height.int32),
     nil, nil, gHinstance, nil)
 
   if gHwnd == nil:
     quit("CreateWindowExW failed")
 
-  discard ShowWindow(gHwnd, SW_SHOW)
+  # A negative dimension is MaxWindowWidth/MaxWindowHeight. SW_MAXIMIZE is the
+  # shell's own idea of how large a window may be, so it stops at the taskbar
+  # instead of covering it -- this is not a fullscreen window. GetClientRect
+  # below then reports whatever size that worked out to.
+  let maximized = layout.width < 0 or layout.height < 0
+  discard ShowWindow(gHwnd, if maximized: SW_MAXIMIZE else: SW_SHOW)
   discard UpdateWindow(gHwnd)
 
   var rc: WINAPIRECT
@@ -664,6 +728,12 @@ proc winCreateWindow(layout: var ScreenLayout) =
   layout.scaleY = 1
   gUiScale = currentUiScale()
   layout.uiScale = gUiScale
+  # The seed above is the system DPI, which is not this window's on a desktop
+  # of mixed density -- only now can `GetDpiForWindow` be asked. Anything the
+  # messages during creation already queued gets the same answer this call
+  # hands back, so that no event ever contradicts it.
+  for e in eventQueue.mitems:
+    if e.kind == WindowMetricsEvent: e.uiScale = gUiScale
 
   recreateBackBuffer()
 
@@ -697,19 +767,137 @@ proc winSetClipRect(r: coords.Rect) =
     discard IntersectClipRect(gBackDC,
       r.x.int32, r.y.int32, (r.x + r.w).int32, (r.y + r.h).int32)
 
-proc winOpenFont(path: string; size: int;
-                 metrics: var FontMetrics): screen.Font =
+proc winPutRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                dst: coords.Rect; scaleImage: bool; format: RGBAFormat): bool =
+  ## This driver decodes no pictures, so it fills in none of the image
+  ## relays. What it can do is take finished pixels from whoever does.
+  if gBackDC == nil or pixels == nil: return false
+  if w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0: return false
+  var bmi = BITMAPINFO()
+  bmi.bmiHeader.biSize = DWORD(sizeof(BITMAPINFOHEADER))
+  bmi.bmiHeader.biWidth = w.LONG
+  # Negative, which is how a DIB says its rows run top to bottom. They are
+  # handed over that way and a DIB is bottom-up unless told otherwise, so
+  # without the sign the picture arrives upside down.
+  bmi.bmiHeader.biHeight = LONG(-h)
+  bmi.bmiHeader.biPlanes = 1
+  bmi.bmiHeader.biBitCount = 32
+  bmi.bmiHeader.biCompression = BI_RGB
+  if format == RGBAFormat.argbPremultiplied:
+    let dc = CreateCompatibleDC(gBackDC)
+    if dc == nil: return false
+    defer: discard DeleteDC(dc)
+    var data: pointer
+    let bitmap = CreateDIBSection(dc, addr bmi, DIB_RGB_COLORS, addr data, nil, 0)
+    if bitmap == nil: return false
+    defer: discard DeleteObject(cast[HGDIOBJ](bitmap))
+    copyMem(data, pixels, w * h * 4)
+    let previous = SelectObject(dc, cast[HGDIOBJ](bitmap))
+    defer: discard SelectObject(dc, previous)
+    let drawW = if scaleImage: dst.w else: min(w, dst.w)
+    let drawH = if scaleImage: dst.h else: min(h, dst.h)
+    return AlphaBlend(gBackDC, dst.x.int32, dst.y.int32, drawW.int32, drawH.int32,
+      dc, 0, 0, (if scaleImage: w else: drawW).int32,
+      (if scaleImage: h else: drawH).int32, BlendFunction(alpha: 255, format: 1)) != 0
+  # Blits clip a source-sized rectangle. Image draws map the full source
+  # into the logical destination, using the same top-down DIB data.
+  let drawW = if scaleImage: dst.w else: w
+  let drawH = if scaleImage: dst.h else: h
+  let clipW = if scaleImage: dst.w else: min(w, dst.w)
+  let clipH = if scaleImage: dst.h else: min(h, dst.h)
+  let saved = SaveDC(gBackDC)
+  discard IntersectClipRect(gBackDC, dst.x.int32, dst.y.int32,
+    int32(dst.x + clipW), int32(dst.y + clipH))
+  discard StretchDIBits(gBackDC,
+    dst.x.int32, dst.y.int32, drawW.int32, drawH.int32,
+    0, 0, w.int32, h.int32,
+    cast[pointer](pixels), addr bmi, DIB_RGB_COLORS, SRCCOPY)
+  if saved != 0:
+    discard RestoreDC(gBackDC, saved)
+  result = true
+
+proc winBlitRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  winPutRGBA(pixels, w, h, dst, false, format)
+
+proc winDrawRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  winPutRGBA(pixels, w, h, dst, true, format)
+
+type FaceInfo = object
+  family: string     ## the name GDI selects the face by; "" if unknown
+  weight: int
+  italic: bool
+
+proc readFaceInfo(path: string; faceIndex: int): FaceInfo =
+  ## The GDI family name (`name` ID 1), weight and slant (`OS/2`) of the
+  ## selected face in a TrueType/OpenType file or collection.
+  var data: string
+  try: data = readFile(path)
+  except IOError, OSError: return
+  proc u16(at: int): int =
+    if at + 2 > data.len: 0
+    else: (data[at].ord shl 8) or data[at+1].ord
+  proc u32(at: int): int = (u16(at) shl 16) or u16(at + 2)
+  var face = 0
+  if data.len >= 16 and data[0 ..< 4] == "ttcf":
+    if faceIndex < 0 or faceIndex >= u32(8): return
+    face = u32(12 + faceIndex * 4)
+  elif faceIndex != 0:
+    return
+  var nameAt, os2At = -1
+  for i in 0 ..< u16(face + 4):
+    let rec = face + 12 + i * 16
+    if rec + 16 > data.len: break
+    case data[rec ..< rec + 4]
+    of "name": nameAt = u32(rec + 8)
+    of "OS/2": os2At = u32(rec + 8)
+    else: discard
+  if os2At >= 0:
+    result.weight = u16(os2At + 4)
+    result.italic = (u16(os2At + 62) and 1) != 0
+  if nameAt < 0: return
+  let strings = nameAt + u16(nameAt + 4)
+  var best = -1
+  for i in 0 ..< u16(nameAt + 2):
+    let rec = nameAt + 6 + i * 12
+    # Windows Unicode BMP; the US English record is the one GDI matches.
+    if u16(rec) == 3 and u16(rec + 2) == 1 and u16(rec + 6) == 1:
+      if best < 0 or u16(rec + 4) == 0x409: best = rec
+  if best < 0: return
+  let start = strings + u16(best + 10)
+  var w = newSeq[Utf16Char](u16(best + 8) div 2)
+  for i in 0 ..< w.len: w[i] = Utf16Char(u16(start + 2 * i))
+  w.add Utf16Char(0)
+  result.family = $cast[WideCString](addr w[0])
+
+proc winOpenFontFace(path: string; faceIndex, size: int; style: FontStyles;
+                     metrics: var FontMetrics): screen.Font =
   # Ensure the font file is available as a private resource (needed for
   # fonts outside C:\Windows\Fonts, harmless for system-installed ones).
   let wpath = newWideCString(path)
   let FR_PRIVATE = 0x10'u32
-  discard AddFontResourceExW(cast[ptr uint16](wpath[0].addr), FR_PRIVATE, nil)
+  let info = readFaceInfo(path, faceIndex)
+  if faceIndex < 0 or (faceIndex != 0 and info.family.len == 0):
+    return screen.Font(0)
+  let registered = path.len > 0 and
+    AddFontResourceExW(cast[ptr uint16](wpath[0].addr), FR_PRIVATE, nil) > 0
+  var keepRegistration = false
+  defer:
+    if registered and not keepRegistration:
+      discard RemoveFontResourceExW(cast[ptr uint16](wpath[0].addr), FR_PRIVATE, nil)
 
-  # Detect bold/italic from filename
+  # Asked for outright, or -- for a path that names one face of a family --
+  # read from the file, or detected from the filename.
   let lpath = path.toLowerAscii()
-  let isBold = "bold" in lpath
-  let isItalic = "italic" in lpath or "oblique" in lpath
-  let weight = if isBold: 700'i32 else: FW_NORMAL
+  let isBold = FontStyle.bold in style or
+               (info.weight == 0 and "bold" in lpath)
+  let isItalic = FontStyle.italics in style or info.italic or
+                 (info.family.len == 0 and
+                  ("italic" in lpath or "oblique" in lpath))
+  let weight = if isBold: 700'i32
+               elif info.weight > 0: info.weight.int32
+               else: FW_NORMAL
   let italic = if isItalic: 1'u32 else: 0'u32
   let FIXED_PITCH = 1'u32
 
@@ -718,7 +906,9 @@ proc winOpenFont(path: string; size: int;
   # ClearType hinting.
   var faceName = "Consolas"
   let baseName = path.extractFilename.toLowerAscii
-  if "dejavu" in baseName and "mono" in baseName:
+  if info.family.len > 0:
+    faceName = info.family
+  elif "dejavu" in baseName and "mono" in baseName:
     faceName = "DejaVu Sans Mono"
   elif "dejavu" in baseName:
     faceName = "DejaVu Sans"
@@ -773,33 +963,56 @@ proc winOpenFont(path: string; size: int;
     return screen.Font(0)
 
   # Get font metrics
-  let oldFont = SelectObject(gBackDC, cast[HGDIOBJ](hf))
+  let dc = CreateCompatibleDC(nil)
+  if dc == nil:
+    discard DeleteObject(cast[HGDIOBJ](hf))
+    return screen.Font(0)
+  defer: discard DeleteDC(dc)
+  let oldFont = SelectObject(dc, cast[HGDIOBJ](hf))
   var tm: TEXTMETRICW
-  discard GetTextMetricsW(gBackDC, addr tm)
-  discard SelectObject(gBackDC, oldFont)
+  discard GetTextMetricsW(dc, addr tm)
+  discard SelectObject(dc, oldFont)
 
   metrics.ascent = tm.tmAscent.int
   metrics.descent = tm.tmDescent.int
   metrics.lineHeight = tm.tmHeight.int + tm.tmExternalLeading.int
 
-  fonts.add FontSlot(hFont: hf, metrics: metrics, faceName: path, size: size)
+  let slot = FontSlot(hFont: hf, metrics: metrics, faceName: path, size: size,
+    registeredPath: (if registered: path else: ""))
+  keepRegistration = registered
+  for i in 0 ..< fonts.len:
+    if fonts[i].hFont == nil:
+      fonts[i] = slot
+      return screen.Font(i + 1)
+  fonts.add slot
   result = screen.Font(fonts.len)
+
+proc winOpenFont(path: string; size: int; style: FontStyles;
+                 metrics: var FontMetrics): screen.Font =
+  winOpenFontFace(path, 0, size, style, metrics)
 
 proc winCloseFont(f: screen.Font) =
   let idx = f.int - 1
   if idx >= 0 and idx < fonts.len and fonts[idx].hFont != nil:
     discard DeleteObject(cast[HGDIOBJ](fonts[idx].hFont))
     fonts[idx].hFont = nil
+    if fonts[idx].registeredPath.len > 0:
+      let path = newWideCString(fonts[idx].registeredPath)
+      discard RemoveFontResourceExW(cast[ptr uint16](path[0].addr), 0x10, nil)
+      fonts[idx].registeredPath.setLen(0)
 
 proc winMeasureText(f: screen.Font; text: string): TextExtent =
   let hf = getFontHandle(f)
   if hf == nil or text.len == 0: return
-  let oldFont = SelectObject(gBackDC, cast[HGDIOBJ](hf))
+  let dc = CreateCompatibleDC(nil)
+  if dc == nil: return
+  defer: discard DeleteDC(dc)
+  let oldFont = SelectObject(dc, cast[HGDIOBJ](hf))
   let wtext = newWideCString(text)
   var sz: SIZE
-  discard GetTextExtentPoint32W(gBackDC, cast[ptr uint16](wtext[0].addr),
+  discard GetTextExtentPoint32W(dc, cast[ptr uint16](wtext[0].addr),
     wtext.len.int32, addr sz)
-  discard SelectObject(gBackDC, oldFont)
+  discard SelectObject(dc, oldFont)
   result = TextExtent(w: sz.cx.int, h: sz.cy.int)
 
 proc winDrawText(f: screen.Font; x, y: int; text: string;
@@ -820,12 +1033,69 @@ proc winDrawText(f: screen.Font; x, y: int; text: string;
   discard SelectObject(gBackDC, oldFont)
   result = TextExtent(w: sz.cx.int, h: sz.cy.int)
 
+proc winRenderText(f: screen.Font; text: string; fg: screen.Color;
+                   pixels: var seq[uint32]): TextExtent =
+  pixels.setLen 0
+  let hf = getFontHandle(f)
+  if hf == nil or text.len == 0: return
+  let dc = CreateCompatibleDC(nil)
+  if dc == nil: return
+  defer: discard DeleteDC(dc)
+  let oldFont = SelectObject(dc, cast[HGDIOBJ](hf))
+  defer: discard SelectObject(dc, oldFont)
+  let wtext = newWideCString(text)
+  let wlen = wtext.len.int32
+  var sz: SIZE
+  discard GetTextExtentPoint32W(dc, cast[ptr uint16](wtext[0].addr), wlen, addr sz)
+  if sz.cx <= 0 or sz.cy <= 0: return
+  var bmi = BITMAPINFO()
+  bmi.bmiHeader.biSize = DWORD(sizeof(BITMAPINFOHEADER))
+  bmi.bmiHeader.biWidth = sz.cx
+  bmi.bmiHeader.biHeight = -sz.cy # top to bottom, as the pixels are handed out
+  bmi.bmiHeader.biPlanes = 1
+  bmi.bmiHeader.biBitCount = 32
+  bmi.bmiHeader.biCompression = BI_RGB
+  var data: pointer
+  let bitmap = CreateDIBSection(dc, addr bmi, DIB_RGB_COLORS, addr data, nil, 0)
+  if bitmap == nil: return
+  defer: discard DeleteObject(cast[HGDIOBJ](bitmap))
+  let oldBmp = SelectObject(dc, cast[HGDIOBJ](bitmap))
+  defer: discard SelectObject(dc, oldBmp)
+  # White on the black a new DIB starts as: what GDI writes is coverage, and
+  # coverage times `fg` is the premultiplied pixel. ClearType coverage differs
+  # per channel; its mean is the plain antialiased value.
+  discard SetBkMode(dc, TRANSPARENT)
+  discard SetTextColor(dc, rgb(screen.Color(r: 255, g: 255, b: 255, a: 255)))
+  discard TextOutW(dc, 0, 0, cast[ptr uint16](wtext[0].addr), wlen)
+  discard GdiFlush()
+  let n = sz.cx.int * sz.cy.int
+  let src = cast[ptr UncheckedArray[uint32]](data)
+  pixels.setLen n
+  for i in 0 ..< n:
+    let p = src[i]
+    let coverage = (((p shr 16) and 0xFF) + ((p shr 8) and 0xFF) + (p and 0xFF)) div 3
+    let a = coverage * fg.a.uint32 div 255
+    pixels[i] = (a shl 24) or ((fg.r.uint32 * a div 255) shl 16) or
+                ((fg.g.uint32 * a div 255) shl 8) or (fg.b.uint32 * a div 255)
+  result = TextExtent(w: sz.cx.int, h: sz.cy.int)
+
 proc winGetFontMetrics(f: screen.Font): FontMetrics =
   let idx = f.int - 1
   if idx >= 0 and idx < fonts.len: fonts[idx].metrics
   else: screen.FontMetrics()
 
 proc winFillRect(r: coords.Rect; color: screen.Color) =
+  if r.w <= 0 or r.h <= 0 or color.a == 0: return
+  if color.a < 255:
+    let a = color.a.uint32
+    var pixel = (a shl 24) or
+      (((color.r.uint32 * a + 127) div 255) shl 16) or
+      (((color.g.uint32 * a + 127) div 255) shl 8) or
+      ((color.b.uint32 * a + 127) div 255)
+    if not winDrawRGBA(cast[ptr UncheckedArray[uint32]](addr pixel),
+        1, 1, r, RGBAFormat.argbPremultiplied):
+      raise newException(ValueError, "Cannot blend a native GDI rectangle")
+    return
   let brush = CreateSolidBrush(rgb(color))
   var wr = WINAPIRECT(
     left: r.x.int32, top: r.y.int32,
@@ -962,6 +1232,17 @@ proc setDpiAware() =
     discard SetProcessDPIAware()
   except: discard
 
+proc winapiFontRelays*(): FontRelays =
+  ## A font provider independent of the installed window/drawing relays.
+  FontRelays(
+    openFont: winOpenFont, openFontFace: winOpenFontFace, closeFont: winCloseFont,
+    getFontMetrics: winGetFontMetrics, measureText: winMeasureText,
+    drawText: winDrawText, renderText: winRenderText)
+
+proc initWinapiFontRelays*() =
+  ## Installs only the Win32 font provider.
+  fontRelays = winapiFontRelays()
+
 proc initWinapiDriver*() =
   setDpiAware()
   windowRelays = WindowRelays(
@@ -970,15 +1251,57 @@ proc initWinapiDriver*() =
     saveState: winSaveState, restoreState: winRestoreState,
     setClipRect: winSetClipRect, setCursor: winSetCursor,
     setWindowTitle: winSetWindowTitle)
-  fontRelays = FontRelays(
-    openFont: winOpenFont, closeFont: winCloseFont,
-    getFontMetrics: winGetFontMetrics, measureText: winMeasureText,
-    drawText: winDrawText)
+  initWinapiFontRelays()
   drawRelays = DrawRelays(
-    fillRect: winFillRect, drawLine: winDrawLine, drawPoint: winDrawPoint)
+    fillRect: winFillRect, drawLine: winDrawLine, drawPoint: winDrawPoint,
+    blitRGBA: winBlitRGBA, drawRGBA: winDrawRGBA)
   inputRelays = InputRelays(
     pollEvent: winPollEvent, waitEvent: winWaitEvent,
     getTicks: winGetTicks, sleep: winDelay,
     shutdown: winQuitRequest)
   clipboardRelays = ClipboardRelays(
     getText: winGetClipboardText, putText: winPutClipboardText)
+
+var siwinSurfaceOwned = false
+
+proc detachSiwinSurface*() =
+  if siwinSurfaceOwned and gBackDC != nil:
+    discard SelectObject(gBackDC, gOldBmp)
+    discard DeleteObject(cast[HGDIOBJ](gBackBmp))
+    discard DeleteDC(gBackDC)
+  gBackDC = nil
+  gBackBmp = nil
+  gOldBmp = nil
+  gWidth = 0
+  gHeight = 0
+  siwinSurfaceOwned = false
+
+proc attachSiwinSurface*(dc: pointer; width, height: int) =
+  ## Own a persistent GDI compositor, independent of Siwin's replaceable DIB.
+  if dc == nil or width <= 0 or height <= 0: return
+  if siwinSurfaceOwned and gWidth == width.int32 and gHeight == height.int32: return
+  let nextDC = CreateCompatibleDC(cast[HDC](dc))
+  if nextDC == nil: raise newException(ValueError, "Cannot create the GDI compositor")
+  let nextBitmap = CreateCompatibleBitmap(cast[HDC](dc), width.int32, height.int32)
+  if nextBitmap == nil:
+    discard DeleteDC(nextDC)
+    raise newException(ValueError, "Cannot create the GDI backing bitmap")
+  let previous = SelectObject(nextDC, cast[HGDIOBJ](nextBitmap))
+  var area = WINAPIRECT(left: 0, top: 0, right: width.int32, bottom: height.int32)
+  let brush = CreateSolidBrush(0)
+  discard FillRectGdi(nextDC, addr area, brush)
+  discard DeleteObject(cast[HGDIOBJ](brush))
+  if siwinSurfaceOwned:
+    discard BitBlt(nextDC, 0, 0, min(width.int32, gWidth), min(height.int32, gHeight),
+      gBackDC, 0, 0, SRCCOPY)
+    detachSiwinSurface()
+  gBackDC = nextDC
+  gBackBmp = nextBitmap
+  gOldBmp = previous
+  gWidth = width.int32
+  gHeight = height.int32
+  siwinSurfaceOwned = true
+
+proc presentSiwinSurface*(dc: pointer): bool =
+  gBackDC != nil and dc != nil and BitBlt(cast[HDC](dc), 0, 0, gWidth, gHeight,
+    gBackDC, 0, 0, SRCCOPY) != 0

@@ -3809,7 +3809,7 @@ proc detectRebuildCmd*(): string =
   let bnim = dir / "toolchain" / "nim" / "bin" / "nim"
   let bzig = dir / "toolchain" / "zig" / "zig"
   var nimExe = if fileExists(bnim): bnim.quoteShell else: "nim"
-  when defined(feature.uirelays.figDrawSiwin):
+  when defined(features.uirelays.figDrawSiwinGpu):
     # A GPU build needs Nim >= 2.4 (config.nims falls back to the CPU driver
     # below that). If the PATH `nim` is older, rebuild with the newest one
     # nimble installed as a package -- it fetches one for figdraw's deps --

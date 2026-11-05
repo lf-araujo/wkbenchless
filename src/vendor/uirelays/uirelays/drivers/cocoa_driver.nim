@@ -23,6 +23,12 @@ typedef struct {
 
 import ../coords, ../input, ../screen
 
+proc prepareSiwinSurface*(width, height: cint; scale: cdouble): cint
+  {.importc: "cocoa_prepareSiwinSurface", cdecl.}
+proc presentSiwinSurface*(pixels: pointer; width, height: cint): cint
+  {.importc: "cocoa_presentSiwinSurface", cdecl.}
+proc detachSiwinSurface*() {.importc: "cocoa_detachSurface", cdecl.}
+
 # --- C bindings to cocoa_backend.m ---
 # All procs use {.importc.} with explicit C names to avoid Nim's
 # identifier normalisation colliding with the Nim wrapper procs.
@@ -68,12 +74,15 @@ proc cRefresh() {.importc: "cocoa_refresh", cdecl.}
 proc cPollEvent(ev: ptr NEEvent): cint {.importc: "cocoa_pollEvent", cdecl.}
 proc cWaitEvent(ev: ptr NEEvent; timeoutMs: cint): cint {.importc: "cocoa_waitEvent", cdecl.}
 
-proc cOpenFont(path: cstring; size: cint;
+proc cOpenFont(path: cstring; size, bold, italic: cint;
                outAsc, outDesc, outLH: ptr cint): cint {.importc: "cocoa_openFont", cdecl.}
 proc cCloseFont(handle: cint) {.importc: "cocoa_closeFont", cdecl.}
 proc cGetFontMetrics(handle: cint; asc, desc, lh: ptr cint) {.importc: "cocoa_getFontMetrics", cdecl.}
 proc cMeasureText(handle: cint; text: cstring;
                   outW, outH: ptr cint) {.importc: "cocoa_measureText", cdecl.}
+proc cRenderText(handle: cint; text: cstring; w, h: cint;
+                 r, g, b, a: cint; pixels: ptr uint32)
+  {.importc: "cocoa_renderText", cdecl.}
 proc cDrawText(handle: cint; x, y: cint; text: cstring;
                fgR, fgG, fgB, fgA: cint;
                bgR, bgG, bgB, bgA: cint;
@@ -84,10 +93,15 @@ proc cDrawLine(x1, y1, x2, y2: cint; r, g, b, a: cint) {.importc: "cocoa_drawLin
 proc cDrawPoint(x, y: cint; r, g, b, a: cint) {.importc: "cocoa_drawPoint", cdecl.}
 
 proc cLoadImage(path: cstring): cint {.importc: "cocoa_loadImage", cdecl.}
-proc cGetImageSize(handle: cint; outW, outH: ptr cint) {.importc: "cocoa_getImageSize", cdecl.}
-proc cFreeImage(handle: cint) {.importc: "cocoa_freeImage", cdecl.}
 proc cDrawImage(handle, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH: cint)
   {.importc: "cocoa_drawImage", cdecl.}
+proc cFreeImage(handle: cint) {.importc: "cocoa_freeImage", cdecl.}
+proc cImageSize(handle: cint; outW, outH: ptr cint)
+  {.importc: "cocoa_imageSize", cdecl.}
+proc cBlitRGBA(pixels: pointer; w, h, dstX, dstY, dstW, dstH, format: cint): cint
+  {.importc: "cocoa_blitRGBA", cdecl.}
+proc cDrawRGBA(pixels: pointer; w, h, dstX, dstY, dstW, dstH, format: cint): cint
+  {.importc: "cocoa_drawRGBA", cdecl.}
 
 proc cSetClipRect(x, y, w, h: cint) {.importc: "cocoa_setClipRect", cdecl.}
 proc cSaveState() {.importc: "cocoa_saveState", cdecl.}
@@ -107,7 +121,7 @@ proc cShutdown() {.importc: "cocoa_shutdown", cdecl.}
 
 # --- Relay implementations ---
 
-proc cocoaCreateWindow(layout: var ScreenLayout) =
+proc cocoaCreateWindow(layout: var ScreenLayout; icon: pointer; iconLen: int) =
   var w, h, sx, sy: cint
   cCreateWindow(layout.width.cint, layout.height.cint,
                 addr w, addr h, addr sx, addr sy)
@@ -137,23 +151,41 @@ proc cocoaLoadImage(path: string): Image =
   let handle = cLoadImage(path.cstring)
   result = Image(handle)
 
-proc cocoaFreeImage(img: Image) =
-  cFreeImage(img.int.cint)
-
-proc cocoaImageSize(img: Image): tuple[w, h: int] =
-  var w, h: cint
-  cGetImageSize(img.int.cint, addr w, addr h)
-  (w.int, h.int)
-
 proc cocoaDrawImage(img: Image; src, dst: Rect) =
   cDrawImage(img.int.cint,
              src.x.cint, src.y.cint, src.w.cint, src.h.cint,
              dst.x.cint, dst.y.cint, dst.w.cint, dst.h.cint)
 
-proc cocoaOpenFont(path: string; size: int;
+proc cocoaFreeImage(img: Image) =
+  ## The relay this driver was missing. The three image relays go together --
+  ## a caller checks for all of them before it asks for any -- so a driver
+  ## that loads and draws but cannot free was a driver that never got asked,
+  ## and every picture on macOS came out as the caller's placeholder.
+  cFreeImage(img.int.cint)
+
+proc cocoaImageSize(img: Image): tuple[w, h: int] =
+  var w, h: cint
+  cImageSize(img.int.cint, addr w, addr h)
+  (w.int, h.int)
+
+proc cocoaBlitRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                   dst: Rect; format: RGBAFormat): bool =
+  if pixels == nil: return false
+  cBlitRGBA(cast[pointer](pixels), w.cint, h.cint,
+            dst.x.cint, dst.y.cint, dst.w.cint, dst.h.cint, format.ord.cint) != 0
+
+proc cocoaDrawRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                   dst: Rect; format: RGBAFormat): bool =
+  if pixels == nil: return false
+  cDrawRGBA(cast[pointer](pixels), w.cint, h.cint,
+            dst.x.cint, dst.y.cint, dst.w.cint, dst.h.cint, format.ord.cint) != 0
+
+proc cocoaOpenFont(path: string; size: int; style: FontStyles;
                    metrics: var FontMetrics): Font =
   var asc, desc, lh: cint
   let handle = cOpenFont(cstring(path), size.cint,
+                         cint(FontStyle.bold in style),
+                         cint(FontStyle.italics in style),
                          addr asc, addr desc, addr lh)
   if handle == 0: return Font(0)
   metrics.ascent = asc
@@ -179,6 +211,17 @@ proc cocoaDrawText(f: Font; x, y: int; text: string;
             bg.r.cint, bg.g.cint, bg.b.cint, bg.a.cint,
             addr w, addr h)
   result = TextExtent(w: w, h: h)
+
+proc cocoaRenderText(f: Font; text: string; fg: Color;
+                     pixels: var seq[uint32]): TextExtent =
+  pixels.setLen 0
+  if text == "": return TextExtent()
+  let size = cocoaMeasureText(f, text)
+  if size.w <= 0 or size.h <= 0: return TextExtent()
+  pixels.setLen size.w * size.h  # zeroed: transparent until drawn on
+  cRenderText(f.int.cint, cstring(text), size.w.cint, size.h.cint,
+              fg.r.cint, fg.g.cint, fg.b.cint, fg.a.cint, addr pixels[0])
+  result = size
 
 proc cocoaGetFontMetrics(f: Font): FontMetrics =
   var asc, desc, lh: cint
@@ -310,12 +353,13 @@ proc initCocoaDriver*() =
   fontRelays = FontRelays(
     openFont: cocoaOpenFont, closeFont: cocoaCloseFont,
     getFontMetrics: cocoaGetFontMetrics, measureText: cocoaMeasureText,
-    drawText: cocoaDrawText)
+    drawText: cocoaDrawText, renderText: cocoaRenderText)
   drawRelays = DrawRelays(
     fillRect: cocoaFillRect, drawLine: cocoaDrawLine,
     drawPoint: cocoaDrawPoint,
-    loadImage: cocoaLoadImage, freeImage: cocoaFreeImage, drawImage: cocoaDrawImage,
-    imageSize: cocoaImageSize)
+    loadImage: cocoaLoadImage, freeImage: cocoaFreeImage,
+    drawImage: cocoaDrawImage,
+    imageSize: cocoaImageSize, blitRGBA: cocoaBlitRGBA, drawRGBA: cocoaDrawRGBA)
   inputRelays = InputRelays(
     pollEvent: cocoaPollEvent, waitEvent: cocoaWaitEvent,
     getTicks: cocoaGetTicks, sleep: cocoaDelay,

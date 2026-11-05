@@ -4,7 +4,7 @@
 when defined(macosx):
   {.passC: "-Wno-incompatible-function-pointer-types".}
 
-import std/[deques, hashes, math, os, tables, times, unicode]
+import std/[deques, hashes, math, monotimes, os, tables, times, unicode]
 
 import pixie
 import pixie/fonts
@@ -22,6 +22,7 @@ import figdraw/extras/systemfonts
 import figdraw/common/[fontglyphs, fonttypes, fontutils, typefaces]
 
 import ../coords, ../input, ../screen
+import ./siwin_keys
 
 when defined(linux):
   import std/importutils
@@ -41,12 +42,19 @@ type
   ImageSlot = object
     image: pixie.Image
 
+  PixelUploadSlot = object
+    key: Hash
+    pixelsKey: Hash
+    width, height: int
+    generation: uint64
+
   DrawOpKind = enum
     dopFillRect
     dopLine
     dopPoint
     dopText
     dopImage
+    dopPixels
 
   DrawOp = object
     state: DrawState
@@ -68,9 +76,14 @@ type
     of dopImage:
       image: screen.Image
       src, dst: coords.Rect
+    of dopPixels:
+      pixels: pixie.Image
+      pixelsKey: Hash
+      pixelsDst: coords.Rect
 
 var
   appWindow: siwin.Window
+  appGlobals: SiwinGlobals
   renderer: FigRenderer[SiwinRenderBackend]
   useAutoScale: bool
   decorationCloseRequested: bool
@@ -88,6 +101,8 @@ var
   wheelAcc: float32           ## scroll lines not sent yet (a touchpad's fractions)
   siwinInitialized = false
   frameStarted = false
+  presentationPending = false
+  pixelUploadSlots: seq[PixelUploadSlot]
 
 proc toFigColor(c: screen.Color): chroma.Color =
   rgba(c.r, c.g, c.b, c.a).color
@@ -130,29 +145,39 @@ proc queueScroll(lines, dx: int) =
                            preciseLines: lines))
 
 proc resolveFontPath(path: string): string =
+  ## An empty path means "the platform default", and for this library that is
+  ## a *monospaced* font: the native drivers pick Consolas (Windows) and
+  ## fontconfig's `monospace` (X11), and the apps are text editors that expect
+  ## a fixed advance. So the candidate lists here are mono-only too -- a
+  ## proportional fallback would silently break column arithmetic.
+  ##
+  ## Only `.ttf`/`.otf` are listed: pixie's `readTypeface` rejects anything
+  ## else, so macOS' `.ttc` collections (Menlo, Courier) are unreachable from
+  ## here, and SFNSMono.ttf is a variable font whose default instance is the
+  ## too-thin Light weight.
   if path.len > 0:
     return path
 
   when defined(windows):
     let candidates = [
-      "Segoe UI",
-      "segoeui.ttf",
-      "Arial",
-      "arial.ttf"
+      "Consolas",
+      "consola.ttf",
+      "Courier New",
+      "cour.ttf"
     ]
   elif defined(macosx):
     let candidates = [
-      "SFNS.ttf",
-      "Helvetica",
-      "Arial Unicode.ttf",
-      "Arial.ttf"
+      "Monaco.ttf",
+      "Andale Mono.ttf",
+      "Courier New.ttf",
+      "DejaVuSansMono.ttf"
     ]
   else:
     let candidates = [
-      "NotoSans[wght].ttf",
-      "LiberationSans-Regular.ttf",
-      "Cantarell-VF.otf",
-      "DejaVuSans.ttf"
+      "DejaVuSansMono.ttf",
+      "LiberationMono-Regular.ttf",
+      "NotoSansMono[wdth,wght].ttf",
+      "monospace"
     ]
 
   for candidate in candidates:
@@ -179,88 +204,14 @@ proc getImageSlot(img: screen.Image): ptr ImageSlot =
 proc pushCurrentRenderRequest() =
   queueEvent(input.Event(kind: NoEvent))
 
-proc translateMods(mods: set[siwin.ModifierKey]): set[input.Modifier] =
-  if siwin.ModifierKey.shift in mods: result.incl ShiftPressed
-  if siwin.ModifierKey.control in mods: result.incl CtrlPressed
-  if siwin.ModifierKey.alt in mods: result.incl AltPressed
-  if siwin.ModifierKey.system in mods: result.incl GuiPressed
-
-proc translateKey(k: siwin.Key): input.KeyCode =
-  case k
-  of siwin.Key.a: KeyA
-  of siwin.Key.b: KeyB
-  of siwin.Key.c: KeyC
-  of siwin.Key.d: KeyD
-  of siwin.Key.e: KeyE
-  of siwin.Key.f: KeyF
-  of siwin.Key.g: KeyG
-  of siwin.Key.h: KeyH
-  of siwin.Key.i: KeyI
-  of siwin.Key.j: KeyJ
-  of siwin.Key.k: KeyK
-  of siwin.Key.l: KeyL
-  of siwin.Key.m: KeyM
-  of siwin.Key.n: KeyN
-  of siwin.Key.o: KeyO
-  of siwin.Key.p: KeyP
-  of siwin.Key.q: KeyQ
-  of siwin.Key.r: KeyR
-  of siwin.Key.s: KeyS
-  of siwin.Key.t: KeyT
-  of siwin.Key.u: KeyU
-  of siwin.Key.v: KeyV
-  of siwin.Key.w: KeyW
-  of siwin.Key.x: KeyX
-  of siwin.Key.y: KeyY
-  of siwin.Key.z: KeyZ
-  of siwin.Key.n0: Key0
-  of siwin.Key.n1: Key1
-  of siwin.Key.n2: Key2
-  of siwin.Key.n3: Key3
-  of siwin.Key.n4: Key4
-  of siwin.Key.n5: Key5
-  of siwin.Key.n6: Key6
-  of siwin.Key.n7: Key7
-  of siwin.Key.n8: Key8
-  of siwin.Key.n9: Key9
-  of siwin.Key.f1: KeyF1
-  of siwin.Key.f2: KeyF2
-  of siwin.Key.f3: KeyF3
-  of siwin.Key.f4: KeyF4
-  of siwin.Key.f5: KeyF5
-  of siwin.Key.f6: KeyF6
-  of siwin.Key.f7: KeyF7
-  of siwin.Key.f8: KeyF8
-  of siwin.Key.f9: KeyF9
-  of siwin.Key.f10: KeyF10
-  of siwin.Key.f11: KeyF11
-  of siwin.Key.f12: KeyF12
-  of siwin.Key.enter: KeyEnter
-  of siwin.Key.space: KeySpace
-  of siwin.Key.escape: KeyEsc
-  of siwin.Key.tab: KeyTab
-  of siwin.Key.backspace: KeyBackspace
-  of siwin.Key.del: KeyDelete
-  of siwin.Key.insert: KeyInsert
-  of siwin.Key.left: KeyLeft
-  of siwin.Key.right: KeyRight
-  of siwin.Key.up: KeyUp
-  of siwin.Key.down: KeyDown
-  of siwin.Key.pageUp: KeyPageUp
-  of siwin.Key.pageDown: KeyPageDown
-  of siwin.Key.home: KeyHome
-  of siwin.Key.End: KeyEnd
-  of siwin.Key.capsLock: KeyCapslock
-  of siwin.Key.comma: KeyComma
-  of siwin.Key.dot: KeyPeriod
-  else: KeyNone
-
-proc translateButton(btn: siwin.MouseButton): input.MouseButton =
-  case btn
-  of siwin.MouseButton.left: LeftButton
-  of siwin.MouseButton.right: RightButton
-  of siwin.MouseButton.middle: MiddleButton
-  else: LeftButton
+proc handleRenderRequest() =
+  # refresh() requests one window service to present the submitted frame.
+  # An expose requests an application repaint, but our own presentation must
+  # not request another repaint and feed an event-driven redraw loop forever.
+  if presentationPending:
+    presentationPending = false
+  else:
+    pushCurrentRenderRequest()
 
 proc queueTextEvent(text: string) =
   var e = input.Event(kind: TextInputEvent)
@@ -373,6 +324,35 @@ proc replayImage(ctx: BackendContext; op: DrawOp) =
     false,
   )
 
+proc replayPixels(ctx: BackendContext; op: DrawOp; index: int) =
+  ## One atlas slot per blit position in a frame, reused across animation frames.
+  ## Content hashes avoid uploads for unchanged pictures; changed pixels update
+  ## the same rectangle instead of growing the atlas for every animation frame.
+  if op.pixels.isNil:
+    return
+  if index >= pixelUploadSlots.len:
+    pixelUploadSlots.setLen(index + 1)
+    pixelUploadSlots[index].key = hash(("uirelays-pixel-slot", index))
+  let slot = addr pixelUploadSlots[index]
+  if slot.key notin ctx.entries() or slot.width != op.pixels.width or
+      slot.height != op.pixels.height:
+    if slot.key in ctx.entries():
+      ctx.removeAtlasEntry(slot.key)
+    ctx.putImage(slot.key, op.pixels)
+  elif slot.generation != ctx.atlasGeneration() or slot.pixelsKey != op.pixelsKey:
+    ctx.updateImage(slot.key, op.pixels)
+  slot.pixelsKey = op.pixelsKey
+  slot.width = op.pixels.width
+  slot.height = op.pixels.height
+  slot.generation = ctx.atlasGeneration()
+  ctx.drawImage(
+    slot.key,
+    vec2(scaledF(op.pixelsDst.x), scaledF(op.pixelsDst.y)),
+    toFigColor(color(255, 255, 255, 255)),
+    vec2(scaledF(op.pixelsDst.w), scaledF(op.pixelsDst.h)),
+    false,
+  )
+
 proc renderQueuedOps() =
   if appWindow.isNil or appWindow.closed or renderer.isNil:
     return
@@ -389,6 +369,7 @@ proc renderQueuedOps() =
   # A mask per op made every frame thousands of stencil passes (nearly every
   # op is clipped to its pane): open one only where the clip changes.
   var open = DrawState()
+  var pixelIndex = 0
   for op in drawOps:
     if not sameClip(op.state, open):
       if open.clipActive: ctx.popMask()
@@ -419,6 +400,9 @@ proc renderQueuedOps() =
       replayText(ctx, op)
     of dopImage:
       replayImage(ctx, op)
+    of dopPixels:
+      replayPixels(ctx, op, pixelIndex)
+      inc pixelIndex
   if open.clipActive: ctx.popMask()
   ctx.restoreTransform()
   ctx.endFrame()
@@ -443,7 +427,14 @@ proc deferDecorationClose(window: siwin.Window) =
           proc(frame: LibdecorFrame; userData: pointer) {.cdecl.} =
             decorationCloseRequested = true
 
-proc figCreateWindow(layout: var ScreenLayout) =
+proc figCreateWindow(layout: var ScreenLayout; icon: pointer; iconLen: int) =
+  # MaxWindowWidth/MaxWindowHeight arrive as negative sizes. Neither backend
+  # is available to test against here, so this driver does the safe half of
+  # the contract: it substitutes a sane size instead of handing a negative one
+  # to the toolkit. The window is then merely large, not maximized -- wiring
+  # that up is a one-liner once the backend's own maximize can be verified.
+  if layout.width < 0: layout.width = 1024
+  if layout.height < 0: layout.height = 768
   if not siwinInitialized:
     # siwin takes the X11 WM_CLASS / Wayland app_id from the window's initial
     # title, so open it under the program's own name (as the X11 driver sets
@@ -472,12 +463,13 @@ proc figCreateWindow(layout: var ScreenLayout) =
       renderer = newFigRenderer(atlasSize = 1024, backendState = SiwinRenderBackend())
     deferDecorationClose(appWindow)
     useAutoScale = appWindow.configureUiScale()
+    appGlobals = sharedSiwinGlobals()
     renderer.setupBackend(appWindow)
     appWindow.eventsHandler = WindowEventsHandler(
       onClose: proc(e: CloseEvent) =
         queueEvent(input.Event(kind: WindowCloseEvent)),
       onRender: proc(e: RenderEvent) =
-        pushCurrentRenderRequest(),
+        handleRenderRequest(),
       onResize: proc(e: ResizeEvent) =
         appWindow.refreshUiScale(useAutoScale)
         let scale = currentScale().round().int
@@ -566,6 +558,7 @@ proc figRefresh() =
     drawOps.setLen(0)
     return
   renderQueuedOps()
+  presentationPending = true
   appWindow.redraw()
 
 proc figSaveState() =
@@ -581,7 +574,13 @@ proc figSetClipRect(r: coords.Rect) =
   currentState.clipActive = true
   currentState.clipRect = r
 
-proc figOpenFont(path: string; size: int; metrics: var FontMetrics): screen.Font =
+proc figOpenFont(path: string; size: int; style: FontStyles;
+                 metrics: var FontMetrics): screen.Font =
+  # `style` is accepted and ignored: pixie draws the typeface in the file it
+  # was handed and has nothing to synthesize a bold or an italic cut with, so
+  # styled text comes out upright here. Picking a sibling file -- the
+  # `-Bold.ttf` next to the `-Regular.ttf` -- is the way to fix that, once
+  # there is a machine to try it on.
   let resolvedPath = resolveFontPath(path)
   if resolvedPath.len == 0:
     return screen.Font(0)
@@ -634,6 +633,30 @@ proc figDrawText(f: screen.Font; x, y: int; text: string;
     bg: bg,
   )
 
+proc figRenderText(f: screen.Font; text: string; fg: screen.Color;
+                   pixels: var seq[uint32]): TextExtent =
+  ## Pixie fills the run into an image of its own, premultiplied as the
+  ## pixels `renderText` hands out are.
+  pixels.setLen 0
+  let slot = getFontSlot(f)
+  if slot.isNil or slot.pixieFont.isNil or text.len == 0:
+    return
+  let size = figMeasureText(f, text)
+  if size.w <= 0 or size.h <= 0:
+    return
+  let font = slot.pixieFont.copy()
+  font.paint = toFigColor(fg)
+  let image = newImage(size.w, size.h)
+  try:
+    image.fillText(font.typeset(text))
+  except PixieError:
+    return
+  pixels.setLen size.w * size.h
+  for i, c in image.data:
+    pixels[i] = (c.a.uint32 shl 24) or (c.r.uint32 shl 16) or
+                (c.g.uint32 shl 8) or c.b.uint32
+  result = size
+
 proc figGetFontMetrics(f: screen.Font): FontMetrics =
   let slot = getFontSlot(f)
   if not slot.isNil:
@@ -660,13 +683,6 @@ proc figLoadImage(path: string): screen.Image =
   except PixieError:
     screen.Image(0)
 
-proc figImageSize(img: screen.Image): tuple[w, h: int] =
-  ## Native pixel size -- the editor sizes inline images from it (without it,
-  ## they got a placeholder box and an empty source rect, so drew nothing).
-  let slot = getImageSlot(img)
-  if slot.isNil or slot.image.isNil: (0, 0)
-  else: (slot.image.width, slot.image.height)
-
 proc figFreeImage(img: screen.Image) =
   let idx = img.int - 1
   if idx >= 0 and idx < images.len:
@@ -676,6 +692,47 @@ proc figDrawImage(img: screen.Image; src, dst: coords.Rect) =
   if img == screen.Image(0):
     return
   drawOps.add DrawOp(kind: dopImage, state: currentState, image: img, src: src, dst: dst)
+
+proc figImageSize(img: screen.Image): tuple[w, h: int] =
+  ## Without this a caller can crop a picture but cannot ask for all of it,
+  ## because "all of it" is a rectangle in the picture's own pixels and it had
+  ## no way to learn how many there are.
+  let slot = getImageSlot(img)
+  if slot.isNil or slot.image.isNil: (0, 0)
+  else: (slot.image.width, slot.image.height)
+
+proc queueRGBA(pixels: ptr UncheckedArray[uint32]; w, h, stride: int;
+               dst: coords.Rect; format: RGBAFormat): bool =
+  if pixels == nil or w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0:
+    return false
+  # Deferred replay owns a copy; the caller may reuse its buffer on return.
+  var img = pixie.newImage(w, h)
+  var key = hash((w, h, format))
+  for y in 0 ..< h:
+    for x in 0 ..< w:
+      let p = pixels[y * stride + x]
+      img.data[y * w + x] = rgbx(uint8((p shr 16) and 0xFF),
+                                uint8((p shr 8) and 0xFF),
+                                uint8(p and 0xFF),
+                                if format == RGBAFormat.argbPremultiplied: uint8(p shr 24) else: 255'u8)
+      key = key !& hash(p)
+  drawOps.add DrawOp(kind: dopPixels, state: currentState,
+                    pixels: img, pixelsKey: !$key, pixelsDst: dst)
+  true
+
+proc figDrawRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  queueRGBA(pixels, w, h, w, dst, format)
+
+proc figBlitRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  if pixels == nil or w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0:
+    return false
+  # Preserve blitRGBA's clipping-only contract, including the source stride.
+  let cw = min(w, dst.w)
+  let ch = min(h, dst.h)
+  queueRGBA(pixels, cw, ch, w, coords.rect(dst.x, dst.y, cw, ch), format)
+
 
 proc figSetCursor(c: screen.CursorKind) =
   if appWindow.isNil or appWindow.closed:
@@ -701,37 +758,43 @@ proc figPutClipboardText(text: string) =
   if not appWindow.isNil:
     appWindow.clipboard.text = text
 
-proc pumpWindowStep() =
+proc pumpWindowEvents() =
   if not appWindow.isNil and appWindow.opened:
     if decorationCloseRequested:
       decorationCloseRequested = false
       appWindow.close()
       return
-    appWindow.step()
+    discard appGlobals.pollEvents()
+    appWindow.serviceWindow()
 
 proc figPollEvent(e: var input.Event; flags: set[InputFlag]): bool =
   discard flags
   if eventQueue.len == 0:
-    pumpWindowStep()
+    pumpWindowEvents()
   if eventQueue.len == 0:
     return false
   e = eventQueue.popFirst()
   true
 
 proc figWaitEvent(e: var input.Event; timeoutMs: int; flags: set[InputFlag]): bool =
-  discard flags
-  let startMs = (epochTime() * 1000).int
-  let deadlineMs =
-    if timeoutMs < 0: int.high
-    else: startMs + timeoutMs
-  while eventQueue.len == 0:
-    pumpWindowStep()
-    if timeoutMs >= 0 and (epochTime() * 1000).int >= deadlineMs:
+  let deadline = getMonoTime() + initDuration(milliseconds = max(timeoutMs, 0))
+  if figPollEvent(e, flags):
+    return true
+  while not appWindow.isNil and appWindow.opened:
+    let remaining =
+      if timeoutMs < 0: high(Duration)
+      else: deadline - getMonoTime()
+    if timeoutMs >= 0 and remaining.inNanoseconds <= 0:
       return false
-    if timeoutMs >= 0:
-      os.sleep(1)
-  e = eventQueue.popFirst()
-  true
+    let activity = appGlobals.waitEvents(remaining)
+    if appWindow.opened:
+      appWindow.serviceWindow()
+    if eventQueue.len > 0:
+      e = eventQueue.popFirst()
+      return true
+    if activity == eventTimeout:
+      return false
+  false
 
 proc figGetTicks(): int =
   (epochTime() * 1000).int
@@ -743,6 +806,7 @@ proc figShutdown() =
   if not appWindow.isNil and appWindow.opened:
     close(appWindow)
   appWindow = nil
+  appGlobals = nil
   renderer = nil
   eventQueue.clear()
   drawOps.setLen(0)
@@ -751,8 +815,10 @@ proc figShutdown() =
   fontSlots.setLen(0)
   images.setLen(0)
   typefaceIdsByPath.clear()
+  pixelUploadSlots.setLen(0)
   siwinInitialized = false
   frameStarted = false
+  presentationPending = false
 
 proc initFigDrawSiwinDriver*() =
   windowRelays = WindowRelays(
@@ -771,6 +837,7 @@ proc initFigDrawSiwinDriver*() =
     getFontMetrics: figGetFontMetrics,
     measureText: figMeasureText,
     drawText: figDrawText,
+    renderText: figRenderText,
   )
   drawRelays = DrawRelays(
     fillRect: figFillRect,
@@ -780,6 +847,8 @@ proc initFigDrawSiwinDriver*() =
     freeImage: figFreeImage,
     drawImage: figDrawImage,
     imageSize: figImageSize,
+    blitRGBA: figBlitRGBA,
+    drawRGBA: figDrawRGBA,
   )
   inputRelays = InputRelays(
     pollEvent: figPollEvent,

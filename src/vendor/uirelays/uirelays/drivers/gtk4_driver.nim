@@ -11,6 +11,9 @@
 {.emit: """
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
+#ifdef GDK_WINDOWING_X11
+#include <gdk/x11/gdkx.h>
+#endif
 #include <cairo.h>
 #include <pango/pangocairo.h>
 #include <pango/pangofc-fontmap.h>
@@ -20,9 +23,15 @@
 static inline FcPattern *nimedit_fc_font_match(FcPattern *p, void *result_out) {
   return FcFontMatch(NULL, p, (FcResult *)result_out);
 }
+
+static inline void nimedit_set_program_class(GdkDisplay *display, const char *name) {
+#ifdef GDK_WINDOWING_X11
+  gdk_x11_display_set_program_class(display, name);
+#endif
+}
 """.}
 
-import std/unicode
+import std/[unicode, os, strutils]
 import ../coords, ../input, ../screen
 
 const
@@ -61,6 +70,7 @@ type
   gint = cint
   gulong = culong
   gdouble = cdouble
+  GType = csize_t
   GCallback = pointer
   GConnectFlags = cint
 
@@ -80,6 +90,8 @@ const
   GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES = 3
   FcMatchPattern = 0
   CAIRO_FORMAT_ARGB32 = 0 ## cairo_format_t; pixel buffer must be flushed before another cairo_t reads it
+  CAIRO_ANTIALIAS_GRAY = 2 ## cairo_antialias_t
+  CAIRO_FORMAT_RGB24 = 1 ## cairo_format_t; 32 bits a pixel with the top byte unused -- the word `blitRGBA` hands over
 
 const
   FC_FILE = "file"
@@ -96,16 +108,22 @@ proc g_error_free(err: ptr GError) {.importc, nodecl, cdecl.}
 proc g_free(p: pointer) {.importc, nodecl, cdecl.}
 proc g_get_monotonic_time(): int64 {.importc, nodecl, cdecl.}
 proc g_usleep(micros: culong) {.importc, nodecl, cdecl.}
+proc g_set_prgname(name: cstring) {.importc, nodecl, cdecl.}
+proc g_get_prgname(): cstring {.importc, nodecl, cdecl.}
+proc g_type_from_name(name: cstring): GType {.importc, nodecl, cdecl.}
+proc g_type_check_instance_is_a(inst: pointer; t: GType): gboolean {.importc, nodecl, cdecl.}
 
 proc g_main_context_iteration(ctx: pointer; mayBlock: gboolean): gboolean {.importc, nodecl, cdecl.}
 
 proc gtk_init_check(): gboolean {.importc, nodecl, cdecl.}
 proc gtk_window_new(): pointer {.importc, nodecl, cdecl.}
 proc gtk_window_set_title(win: pointer; title: cstring) {.importc, nodecl, cdecl.}
+proc gtk_window_set_icon_name(win: pointer; name: cstring) {.importc, nodecl, cdecl.}
 proc gtk_window_set_default_size(win: pointer; w, h: gint) {.importc, nodecl, cdecl.}
 proc gtk_window_set_child(win: pointer; child: pointer) {.importc, nodecl, cdecl.}
 proc gtk_window_destroy(win: pointer) {.importc, nodecl, cdecl.}
 proc gtk_window_present(win: pointer) {.importc, nodecl, cdecl.}
+proc gtk_window_maximize(win: pointer) {.importc, nodecl, cdecl.}
 proc gtk_widget_queue_draw(w: pointer) {.importc, nodecl, cdecl.}
 proc gtk_widget_grab_focus(w: pointer) {.importc, nodecl, cdecl.}
 proc gtk_widget_set_cursor(w, cursor: pointer) {.importc, nodecl, cdecl.}
@@ -146,6 +164,8 @@ proc gtk_im_context_focus_in(im: pointer) {.importc, nodecl, cdecl.}
 proc gdk_event_get_modifier_state(ev: pointer): guint {.importc, nodecl, cdecl.}
 proc gdk_keyval_to_lower(k: guint): guint {.importc, nodecl, cdecl.}
 proc gdk_cursor_new_from_name(name: cstring; fallback: pointer): pointer {.importc, nodecl, cdecl.}
+proc gdk_x11_display_set_program_class(disp: pointer; name: cstring)
+  {.importc: "nimedit_set_program_class", nodecl, cdecl.}
 proc gdk_display_get_default(): pointer {.importc, nodecl, cdecl.}
 proc gdk_display_get_clipboard(disp: pointer): pointer {.importc, nodecl, cdecl.}
 proc gdk_clipboard_set_text(clip: pointer; text: cstring) {.importc, nodecl, cdecl.}
@@ -163,6 +183,14 @@ proc cairo_destroy(cr: pointer) {.importc, nodecl, cdecl.}
 proc cairo_surface_destroy(surf: pointer) {.importc, nodecl, cdecl.}
 proc cairo_surface_flush(surf: pointer) {.importc, nodecl, cdecl.}
 proc cairo_image_surface_create(fmt, w, h: gint): pointer {.importc, nodecl, cdecl.}
+proc cairo_image_surface_get_data(surf: pointer): pointer {.importc, nodecl, cdecl.}
+proc cairo_image_surface_get_stride(surf: pointer): gint {.importc, nodecl, cdecl.}
+proc cairo_font_options_create(): pointer {.importc, nodecl, cdecl.}
+proc cairo_font_options_destroy(opts: pointer) {.importc, nodecl, cdecl.}
+proc cairo_font_options_set_antialias(opts: pointer; aa: gint) {.importc, nodecl, cdecl.}
+proc cairo_set_font_options(cr, opts: pointer) {.importc, nodecl, cdecl.}
+proc cairo_image_surface_create_for_data(data: pointer; fmt, w, h, stride: gint):
+  pointer {.importc, nodecl, cdecl.}
 proc cairo_save(cr: pointer) {.importc, nodecl, cdecl.}
 proc cairo_restore(cr: pointer) {.importc, nodecl, cdecl.}
 proc cairo_reset_clip(cr: pointer) {.importc, nodecl, cdecl.}
@@ -177,6 +205,9 @@ proc cairo_move_to(cr: pointer; x, y: gdouble) {.importc, nodecl, cdecl.}
 proc cairo_line_to(cr: pointer; x, y: gdouble) {.importc, nodecl, cdecl.}
 proc cairo_set_line_width(cr: pointer; w: gdouble) {.importc, nodecl, cdecl.}
 proc cairo_scale(cr: pointer; sx, sy: gdouble) {.importc, nodecl, cdecl.}
+const cairoRgbaHeader = currentSourcePath().parentDir / "cairo_rgba.h"
+proc drawCairoRGBA(cr, surf: pointer; w, h, x, y, dstW, dstH: cint)
+  {.importc: "uirelays_draw_cairo_rgba", header: cairoRgbaHeader, cdecl.}
 
 proc pango_cairo_create_layout(cr: pointer): pointer {.importc, nodecl, cdecl.}
 proc pango_cairo_update_layout(cr, layout: pointer) {.importc, nodecl, cdecl.}
@@ -189,6 +220,8 @@ proc pango_layout_get_pixel_size(layout: pointer; w, h: ptr gint) {.importc, nod
 
 proc pango_font_description_free(desc: pointer) {.importc, nodecl, cdecl.}
 proc pango_font_description_set_absolute_size(desc: pointer; size: gint) {.importc, nodecl, cdecl.}
+proc pango_font_description_set_weight(desc: pointer; weight: cint) {.importc, nodecl, cdecl.}
+proc pango_font_description_set_style(desc: pointer; style: cint) {.importc, nodecl, cdecl.}
 
 proc pango_fc_font_description_from_pattern(pat: pointer; includeSize: gboolean): pointer {.importc, nodecl, cdecl.}
 
@@ -488,7 +521,7 @@ proc readClipboardSync(): string =
 
 # --- Screen hooks ---
 
-proc gtkCreateWindow(layout: var ScreenLayout) =
+proc gtkCreateWindow(layout: var ScreenLayout; icon: pointer; iconLen: int) =
   if win != nil:
     let da = cast[ptr GtkDrawingArea](drawingArea)
     layout.width = max(1, gtk_drawing_area_get_content_width(da).int)
@@ -497,8 +530,35 @@ proc gtkCreateWindow(layout: var ScreenLayout) =
   if gtk_init_check() == G_FALSE:
     quit("GTK4 init failed")
   win = gtk_window_new()
-  gtk_window_set_title(win, "NimEdit")
-  gtk_window_set_default_size(win, gint(layout.width), gint(layout.height))
+  # Who this window belongs to: the name of the executable, which is what a
+  # `.desktop` file's StartupWMClass matches and what GTK then looks the icon
+  # up by in the icon theme. Not the title -- that changes while it runs.
+  var instName = getAppFilename().extractFilename.changeFileExt("")
+  var className = instName
+  if className.len > 0: className[0] = className[0].toUpperAscii
+  g_set_prgname(instName.cstring)
+  # X11 only: the class half of WM_CLASS. GTK4 would otherwise take it from
+  # RESOURCE_NAME when that is set, so say it outright. Wayland has no such
+  # property -- there the app id is the prgname above. The type check keeps
+  # this off a Wayland display, where the cast inside GTK would be a critical;
+  # an unregistered type name yields 0, which matches nothing.
+  let disp = gdk_display_get_default()
+  if disp != nil and
+      g_type_check_instance_is_a(disp, g_type_from_name("GdkX11Display")) == G_TRUE:
+    gdk_x11_display_set_program_class(disp, className.cstring)
+  gtk_window_set_title(win, instName.cstring)
+  # GTK takes the icon from the icon theme, by this name -- `icon` holds X11
+  # cardinals, which it has no use for. An installed `.desktop` entry and its
+  # hicolor PNGs are what put a picture there.
+  gtk_window_set_icon_name(win, instName.cstring)
+  # A negative dimension is MaxWindowWidth/MaxWindowHeight: ask the window
+  # manager to maximize, which leaves panels and docks visible (unlike
+  # gtk_window_fullscreen). The default size is what unmaximizing returns to.
+  let maximized = layout.width < 0 or layout.height < 0
+  gtk_window_set_default_size(win,
+    gint(if layout.width < 0: 1024 else: layout.width),
+    gint(if layout.height < 0: 768 else: layout.height))
+  if maximized: gtk_window_maximize(win)
   drawingArea = gtk_drawing_area_new()
   gtk_window_set_child(win, drawingArea)
   let da = cast[ptr GtkDrawingArea](drawingArea)
@@ -573,8 +633,12 @@ proc gtkRefresh() =
   if drawingArea != nil:
     gtk_widget_queue_draw(drawingArea)
 
-proc gtkSaveState() = discard
-proc gtkRestoreState() = discard
+proc gtkSaveState() =
+  ensureBackingCr()
+  if backingCr != nil: cairo_save(backingCr)
+
+proc gtkRestoreState() =
+  if backingCr != nil: cairo_restore(backingCr)
 
 proc gtkSetClipRect(r: coords.Rect) =
   ensureBackingCr()
@@ -583,7 +647,12 @@ proc gtkSetClipRect(r: coords.Rect) =
   cairo_rectangle(backingCr, gdouble(r.x), gdouble(r.y), gdouble(r.w), gdouble(r.h))
   cairo_clip(backingCr)
 
-proc gtkOpenFont(path: string; size: int; metrics: var FontMetrics): Font =
+const
+  PangoStyleItalic = 2'i32   ## PANGO_STYLE_ITALIC
+  PangoWeightBold = 700'i32  ## PANGO_WEIGHT_BOLD
+
+proc gtkOpenFont(path: string; size: int; style: FontStyles;
+                 metrics: var FontMetrics): Font =
   discard FcInit()
   var pat = FcPatternCreate()
   if pat == nil:
@@ -603,6 +672,12 @@ proc gtkOpenFont(path: string; size: int; metrics: var FontMetrics): Font =
   if desc == nil:
     return Font(0)
   pango_font_description_set_absolute_size(desc, gint(size * PANGO_SCALE))
+  # Pango picks the face out of the family, and synthesizes an oblique one
+  # when the family has no italic of its own.
+  if FontStyle.bold in style:
+    pango_font_description_set_weight(desc, PangoWeightBold)
+  if FontStyle.italics in style:
+    pango_font_description_set_style(desc, PangoStyleItalic)
   let surf = cairo_image_surface_create(0, 8, 8)
   let cr = cairo_create(surf)
   let layout = pango_cairo_create_layout(cr)
@@ -637,14 +712,23 @@ proc gtkCloseFont(f: Font) =
     pango_font_description_free(fonts[idx].desc)
     fonts[idx].desc = nil
 
-proc gtkMeasureText(f: Font; text: string): TextExtent =
+var textSurf, textCr: pointer
+
+proc measuringCr(): pointer =
+  ## The back buffer once there is a window. Fonts are measured before one,
+  ## and without one by a renderer that draws in a window of its own.
   ensureBackingCr()
+  if backingCr != nil: return backingCr
+  if textCr == nil:
+    textSurf = cairo_image_surface_create(gint(CAIRO_FORMAT_ARGB32), 1, 1)
+    textCr = cairo_create(textSurf)
+  textCr
+
+proc gtkMeasureText(f: Font; text: string): TextExtent =
   let desc = getDesc(f)
   if desc == nil or text.len == 0:
     return TextExtent()
-  let cr = backingCr
-  if cr == nil:
-    return TextExtent()
+  let cr = measuringCr()
   let layout = pango_cairo_create_layout(cr)
   pango_layout_set_font_description(layout, desc)
   pango_layout_set_text(layout, cstring(text), -1)
@@ -653,17 +737,17 @@ proc gtkMeasureText(f: Font; text: string): TextExtent =
   g_object_unref_layout(layout)
   result = TextExtent(w: w.int, h: h.int)
 
-proc gtkDrawText(f: Font; x, y: int; text: string; fg, bg: screen.Color): TextExtent =
-  ensureBackingCr()
-  let desc = getDesc(f)
-  if desc == nil or text.len == 0 or backingCr == nil:
-    return
-  let ext = gtkMeasureText(f, text)
+proc paintText(desc: pointer; x, y: int; text: string;
+               fg, bg: screen.Color; size: TextExtent) =
+  ## The drawing both entry points below share, once the extent is known --
+  ## by measuring, or because the caller said so. A measurement here is a
+  ## Pango layout of its own, so the one that is spared is worth sparing.
   cairo_save(backingCr)
   cairo_set_source_rgba(backingCr,
     gdouble(bg.r) / 255.0, gdouble(bg.g) / 255.0, gdouble(bg.b) / 255.0,
     gdouble(bg.a) / 255.0)
-  cairo_rectangle(backingCr, gdouble(x), gdouble(y), gdouble(ext.w), gdouble(ext.h))
+  cairo_rectangle(backingCr, gdouble(x), gdouble(y),
+                  gdouble(size.w), gdouble(size.h))
   cairo_fill(backingCr)
   let layout = pango_cairo_create_layout(backingCr)
   pango_layout_set_font_description(layout, desc)
@@ -676,7 +760,64 @@ proc gtkDrawText(f: Font; x, y: int; text: string; fg, bg: screen.Color): TextEx
   pango_cairo_show_layout(backingCr, layout)
   g_object_unref_layout(layout)
   cairo_restore(backingCr)
-  result = ext
+
+proc gtkDrawText(f: Font; x, y: int; text: string; fg, bg: screen.Color): TextExtent =
+  ensureBackingCr()
+  let desc = getDesc(f)
+  if desc == nil or text.len == 0 or backingCr == nil:
+    return
+  result = gtkMeasureText(f, text)
+  paintText(desc, x, y, text, fg, bg, result)
+
+proc gtkDrawMeasuredText(f: Font; x, y: int; text: string;
+                         fg, bg: screen.Color; size: TextExtent) =
+  ## What the caller measured is what gets drawn: no layout is built here to
+  ## ask Pango what it already knows.
+  ensureBackingCr()
+  let desc = getDesc(f)
+  if desc == nil or text.len == 0 or backingCr == nil:
+    return
+  paintText(desc, x, y, text, fg, bg, size)
+
+proc gtkRenderText(f: Font; text: string; fg: screen.Color;
+                   pixels: var seq[uint32]): TextExtent =
+  ## Pango draws the run into an ARGB32 surface of its own, which cairo keeps
+  ## premultiplied already -- the very pixels `renderText` hands out.
+  pixels.setLen 0
+  let desc = getDesc(f)
+  if desc == nil or text.len == 0:
+    return
+  let size = gtkMeasureText(f, text)
+  if size.w <= 0 or size.h <= 0:
+    return
+  let surf = cairo_image_surface_create(gint(CAIRO_FORMAT_ARGB32),
+    gint(size.w), gint(size.h))
+  let cr = cairo_create(surf)
+  # Grayscale: subpixel coverage differs per channel, which a texture blended
+  # anywhere, over anything, cannot use -- and fontconfig may well ask for it.
+  let options = cairo_font_options_create()
+  cairo_font_options_set_antialias(options, CAIRO_ANTIALIAS_GRAY)
+  cairo_set_font_options(cr, options)
+  cairo_font_options_destroy(options)
+  let layout = pango_cairo_create_layout(cr)
+  pango_layout_set_font_description(layout, desc)
+  pango_layout_set_text(layout, cstring(text), -1)
+  cairo_set_source_rgba(cr,
+    gdouble(fg.r) / 255.0, gdouble(fg.g) / 255.0, gdouble(fg.b) / 255.0,
+    gdouble(fg.a) / 255.0)
+  cairo_move_to(cr, 0, 0)
+  pango_cairo_show_layout(cr, layout)
+  g_object_unref_layout(layout)
+  cairo_destroy(cr)
+  cairo_surface_flush(surf)
+  let data = cast[ptr UncheckedArray[uint8]](cairo_image_surface_get_data(surf))
+  let stride = cairo_image_surface_get_stride(surf).int
+  if data != nil:
+    pixels.setLen size.w * size.h
+    for y in 0 ..< size.h:
+      copyMem(addr pixels[y * size.w], addr data[y * stride], size.w * 4)
+    result = size
+  cairo_surface_destroy(surf)
 
 proc gtkGetFontMetrics(f: Font): FontMetrics =
   let idx = f.int - 1
@@ -709,6 +850,42 @@ proc gtkDrawLine(x1, y1, x2, y2: int; color: screen.Color) =
 
 proc gtkDrawPoint(x, y: int; color: screen.Color) =
   gtkFillRect(rect(x, y, 1, 1), color)
+
+proc gtkPutRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                dst: coords.Rect; scaleImage: bool; format: RGBAFormat): bool =
+  ## This driver decodes no pictures, so it fills in none of the image
+  ## relays. What it can do is take finished pixels from whoever does.
+  ensureBackingCr()
+  if backingCr == nil or pixels == nil: return false
+  if w <= 0 or h <= 0 or dst.w <= 0 or dst.h <= 0: return false
+  # No copy: cairo reads the caller's rows straight through, and it has read
+  # all of them by the time `cairo_paint` returns -- which is before this
+  # does, and so before the caller may touch them again.
+  let surf = cairo_image_surface_create_for_data(cast[pointer](pixels),
+    gint(if format == RGBAFormat.argbPremultiplied: CAIRO_FORMAT_ARGB32 else: CAIRO_FORMAT_RGB24), gint(w), gint(h), gint(w * 4))
+  if surf == nil: return false
+  if scaleImage:
+    drawCairoRGBA(backingCr, surf, w.cint, h.cint, dst.x.cint, dst.y.cint,
+                  dst.w.cint, dst.h.cint)
+  else:
+    # Preserve the clipping-only behavior of the original blit relay.
+    cairo_save(backingCr)
+    cairo_rectangle(backingCr, gdouble(dst.x), gdouble(dst.y),
+                    gdouble(min(w, dst.w)), gdouble(min(h, dst.h)))
+    cairo_clip(backingCr)
+    cairo_set_source_surface(backingCr, surf, gdouble(dst.x), gdouble(dst.y))
+    cairo_paint(backingCr)
+    cairo_restore(backingCr)
+  cairo_surface_destroy(surf)
+  result = true
+
+proc gtkBlitRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  gtkPutRGBA(pixels, w, h, dst, false, format)
+
+proc gtkDrawRGBA(pixels: ptr UncheckedArray[uint32]; w, h: int;
+                 dst: coords.Rect; format: RGBAFormat): bool =
+  gtkPutRGBA(pixels, w, h, dst, true, format)
 
 proc gtkSetCursor(c: CursorKind) =
   if drawingArea == nil: return
@@ -804,9 +981,11 @@ proc initGtk4Driver*() =
   fontRelays = FontRelays(
     openFont: gtkOpenFont, closeFont: gtkCloseFont,
     getFontMetrics: gtkGetFontMetrics, measureText: gtkMeasureText,
-    drawText: gtkDrawText)
+    drawText: gtkDrawText, drawMeasuredText: gtkDrawMeasuredText,
+    renderText: gtkRenderText)
   drawRelays = DrawRelays(
-    fillRect: gtkFillRect, drawLine: gtkDrawLine, drawPoint: gtkDrawPoint)
+    fillRect: gtkFillRect, drawLine: gtkDrawLine, drawPoint: gtkDrawPoint,
+    blitRGBA: gtkBlitRGBA, drawRGBA: gtkDrawRGBA)
   inputRelays = InputRelays(
     pollEvent: gtkPollEvent, waitEvent: gtkWaitEvent,
     getTicks: gtkGetTicks, sleep: gtkDelay,
