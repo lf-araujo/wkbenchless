@@ -45,6 +45,7 @@ import uirelays/[coords, screen, input]
 import widgets/theme
 import widgets/langs/markdown
 import std/strutils
+import std/tables
 import std/os
 import std/times
 import std/hashes             # cache key for the converted-image cache
@@ -235,6 +236,11 @@ type
                         ## that a panel coming back to a buffer that changed
                         ## while it was away knows to count its line again
 
+  StyleRun* = object
+    ## Byte offsets into the `code` a styler was given, `last` included.
+    first*, last*: int
+    tc*: TokenClass
+
   SynEdit* = object
     # Gap buffer
     front, back: seq[Cell]
@@ -280,6 +286,10 @@ type
     # Text
     tabSize*: int
     lang*: SourceLanguage
+    markdownLangs*: Table[string, proc (code: string; runs: var seq[StyleRun])]
+      ## Outside highlighters for fenced code blocks, by language in lower case.
+      ## Each gets a block's whole body. A language without an entry stays with
+      ## the tokenizers in this file.
     changed: bool
     readOnly*: int                  ## -1 = fully editable;
                                     ## >= 0 = positions <= readOnly are protected
@@ -1176,19 +1186,6 @@ proc styleMarkdownLine(s: var SynEdit; lineStart, lineEnd, last: int) =
   if lineEnd <= last:
     s.setCellStyle(lineEnd, TokenClass.None)
 
-# --- Code styler relay ---------------------------------------------------------
-# An outside highlighter can style the body of org src blocks and Rmd chunks.
-# SynEdit knows nothing about the engine: both relays are nil by default, and a
-# language the engine does not claim stays with the tokenizers in this file.
-
-type
-  StyleRun* = tuple[first, last: int; tc: TokenClass]
-    ## Byte offsets into the `code` the styler was given, `last` included.
-
-var
-  codeStylerHandles*: proc (lang: string): bool {.nimcall.}
-  codeStyler*: proc (lang, code: string; runs: var seq[StyleRun]) {.nimcall.}
-
 include wkb/styler
 
 proc highlightMarkdown(s: var SynEdit; first, last: int) =
@@ -1219,7 +1216,7 @@ proc highlightMarkdown(s: var SynEdit; first, last: int) =
         let langTok = fenceToken(rest)
         fenceLang = strToLanguage(langTok)
         fenceName = langTok
-        fenceStyled = usesCodeStyler(langTok)
+        fenceStyled = s.usesCodeStyler(langTok)
         insideFence = true
         chunkStart = lineStart
         chunkBody = lineEnd + 1

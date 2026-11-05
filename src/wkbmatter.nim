@@ -1,8 +1,8 @@
 ## wkbmatter -- Matter (TextMate grammars, pure Nim) as SynEdit's code styler.
 ##
-## Optional: build with `-d:wkbMatter` and `matter` on the path. It only fills in
-## the two relays in synedit, so languages without a grammar here, and every
-## build without the flag, keep SynEdit's own tokenizers.
+## Optional: build with `-d:wkbMatter` and `matter` on the path. It only adds an
+## entry to an editor's `markdownLangs`, so languages without a grammar here, and
+## every build without the flag, keep SynEdit's own tokenizers.
 ##
 ## The grammar is VS Code's extensions/r/syntaxes/r.tmLanguage.json (MIT).
 
@@ -24,7 +24,7 @@ var
   rGrammar: Grammar
   cache: Table[string, seq[CachedLine]]
 
-proc grammarFor(lang: string): Grammar =
+proc grammarR(): Grammar =
   if rGrammar == nil:
     let registry = newRegistry()
     registry.addGrammar(parseRawGrammar(rGrammarJson, "r.tmLanguage.json"))
@@ -53,7 +53,8 @@ proc tokenized(g: Grammar; line: string; state: StateStack): CachedLine =
   result = CachedLine(before: state, after: r.ruleStack)
   for t in r.tokens:
     if t.endIndex > t.startIndex:
-      result.runs.add (t.startIndex, t.endIndex - 1, classOf(t.scopes))
+      result.runs.add StyleRun(first: t.startIndex, last: t.endIndex - 1,
+                              tc: classOf(t.scopes))
 
 proc lookup(g: Grammar; line: string; state: StateStack): CachedLine =
   ## A line's tokens depend only on its text and the state it starts in, so a
@@ -64,11 +65,9 @@ proc lookup(g: Grammar; line: string; state: StateStack): CachedLine =
   result = tokenized(g, line, state)
   hits[].add result
 
-proc handles(lang: string): bool = lang == "r"
-
-proc style(lang, code: string; runs: var seq[StyleRun]) =
+proc styleR(code: string; runs: var seq[StyleRun]) =
   if cache.len > MaxCachedLines: cache.clear()
-  let g = grammarFor(lang)
+  let g = grammarR()
   var state: StateStack = nil
   var offset = 0
   for line in code.split('\n'):
@@ -76,11 +75,10 @@ proc style(lang, code: string; runs: var seq[StyleRun]) =
       let c = lookup(g, line, state)
       state = c.after
       for r in c.runs:
-        runs.add (r.first + offset, r.last + offset, r.tc)
+        runs.add StyleRun(first: r.first + offset, last: r.last + offset, tc: r.tc)
     except MatterError:
       discard                            # this line stays unstyled
     offset += line.len + 1
 
-proc install*() =
-  codeStylerHandles = handles
-  codeStyler = style
+proc install*(s: var SynEdit) =
+  s.markdownLangs["r"] = styleR

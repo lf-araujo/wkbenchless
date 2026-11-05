@@ -26,10 +26,10 @@ else:
   windowRelays.restoreState = proc () = discard
   windowRelays.setClipRect = proc (r: Rect) = discard
 
-  install()
   let area = rect(0, 0, 900, 700)
   const doc = "#+begin_src R\n# note\nx <- mean(y, na.rm = TRUE)\nif (x > 1) z <- \"one\n  two\"\nw <- 12\n#+end_src\n"
   var s = createSynEdit(Font(1))
+  install(s)
   s.lang = langOrg
   s.setText(doc)
   render(s, area, false)
@@ -47,8 +47,9 @@ else:
     proc usNow(): int64 = getMonoTime().ticks div 1000
     let text = readFile(paramStr(1))
     let at0 = text.find("#+begin_src R", text.len div 2)
-    proc run(folded: bool; label: string) =
+    proc run(folded: bool; label: string; engine = true) =
       var e = createSynEdit(Font(1))
+      if engine: install(e)
       e.lang = langOrg
       e.foldAllPending = folded
       let t0 = usNow()
@@ -68,10 +69,8 @@ else:
     run(false, "all blocks open")
     run(false, "open again, cache warm")
     run(true, "all blocks folded")
-    codeStylerHandles = nil
-    codeStyler = nil
-    run(false, "no engine, open")
-    run(true, "no engine, folded")
+    run(false, "no engine, open", engine = false)
+    run(true, "no engine, folded", engine = false)
 
   if fails > 0:
     echo "test_wkbmatter: ", fails, " FAILED"

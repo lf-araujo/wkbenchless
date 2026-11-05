@@ -94,7 +94,7 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       let parts = stripped.splitWhitespace()
       blockLang = if parts.len >= 2: strToLanguage(parts[1]) else: langNone
       blockName = if parts.len >= 2: parts[1] else: ""
-      blockStyled = usesCodeStyler(blockName)
+      blockStyled = s.usesCodeStyler(blockName)
       insideBlock = true
       blockStart = lineStart
       blockBody = lineEnd + 1

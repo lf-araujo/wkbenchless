@@ -1,10 +1,9 @@
-## Included by synedit.nim: the code styler relay, fence names and
+## Included by synedit.nim: outside stylers, fence names and
 ## Markdown inline emphasis. wkbenchless only; kept out of
 ## that file so a sync with focim stays small.
 
-proc usesCodeStyler(lang: string): bool =
-  codeStyler != nil and codeStylerHandles != nil and lang.len > 0 and
-    codeStylerHandles(lang.toLowerAscii)
+proc usesCodeStyler(s: SynEdit; lang: string): bool =
+  lang.toLowerAscii in s.markdownLangs
 
 proc styleBlockBody(s: var SynEdit; lang: string; blockStart, a, b: int) =
   ## Style the cells `a ..< b`, the body of the block opened at `blockStart`.
@@ -13,7 +12,7 @@ proc styleBlockBody(s: var SynEdit; lang: string; blockStart, a, b: int) =
   var code = newStringOfCap(b - a)
   for j in a ..< b: code.add s[j]
   var runs: seq[StyleRun]
-  codeStyler(lang.toLowerAscii, code, runs)
+  s.markdownLangs[lang.toLowerAscii](code, runs)
   for j in a ..< b: s.setCellStyle(j, TokenClass.None)
   for r in runs:
     for k in r.first .. min(r.last, code.high):

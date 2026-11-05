@@ -673,6 +673,7 @@ proc main() =
   applyEmphasisFonts(app.ed)
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
+  when defined(wkbMatter): wkbmatter.install(app.ed)
   if paramCount() >= 1 and fileExists(paramStr(1)):
     app.filePath = paramStr(1)
     let ext = splitFile(app.filePath).ext
@@ -712,7 +713,6 @@ proc main() =
                             # is seeded, so latex/dvipng are found
   # Themes come from the config; guarantee one so the chrome is never unstyled,
   # and honor a default the config may already have applied.
-  when defined(wkbMatter): wkbmatter.install()
   if gThemes.len == 0: registerTheme("default", defaultBase16())
   if app.theme.name.len == 0: applyTheme(app, 0)
   loadState()                               # persisted UI state (XDG config dir)

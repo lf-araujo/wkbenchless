@@ -7,6 +7,8 @@
 
 import uirelays              # vendored: src/vendor/uirelays (see config.nims path)
 import widgets/synedit          # our patched SynEdit (langR/langOrg, inline images)
+when defined(wkbMatter):
+  import wkbmatter
 import wkbsession
 import wkblsp                    # pure std/json LSP client -- portable, no GTK
 import wkbref                    # reference context: prose/notes/paper by citekey
@@ -794,6 +796,7 @@ proc openFile*(app: var App; path: string) =
   for i, b in app.buffers:
     if b.filePath == path: switchToBuffer(app, i); return   # already open
   var ed = createSynEdit(app.font)
+  when defined(wkbMatter): wkbmatter.install(ed)
   ed.theme = app.ed.theme      # inherit the active theme so new buffers match
   ed.bigFont = app.bigFont
   ed.setEmphasisFonts(app.ed.boldFont, app.ed.italicFont,
@@ -831,6 +834,7 @@ proc showInfoBuffer*(app: var App; name, text: string) =
     switchToBuffer(app, found)
   else:
     var ed = createSynEdit(app.font)
+    when defined(wkbMatter): wkbmatter.install(ed)
     ed.theme = app.ed.theme
     ed.showLineNumbers = false
     ed.bigFont = app.bigFont

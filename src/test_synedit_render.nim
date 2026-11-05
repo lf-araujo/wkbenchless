@@ -3,7 +3,7 @@
 ## conflict: heading fonts, prose wrapping, no-wrap tables, folded blocks.
 ##   nim c -r --hints:off src/test_synedit_render.nim
 
-import std/[sequtils, strutils]
+import std/[sequtils, strutils, tables]
 import uirelays
 import widgets/synedit
 
@@ -112,10 +112,9 @@ block folding:
 
 # A fake styler: every body byte becomes a keyword, and each call is counted.
 var styled: seq[string]
-proc fakeHandles(lang: string): bool = lang == "r"
-proc fakeStyler(lang, code: string; runs: var seq[StyleRun]) =
+proc fakeStyler(code: string; runs: var seq[StyleRun]) =
   styled.add code
-  if code.len > 0: runs.add (0, code.high, TokenClass.Keyword)
+  if code.len > 0: runs.add StyleRun(first: 0, last: code.high, tc: TokenClass.Keyword)
 
 proc styleAt(s: SynEdit; needle: string; text: string): TokenClass =
   s.getCell(text.find(needle)).s
@@ -132,9 +131,8 @@ block code_styler_relay:
   check "without a styler the tokenizer colors R",
     plain.styleAt("rcode", twoBlocks) != TokenClass.Keyword
 
-  codeStylerHandles = fakeHandles
-  codeStyler = fakeStyler
   var s = createSynEdit(Font(1))
+  s.markdownLangs["r"] = fakeStyler
   s.lang = langOrg
   s.setText(twoBlocks)
   render(s, area, false)
@@ -147,6 +145,7 @@ block code_styler_relay:
 
   styled.setLen 0
   var f = createSynEdit(Font(1))
+  f.markdownLangs["r"] = fakeStyler
   f.lang = langOrg
   f.foldAllPending = true
   f.setText(twoBlocks)
@@ -166,14 +165,13 @@ block code_styler_relay:
 
   styled.setLen 0
   var rmd = createSynEdit(Font(1))
+  rmd.markdownLangs["r"] = fakeStyler
   rmd.lang = langMarkdown
   rmd.setText("text\n\n```{r}\nchunk <- 1\n```\n")
   render(rmd, area, false)
   echo "     styler calls: ", styled
   check "an Rmd chunk reaches the styler", styled.len > 0 and
     styled.allIt(it == "chunk <- 1\n")
-  codeStylerHandles = nil
-  codeStyler = nil
 
 if fails > 0:
   echo "test_synedit_render: ", fails, " FAILED"
