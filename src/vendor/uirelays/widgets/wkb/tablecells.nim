@@ -27,3 +27,19 @@ proc tableGlyph(c: char; sep, atFirst, atLast: bool): string =
   of '+': (if sep: "┼" else: $c)          # ┼ (only in rule rows)
   of '-': (if sep: "─" else: $c)          # ─ (only in rule rows)
   else: $c
+
+proc scanTableRow(s: SynEdit; i: int; tblSep: var bool; firstBar, lastBar: var int) =
+  ## Box-drawing metadata for a row: is it a rule row (only |,+,-,ws with a dash),
+  ## and the offsets of the first/last '|' (so rule-row ends get ├ / ┤).
+  var j = i
+  var onlyRule = true
+  var sawDash = false
+  while j < s.len and s[j] != '\L':
+    let c = s[j]
+    if c == '|':
+      if firstBar < 0: firstBar = j
+      lastBar = j
+    elif c == '-': sawDash = true
+    elif c notin {'+', ' ', '\t'}: onlyRule = false
+    inc j
+  tblSep = onlyRule and sawDash

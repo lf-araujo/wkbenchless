@@ -1216,13 +1216,7 @@ proc highlightMarkdown(s: var SynEdit; first, last: int) =
         s.setCellStyle(j, TokenClass.MarkdownFence)
       let rest = stripped[3..^1].strip
       if rest.len > 0 and not insideFence:
-        # Rmd uses ```{r} fences (with braces + optional chunk options); the
-        # language is the token before any space/comma/brace.
-        var langTok = rest
-        if langTok.startsWith("{"):
-          langTok = langTok[1 .. ^1]
-        let sp = langTok.find({' ', ',', '}'})
-        if sp >= 0: langTok = langTok[0 ..< sp]
+        let langTok = fenceToken(rest)
         fenceLang = strToLanguage(langTok)
         fenceName = langTok
         fenceStyled = usesCodeStyler(langTok)
@@ -1258,63 +1252,7 @@ proc highlightMarkdown(s: var SynEdit; first, last: int) =
 
     pos = lineEnd + 1
 
-  # Inline emphasis: **bold**, *italic*, and `code` (Markdown syntax).
-  proc emph(s: var SynEdit; ch: char; flag: CellFlag; first, last: int) =
-    var p = first
-    while p < last:
-      if s[p] == ch and
-         (p == first or s[p - 1] in {' ', '\t', '\L', '(', '{', '\''}) and
-         p + 1 <= last and s[p + 1] notin {' ', '\t', '\L'}:
-        var q = p + 1
-        while q <= last and s[q] != '\L':
-          if s[q] == ch and s[q - 1] notin {' ', '\t'}: break
-          inc q
-        if q <= last and s[q] == ch and q > p + 1:
-          s.addCellFlags(p, {cfHidden}); s.addCellFlags(q, {cfHidden})
-          for k in p + 1 .. q - 1: s.addCellFlags(k, {flag})
-          p = q + 1
-          continue
-      inc p
-  # Markdown bold is **text** (double star); italic is *text* (single star).
-  # Handle **bold** first (double star), then *italic* (single star).
-  proc emphBold(s: var SynEdit; first, last: int) =
-    var p = first
-    while p + 1 < last:
-      if s[p] == '*' and s[p + 1] == '*' and
-         (p == first or s[p - 1] in {' ', '\t', '\L', '(', '{', '\''}) and
-         p + 2 <= last and s[p + 2] notin {' ', '\t', '\L'}:
-        var q = p + 2
-        while q + 1 <= last and s[q] != '\L':
-          if s[q] == '*' and s[q + 1] == '*' and s[q - 1] notin {' ', '\t'}:
-            break
-          inc q
-        if q + 1 <= last and s[q] == '*' and s[q + 1] == '*' and q > p + 1:
-          s.addCellFlags(p, {cfHidden}); s.addCellFlags(p + 1, {cfHidden})
-          s.addCellFlags(q, {cfHidden}); s.addCellFlags(q + 1, {cfHidden})
-          for k in p + 2 .. q - 1: s.addCellFlags(k, {cfBold})
-          p = q + 2
-          continue
-      inc p
-  s.emphBold(first, last)
-  s.emph('*', cfItalic, first, last)
-  # `code` spans: colour the content in the code face, hide the backticks.
-  proc emphCode(s: var SynEdit; ch: char; tc: TokenClass; first, last: int) =
-    var p = first
-    while p < last:
-      if s[p] == ch and
-         (p == first or s[p - 1] in {' ', '\t', '\L', '(', '{', '\''}) and
-         p + 1 <= last and s[p + 1] notin {' ', '\t', '\L'}:
-        var q = p + 1
-        while q <= last and s[q] != '\L':
-          if s[q] == ch and s[q - 1] notin {' ', '\t'}: break
-          inc q
-        if q <= last and s[q] == ch and q > p + 1:
-          s.addCellFlags(p, {cfHidden}); s.addCellFlags(q, {cfHidden})
-          for k in p + 1 .. q - 1: s.setCellStyle(k, tc)
-          p = q + 1
-          continue
-      inc p
-  s.emphCode('`', TokenClass.StringLit, first, last)
+  s.styleMarkdownEmphasis(first, last)
 
 proc highlight(s: var SynEdit; first, last: int; initialState: TokenClass) =
   # Text a program colored itself is not the highlighter's to guess at. Below
@@ -3040,113 +2978,7 @@ proc gotoMarkdownHeading*(s: var SynEdit; fragment: string): bool =
     inc i
     inc lineNo
 
-proc renderMarkdownImageLine(
-    s: var SynEdit; lineStart: int; dim: var Rect;
-    endX, endY, lineH: int; showCursor: bool;
-    nextIndex, consumedRows: var int): bool =
-  ## Render a whole-line image link inline, sized like Emacs org-mode: the
-  ## image's native dimensions by default, overridable per-image with a
-  ## preceding `#+ATTR_ORG: :width N [:height M]` (or the editor's
-  ## `imageDefaultWidth`); aspect ratio is always preserved.
-  var j = lineStart
-  while j < s.len and s[j] != '\L': inc j
-
-  var line = newStringOfCap(max(0, j - lineStart))
-  for p in lineStart ..< j:
-    line.add s[p]
-
-  var imgPath = ""
-  var handled = false
-  if rfInlineImages in s.flags and parseImageLinkPath(line, imgPath):
-    handled = true                                  # image link (relative ok)
-  var blockEnd = -1                                 # byte past a multi-line math block
-  if not handled and rfLatexPreview in s.flags:     # cached LaTeX math preview
-    var inner = ""
-    if latexDisplayMathAt(s, lineStart, inner, blockEnd):
-      let cp = ltxCachePath(inner)
-      if fileExists(cp): imgPath = cp; handled = true   # else: show source
-  if not handled:
-    return
-
-  # Keep source visible while actively editing this line.
-  if showCursor and lineStart <= s.cursor.int and s.cursor.int <= j:
-    return
-
-  let maxW = endX - dim.x - 4
-  let maxH = endY - dim.y - 2
-  if maxW <= 16 or maxH < lineH:
-    return
-
-  let img = s.getCachedImage(imgPath)
-  let (iw, ih) = imageSize(img)                     # native px, (0,0) if unloaded
-
-  # Requested size: per-image #+ATTR_* :width/:height, else the editor default.
-  var wantW, wantH = 0
-  scanImageAttrs(s, lineStart, wantW, wantH)
-  if wantW == 0 and wantH == 0 and s.imageDefaultWidth > 0:
-    wantW = s.imageDefaultWidth
-
-  # For a multi-line block the image replaces all its source lines, so size it
-  # to fill the block's vertical space (capped by the pane) rather than the
-  # native/tight height, which would leave a gap or overlap the next line.
-  var blockRows = 1
-  if blockEnd > j:
-    blockRows = 0
-    var k = lineStart
-    while k < blockEnd:
-      if s[k] == '\L': inc blockRows
-      inc k
-    if blockRows < 1: blockRows = 1
-
-  var tw, th: int
-  if img != Image(0) and iw > 0 and ih > 0:
-    # Derive from the native aspect ratio -- never stretch.
-    if wantW > 0 and wantH > 0: (tw, th) = (wantW, wantH)
-    elif wantW > 0: tw = wantW; th = max(1, wantW * ih div iw)
-    elif wantH > 0: th = wantH; tw = max(1, wantH * iw div ih)
-    else: (tw, th) = (iw, ih)                        # default: native size
-    if tw > maxW: th = max(1, th * maxW div tw); tw = maxW   # fit width, keep aspect
-    if th > maxH: tw = max(1, tw * maxH div th); th = maxH   # fit height, keep aspect
-    if blockRows > 1 and th > blockRows * lineH:
-      tw = max(1, tw * (blockRows * lineH) div th); th = blockRows * lineH
-  else:
-    # Placeholder box (backend without image relays, or a format that could not
-    # be loaded/converted): no native aspect to honour.
-    tw = if wantW > 0: min(wantW, maxW) else: min(maxW, max(240, maxW div 2))
-    th = min(maxH, if wantH > 0: wantH else: lineH * 6)
-
-  let dst = rect(dim.x, dim.y + 1, tw, th)
-  if img != Image(0):
-    # The source rectangle is in the picture's own pixels, so "all of it" is
-    # its own size -- not the size of the hole it is going into, which is a
-    # different rectangle that happens to also be a rectangle. A driver that
-    # cannot say how big a picture is gets asked the old way and answers by
-    # cropping, which is at least a picture.
-    let srcRect = if iw > 0 and ih > 0: rect(0, 0, iw, ih)
-                  else: rect(0, 0, dst.w, dst.h)
-    drawImage(img, srcRect, dst)
-  else:
-    fillRect(dst, color(52, 56, 64))
-    drawLine(dst.x, dst.y, dst.x + dst.w - 1, dst.y + dst.h - 1, color(140, 146, 172))
-    drawLine(dst.x + dst.w - 1, dst.y, dst.x, dst.y + dst.h - 1, color(140, 146, 172))
-    discard drawText(s.font, dst.x + 6, dst.y + 4, imgPath, color(220, 220, 220), color(52, 56, 64))
-
-  dim.y += th + 2
-  if blockEnd > j:
-    # multi-line block: skip all its source lines and advance the line/span
-    # counters by the number of buffer lines it occupies.
-    nextIndex = blockEnd
-    consumedRows = 0
-    var k = lineStart
-    while k < blockEnd:
-      if s[k] == '\L': inc consumedRows
-      inc k
-    if consumedRows < 1: consumedRows = 1
-    result = true
-  else:
-    nextIndex = j + 1
-    consumedRows = 1
-    result = true
+include wkb/imageline
 
 proc spaceForLines(s: SynEdit): int =
   if s.showLineNumbers:
@@ -3558,24 +3390,9 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
   db.lineNoWrap = isTableLine(s, i)
   if db.lineNoWrap and s.hScroll > 0:
     db.dim.x -= s.hScroll * textWidth(baseFont, " ")   # pan a wide table left
-  # box-drawing metadata for this row: is it a rule row (only |,+,-,ws with a
-  # dash), and the offsets of the first/last '|' (so rule-row ends get ├ / ┤).
   var tblSep = false
-  var firstBar = -1
-  var lastBar = -1
-  if db.lineNoWrap:
-    var j = i
-    var onlyRule = true
-    var sawDash = false
-    while j < s.len and s[j] != '\L':
-      let c = s[j]
-      if c == '|':
-        if firstBar < 0: firstBar = j
-        lastBar = j
-      elif c == '-': sawDash = true
-      elif c notin {'+', ' ', '\t'}: onlyRule = false
-      inc j
-    tblSep = onlyRule and sawDash
+  var firstBar, lastBar = -1
+  if db.lineNoWrap: s.scanTableRow(i, tblSep, firstBar, lastBar)
   db.font = fontForFlags(s, styleFlags, baseFont)
   db.s = addr s
   db.i = i
@@ -3818,14 +3635,7 @@ proc renderPass(s: var SynEdit; area: Rect; showCursor: bool) =
     blink = s.cursorVisible
 
   while dim.y + fontSize < endY and i <= s.len:
-    # Reading margin: prose sits in a centered column; code blocks and tables
-    # span the full width (baseX..fullEndX) so wide content isn't cramped.
-    block:
-      let wide = s.readingMargin <= 0 or s.inSrcBlock(i) or
-                 isTableLine(s, i) or isImageLine(s, i)
-      let lm = if wide: 0 else: s.readingMargin
-      dim.x = baseX + lm
-      dim.w = fullEndX - lm
+    s.applyReadingMargin(i, dim, baseX, fullEndX)
     let thisLine = renderLine.int
     # Two things want a band across the whole row: a row highlight the app has
     # set, and -- while this widget has the focus -- the line the caret is on.
@@ -3883,21 +3693,10 @@ proc renderPass(s: var SynEdit; area: Rect; showCursor: bool) =
     let fold = s.blockRangeAt(lineStart)
     let folded = fold.a == lineStart and s.isFolded(lineStart)
     let savedFont = s.font
-    if isBigOrgLine(s, i): s.font = s.bigFont   # taller row, bigger glyphs
-    elif isCaptionLine(s, i) and s.captionFont.int != 0: s.font = s.captionFont
+    s.font = s.rowFont(i)
     i = s.drawTextLine(i, dim, blink)
     s.font = savedFont
-    if folded:
-      # Mark the collapsed block and hop the buffer/line cursors past its body.
-      discard drawText(s.font, endX - 60, lineY, "\u25b8 \u22ef",
-                       s.theme.lineNumColor, s.srcBlockBg)
-      var skipped = 0
-      var j = i
-      while j <= fold.b:
-        if s[j] == '\L': inc skipped
-        inc j
-      i = fold.b + 1
-      renderLine = (renderLine.int + skipped).Natural
+    if folded: s.skipFoldedBody(fold, endX, lineY, i, renderLine)
     if actionLine or closeLine:
       # Drawn after the text, so the per-token backgrounds cannot paint over
       # the frame's top and bottom edges -- and so the button occludes a
@@ -3955,12 +3754,7 @@ proc renderPass(s: var SynEdit; area: Rect; showCursor: bool) =
                     else: s.theme.scrollBarColor
     fillRect(finalGrip, gripColor)
 
-  # Ghost text (Copilot inline completion): greyed text after the cursor.
-  if s.ghostText.len > 0 and s.cursorDim.h > 0:
-    let gx = s.cursorDim.x
-    let gy = s.cursorDim.y
-    if gx + textWidth(s.font, s.ghostText) <= endX:
-      discard drawText(s.font, gx, gy, s.ghostText, s.theme.lineNumColor, s.theme.bg)
+  s.drawGhostText(endX)
 
   restoreState()
 
