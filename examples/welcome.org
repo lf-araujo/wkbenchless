@@ -51,17 +51,21 @@ Python blocks in order; the second sees =xs= from the first:
 
 * Figures inline
 
-Whole-line image links render inline, right in the buffer -- Emacs org-mode
-style. Use a bracket link (=[[file:figure.bmp]]=) or the Markdown form
-(=![](figure.bmp)=). By default the image shows at its own dimensions; size it
-with a preceding =#+ATTR_ORG: :width N= (aspect ratio is always preserved):
+A block with a =:file= header saves its plot and links it under =#+RESULTS:=,
+and whole-line image links render inline, right in the buffer -- Emacs org-mode
+style. Run this one with =C-c C-c= (it needs R):
 
-#+CAPTION: A figure rendered inline, sized to 460 px wide.
-#+ATTR_ORG: :width 460
-[[file:figure.bmp]]
+#+begin_src R :session demo :results output graphics file :file ~/.cache/wkbenchless/welcome/figure.png :width 640 :height 420
+  plot(mpg ~ wt, data = mtcars, pch = 19, col = "steelblue")
+  abline(lm(mpg ~ wt, data = mtcars), col = "firebrick", lwd = 2)
+#+end_src
+
+Any image link works the same way: =[[file:figure.png]]= or =![](figure.png)=.
+By default the image shows at its own dimensions; size it with a preceding
+=#+ATTR_ORG: :width N= (aspect ratio is always preserved).
 
 Toggle inline rendering any time with =M-x toggle-inline-images=. PNG, JPG and
-friends load via a cached conversion (needs ImageMagick); BMP decodes natively.
+friends load through a cached conversion; BMP loads directly.
 
 * LaTeX previews
 

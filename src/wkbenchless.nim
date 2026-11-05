@@ -691,8 +691,7 @@ proc main() =
     app.docLang = ""
     app.ed.setText(welcomeOrg)
     app.ed.imageDefaultWidth = gInlineImageWidth
-    const exDir = currentSourcePath().parentDir.parentDir / "examples"
-    if dirExists(exDir): app.ed.imageBaseDir = exDir   # so [[file:figure.bmp]] resolves
+    app.ed.setRenderFlag(rfInlineImages)   # for the figure its demo block draws
     app.ed.foldAllPending = true
   app.ed.showLineNumbers = app.ed.lang != langOrg   # on for code/prose; off for org
   app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
