@@ -43,6 +43,7 @@
 
 import uirelays/[coords, screen, input]
 import widgets/theme
+import widgets/langs/markdown
 import std/strutils
 import std/os
 import std/times
@@ -51,8 +52,15 @@ from pixie import nil         # pure-Nim image decode (PNG/JPG/GIF/…); no Imag
                               # Imported qualified: pixie's Color/Image would clash
                               # with the driver's own Color/screen.Image.
 export theme
+export markdown
 
 const
+  BlinkMs* = 500
+    ## How long the caret stays shown, and then hidden. Blinking it is part of
+    ## drawing it and there is no other moment to do it in, so a host that
+    ## decides for itself when to draw has to come back at least this often --
+    ## a caret that has stopped blinking is what a window that has hung looks
+    ## like.
   LinkMod* = when defined(macosx): GuiPressed else: CtrlPressed
 
 # ---------------------------------------------------------------------------
@@ -75,6 +83,11 @@ type
 const
   Letters* = {'a'..'z', 'A'..'Z', '0'..'9', '_', '\128'..'\255'}
   TabWidth = 2
+  MaxViews* = 8
+    ## How many panels may show one buffer at once. Every buffer carries a
+    ## seat for each of them (see `ViewSlot`), so this is a handful of words
+    ## per open file -- and eight windows onto one text is already more than
+    ## a screen can usefully hold.
 
   additionalIndentChars: array[SourceLanguage, set[char]] = [
     langNone: {},
@@ -157,6 +170,10 @@ type
     line: int             ## line number (0-based)
     color: Color          ## color indicator shown in the line number gutter
 
+  RowHighlight = object
+    line: int             ## line number (0-based), -1 for none
+    color: Color          ## background for the whole row, text or no text
+
   EditActionKind* = enum
     noAction,
     ctrlHover,          ## ctrl+mouse move over text
@@ -175,6 +192,49 @@ type
     path: string
     img: Image
 
+  ViewSlot = object
+    ## Where one panel is sitting in this buffer.
+    ##
+    ## A buffer can be shown in more than one place at once -- two panels on
+    ## one file, at different lines -- and what differs between them is only
+    ## this much: where the caret is, what is selected, which line is at the
+    ## top, what the pointer is doing. The text, the undo history, the search
+    ## hits, the font and the colors belong to the buffer and are shared,
+    ## which is what makes two panels on one file worth having in the first
+    ## place -- and is why `Ctrl+plus` in one panel resizes the text in all of
+    ## them. The day that has to be per panel, the font moves in here and the
+    ## public `flags` and `showLineNumbers` fields become setters that write
+    ## every seat; until then a field nothing can intercept must not be one a
+    ## seat carries a stale copy of.
+    ##
+    ## The seats live in the *buffer* and not in whoever draws it, because
+    ## only the buffer knows when the text under them moves: type in one panel
+    ## and the carets of the others are behind the edit as surely as the text
+    ## is, and nobody else is in a position to notice. `noteEdit` moves them.
+    cursor: Natural
+    firstLine, currentLine: Natural
+    firstLineOffset: Natural
+    editLow: int
+    span: int
+    desiredCol: Natural
+    selected: tuple[a, b: int]
+    hotLink: tuple[a, b: int]
+    bracketA, bracketB: int
+    followCaret: bool
+    cursorDim: tuple[x, y, h: int]
+    mouseX, mouseY, clicks: int
+    mouseDragging: bool
+    dragStartPos: int
+    scrollGrabbed: bool
+    scrollGrabOffset: int
+    probeX, probeY: int
+    probeActive: bool
+    probeResult: int
+    closeHover: int
+    stamp: int          ## `cacheId` when this seat was last got up from, so
+                        ## that a panel coming back to a buffer that changed
+                        ## while it was away knows to count its line again
+
   SynEdit* = object
     # Gap buffer
     front, back: seq[Cell]
@@ -182,6 +242,9 @@ type
     # Line tracking
     firstLine*, currentLine*, numberOfLines: Natural
     firstLineOffset: Natural
+    editLow: int                    ## the earliest position edited since
+                                    ## `firstLineOffset` was worked out; see
+                                    ## `syncFirstLine`
     span*: int
     desiredCol: Natural
     # Selection
@@ -197,18 +260,33 @@ type
     boldFont*, italicFont*, boldItalicFont*: Font  ## org emphasis faces
     captionFont*: Font       ## slightly larger face for #+caption lines
     theme*: Theme
+    blinks*: bool        ## Whether the caret blinks. This is about the
+                         ## window and not about this widget: a caret in a
+                         ## window that has not got the keyboard is not
+                         ## waiting for anything, and a host that draws only
+                         ## when its window has changed has to repaint twice
+                         ## a second forever to keep one blinking. True
+                         ## unless a host says otherwise, which is the
+                         ## blinking caret a host that never heard of window
+                         ## focus already expects.
     flags*: set[RenderFlag]
     showLineNumbers*: bool
     readingMargin*: int             ## px side margin for prose lines; code blocks & tables stay full width
     cursorVisible: bool
     lastBlinkTick: int
     cursorDim: tuple[x, y, h: int]
+    followCaret: bool               ## the caret was moved, so the view has to
+                                    ## end up showing it -- see `render`
     # Text
     tabSize*: int
     lang*: SourceLanguage
     changed: bool
     readOnly*: int                  ## -1 = fully editable;
                                     ## >= 0 = positions <= readOnly are protected
+    ansiEnd: int                    ## one past the last position whose color
+                                    ## the *program* that printed it chose --
+                                    ## see `appendOutput` and `highlight`. 0
+                                    ## when nothing here was colored that way.
     # Bracket matching
     bracketA, bracketB: int
     # Underline (set by the app via underline())
@@ -240,6 +318,16 @@ type
     markers: seq[Marker]
     # Line decorations (breakpoints, active execution line, etc.)
     lineDecorations: seq[LineDecoration]
+    # Row highlight -- see setRowHighlight(). One row: a list has one line
+    # that is the current thing, the way it has one cursor.
+    rowHighlight: RowHighlight
+    # The buffer range of the row `render` is painting a band behind, and the
+    # color of that band, so that the per-token backgrounds agree with it.
+    # Set per row while rendering; `(0, -1)` is "no row".
+    activeRow: tuple[a, b: int]
+    activeRowColor: Color
+    activeBand: tuple[x, w: int]  ## how wide that band is, for the rows a
+                                  ## wrapped line continues on
     # Action lines -- see setActionLines()
     actionLines*: int               ## first line whose text is framed as
                                     ## clickable; -1 = none
@@ -258,6 +346,12 @@ type
     ghostText*: string
     # Cache
     offsetToLineCache: array[20, tuple[version, offset, line: int]]
+    # The panels showing this buffer. The one that is drawing or being typed
+    # in has its seat up in the fields above -- that is what keeps the other
+    # 3500 lines of this file from having to know that there is more than one
+    # -- and the rest are sitting here. See `enter`.
+    stowed: array[MaxViews, ViewSlot]
+    slot: int
 
 # ---------------------------------------------------------------------------
 # Public read-only accessors
@@ -274,6 +368,14 @@ proc markSaved*(s: var SynEdit) = s.changed = false
   ## has been consumed by something other than `saveToFile`.
 proc cursor*(s: SynEdit): int {.inline.} = s.cursor.int
 proc cacheId*(s: SynEdit): int {.inline.} = s.cacheId
+proc textVersion*(s: SynEdit): int {.inline.} = s.version
+  ## Bumped by every editing operation. Something that walks the text and
+  ## caches what it found -- a word index, an outline -- compares this against
+  ## the version it last saw to know whether its answer is still current.
+proc cursorRect*(s: SynEdit): tuple[x, y, h: int] {.inline.} = s.cursorDim
+  ## Where the caret was drawn last, in screen coordinates, for a popup that
+  ## wants to sit under it. `h == 0` means the caret was not on screen -- the
+  ## buffer has scrolled away from it, or nothing has been rendered yet.
 proc getFont*(s: SynEdit): Font {.inline.} = s.font
 proc setFont*(s: var SynEdit; f: Font) {.inline.} = s.font = f
 proc setEmphasisFonts*(s: var SynEdit; bold, italic, boldItalic, caption: Font) =
@@ -326,6 +428,11 @@ proc addCellFlags(s: var SynEdit; i: Natural; f: CellFlags) =
 
 proc `[]`*(s: SynEdit; i: Natural): char {.inline.} = s.getCell(i).c
 
+proc tokenClassAt*(s: SynEdit; i: Natural): TokenClass {.inline.} = s.getCell(i).s
+  ## What the highlighter made of the character at `i`. The color it is drawn
+  ## in is `theme.fg` of this, which is what makes a highlighter testable
+  ## without a window: the classes are the output, the colors only a theme.
+
 proc len*(s: SynEdit): int {.inline.} = s.front.len + s.back.len
 
 # ---------------------------------------------------------------------------
@@ -334,23 +441,44 @@ proc len*(s: SynEdit): int {.inline.} = s.front.len + s.back.len
 
 template ones(n: untyped): untyped = ((1 shl n) - 1)
 
+proc leadLen(ch: char): int =
+  ## How many bytes a rune that starts with `ch` announces.
+  if ord(ch) <=% 127: 1
+  elif ord(ch) shr 5 == 0b110: 2
+  elif ord(ch) shr 4 == 0b1110: 3
+  elif ord(ch) shr 3 == 0b11110: 4
+  elif ord(ch) shr 2 == 0b111110: 5
+  elif ord(ch) shr 1 == 0b1111110: 6
+  else: 1
+
 proc graphemeLen(s: SynEdit; i: Natural): Positive =
+  ## Bytes of the rune that starts at `i`. A lead byte only leads a rune when
+  ## the continuation bytes it announces are there: in a Latin-1 file an 'ä'
+  ## is 0xE4, which has the shape of a three byte lead, and taking that at its
+  ## word would walk the cursor over the two characters behind it.
   result = 1
   if i >= s.len: return
-  let ch = s[i]
-  if ord(ch) <=% 127: return
-  elif ord(ch) shr 5 == 0b110: result = 2
-  elif ord(ch) shr 4 == 0b1110: result = 3
-  elif ord(ch) shr 3 == 0b11110: result = 4
-  elif ord(ch) shr 2 == 0b111110: result = 5
-  elif ord(ch) shr 1 == 0b1111110: result = 6
+  let L = leadLen(s[i])
+  if i + L > s.len: return
+  for k in 1 ..< L:
+    if ord(s[i + k]) shr 6 != 0b10: return
+  result = L
 
 proc lastRuneLen(s: SynEdit; last: int): int =
+  ## Bytes of the rune that *ends* at `last` -- so `last` is the last byte of
+  ## it, not the first. A byte that is not part of a well-formed sequence
+  ## stands for itself: a file that is not UTF-8 (a cp1252 dash is 0x97, which
+  ## has the shape of a continuation byte) then loses one byte per keystroke
+  ## instead of taking the character in front of it along.
   if last < 0: return 1
   if ord(s[last]) <= 127: return 1
   var L = 0
-  while last - L >= 0 and ord(s[last - L]) shr 6 == 0b10: inc L
-  result = L + 1
+  while L < 3 and last - L >= 0 and ord(s[last - L]) shr 6 == 0b10: inc L
+  # `last - L` is where the lead byte would be, and it leads this rune only if
+  # it announces exactly the number of bytes that were counted.
+  let lead = last - L
+  if L > 0 and lead >= 0 and s.graphemeLen(lead) == L + 1: L + 1
+  else: 1
 
 # ---------------------------------------------------------------------------
 # Syntax highlighting
@@ -941,13 +1069,82 @@ proc orgNextToken(g: var GeneralTokenizer) =
   g.length = pos - g.pos
   g.pos = pos
 
+proc consoleNextToken(g: var GeneralTokenizer) =
+  ## What a terminal's output is made of, as far as color goes: the word a
+  ## compiler puts in front of a message, the `[Tag]` it puts behind one, and
+  ## the shape of a diff. Ported from nimedit, whose console highlighter this
+  ## is; `git diff` is the most-read output there is, and every line of it
+  ## says with its first character what it is.
+  template fallback() =
+    g.kind = TokenClass.None
+    if pos < g.buf.len: inc pos
+
+  template wholeLine(col) =
+    # Only at the start of a line. A '-' in the middle of one is a minus sign
+    # or half of a word, and there is nothing behind it worth painting red.
+    if pos == 0 or g.buf[pos-1] == '\L':
+      g.kind = col
+      while g.buf[pos] != '\L': inc pos
+    else:
+      fallback()
+
+  var pos = g.pos
+  g.start = g.pos
+  case g.buf[pos]
+  of 'a'..'z', 'A'..'Z', '_', '/', '\\', '\x80'..'\xFF':
+    # A path is a word too: '/', '\' and '.' are taken into it, so a file name
+    # stays one token instead of coming apart into a dozen.
+    var id = ""
+    while g.buf[pos] in Letters + {'/', '\\', ':', '.'}:
+      id.add g.buf[pos].toLowerAscii
+      inc pos
+    case id
+    of "error:", "fatal:": g.kind = TokenClass.Red
+    of "warning:": g.kind = TokenClass.Yellow
+    of "hint:": g.kind = TokenClass.Green
+    else: g.kind = TokenClass.Identifier
+  of '[':
+    # `[Conf]`, `[XDeclaredButNotUsed]`: what the Nim compiler puts at the end
+    # of a message to say which kind of message it was.
+    if pos > 0 and g.buf[pos-1] == ' ' and g.buf[pos+1] in Letters:
+      inc pos
+      let rollback = pos
+      while g.buf[pos] in Letters: inc pos
+      if g.buf[pos] == ']':
+        inc pos
+        g.kind = TokenClass.Rule
+      else:
+        g.kind = TokenClass.None
+        pos = rollback
+    else:
+      fallback()
+  of '+': wholeLine(TokenClass.Green)
+  of '-': wholeLine(TokenClass.Red)
+  of '@':
+    # A hunk header, `@@ -1,4 +1,7 @@`, up to and including its closing '@@'.
+    if g.buf[pos+1] == '@':
+      g.kind = TokenClass.Directive
+      inc pos, 2
+      while g.buf[pos] != '\L':
+        if g.buf[pos] == '@' and g.buf[pos+1] == '@':
+          inc pos, 2
+          break
+        inc pos
+    else:
+      fallback()
+  else:
+    fallback()
+  g.length = pos - g.pos
+  g.pos = pos
+
 proc getNextToken(g: var GeneralTokenizer; lang: SourceLanguage) =
   case lang
-  of langNone, langConsole:
+  of langNone:
     g.start = g.pos
     if g.pos < g.buf.len: inc g.pos
     g.kind = TokenClass.None
     g.length = g.pos - g.start
+  of langConsole: consoleNextToken(g)
   of langNim: nimNextToken(g)
   of langCpp: clikeNextToken(g, cppKeywords)
   of langC: clikeNextToken(g, cKeywords)
@@ -984,6 +1181,87 @@ proc strToLanguage*(s: string): SourceLanguage =
   of "md", "markdown": langMarkdown
   of "r", "rscript": langR
   else: langNone
+
+proc styleMarkdownLink(s: var SynEdit; lineEnd: int; i: var int): bool =
+  ## Style `[label](url)` or `![alt](url)` starting at `i`. Advances `i`.
+  let bang = s[i] == '!' and i + 1 < lineEnd and s[i + 1] == '['
+  let openBracket = if bang: i + 1 else: i
+  if openBracket >= lineEnd or s[openBracket] != '[': return false
+  var j = openBracket + 1
+  while j < lineEnd and s[j] != ']': inc j
+  if j >= lineEnd or j + 1 >= lineEnd or s[j + 1] != '(': return false
+  var k = j + 2
+  while k < lineEnd and s[k] != ')' and s[k] != ' ': inc k
+  var close = k
+  while close < lineEnd and s[close] != ')': inc close
+  if close >= lineEnd: return false
+  if bang:
+    s.setCellStyle(i, TokenClass.Punctuation)
+  s.setCellStyle(openBracket, TokenClass.Punctuation)
+  for p in openBracket + 1 ..< j:
+    s.setCellStyle(p, TokenClass.Link)
+  s.setCellStyle(j, TokenClass.Punctuation)
+  s.setCellStyle(j + 1, TokenClass.Punctuation)
+  for p in j + 2 ..< close:
+    s.setCellStyle(p, TokenClass.Comment)
+  s.setCellStyle(close, TokenClass.Punctuation)
+  i = close + 1
+  result = true
+
+proc styleMarkdownLine(s: var SynEdit; lineStart, lineEnd, last: int) =
+  ## Headings, links, autolinks and inline code -- the bits that make a
+  ## markdown buffer readable without leaving the editor.
+  var i = lineStart
+  while i < lineEnd and s[i] in {' ', '\t'}:
+    s.setCellStyle(i, TokenClass.Whitespace)
+    inc i
+  var hashes = 0
+  var h = i
+  while h < lineEnd and s[h] == '#':
+    inc hashes
+    inc h
+  if hashes in 1 .. 6 and h < lineEnd and s[h] == ' ':
+    for p in i ..< h:
+      s.setCellStyle(p, TokenClass.Punctuation)
+    while h < lineEnd and s[h] == ' ':
+      s.setCellStyle(h, TokenClass.Whitespace)
+      inc h
+    for p in h ..< min(lineEnd, last + 1):
+      s.setCellStyle(p, TokenClass.Keyword)
+    if lineEnd <= last:
+      s.setCellStyle(lineEnd, TokenClass.None)
+    return
+
+  for p in lineStart ..< min(lineEnd, last + 1):
+    s.setCellStyle(p, TokenClass.Text)
+  i = lineStart
+  while i < lineEnd:
+    if s[i] == '`':
+      var j = i + 1
+      while j < lineEnd and s[j] != '`': inc j
+      if j < lineEnd:
+        s.setCellStyle(i, TokenClass.Punctuation)
+        for p in i + 1 ..< j:
+          s.setCellStyle(p, TokenClass.StringLit)
+        s.setCellStyle(j, TokenClass.Punctuation)
+        i = j + 1
+        continue
+    if s[i] == '<' and i + 1 < lineEnd and s[i + 1] notin {' ', '\t', '<'}:
+      var j = i + 1
+      while j < lineEnd and s[j] notin {'>', ' ', '\t'}: inc j
+      if j < lineEnd and s[j] == '>':
+        s.setCellStyle(i, TokenClass.Punctuation)
+        for p in i + 1 ..< j:
+          s.setCellStyle(p, TokenClass.Link)
+        s.setCellStyle(j, TokenClass.Punctuation)
+        i = j + 1
+        continue
+    if s[i] == '[' or (s[i] == '!' and i + 1 < lineEnd and s[i + 1] == '['):
+      if s.styleMarkdownLink(lineEnd, i):
+        continue
+    inc i
+  if lineEnd <= last:
+    s.setCellStyle(lineEnd, TokenClass.None)
 
 proc highlightMarkdown(s: var SynEdit; first, last: int) =
   var insideFence = false
@@ -1038,13 +1316,7 @@ proc highlightMarkdown(s: var SynEdit; first, last: int) =
       if lineEnd <= last:
         s.setCellStyle(lineEnd, TokenClass.None)
     else:
-      var tc = TokenClass.Text
-      if stripped.len > 0 and stripped[0] == '#':
-        tc = TokenClass.Keyword          # Markdown heading (# / ## / ...)
-      for j in lineStart..<min(lineEnd, last+1):
-        s.setCellStyle(j, tc)
-      if lineEnd <= last:
-        s.setCellStyle(lineEnd, TokenClass.None)
+      s.styleMarkdownLine(lineStart, lineEnd, last)
 
     pos = lineEnd + 1
 
@@ -1107,13 +1379,20 @@ proc highlightMarkdown(s: var SynEdit; first, last: int) =
   s.emphCode('`', TokenClass.StringLit, first, last)
 
 proc highlight(s: var SynEdit; first, last: int; initialState: TokenClass) =
+  # Text a program colored itself is not the highlighter's to guess at. Below
+  # `ansiEnd` the classes are the ones the program asked for, and a pass over
+  # them would put back what the shape of the line suggests instead -- which
+  # is what would happen on the next keystroke, since an edit sends the
+  # incremental pass back to the start of the buffer.
+  let a = max(first, s.ansiEnd)
+  if a > last: return
   var g: GeneralTokenizer
   g.buf = addr s
   g.kind = low(TokenClass)
-  g.start = first
+  g.start = a
   g.length = 0
   g.state = initialState
-  g.pos = first
+  g.pos = a
   while g.pos <= last:
     getNextToken(g, s.lang)
     if g.length == 0: break
@@ -1402,6 +1681,22 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       if r.a == f: kept.add f; break
   s.foldedBlocks = kept
 
+proc highlightFrom(s: var SynEdit; pos: Natural) =
+  ## Re-highlight from the start of the line `pos` is in to the end of the
+  ## buffer. What appended output needs: a chunk of it is many lines at once,
+  ## and it may well continue the line the chunk before it ended on.
+  if s.lang == langNone or s.len == 0: return
+  if s.lang == langMarkdown:
+    s.highlightMarkdown(0, s.len - 1)
+    return
+  if s.lang == langOrg:
+    s.highlightOrg(0, s.len - 1)
+    return
+  var first = pos.int
+  while first >= 1 and s[first-1] != '\L': dec first
+  let initialState = if first == 0: TokenClass.None else: s.getCell(first-1).s
+  s.highlight(first, s.len - 1, initialState)
+
 proc highlightEverything(s: var SynEdit) =
   if s.lang == langNone: return
   if s.lang == langMarkdown:
@@ -1438,6 +1733,17 @@ proc highlightIncrementally(s: var SynEdit) =
   else:
     s.highlighter.version = s.version
     s.highlighter.currentlyIndexing = 0
+
+proc setLanguage*(s: var SynEdit; lang: SourceLanguage) =
+  ## Change the language of a buffer that already holds text -- what a
+  ## "save as" under another extension needs. The highlighter is caught up on
+  ## a version of the text and would otherwise keep the previous language's
+  ## colors, so it is put one version behind and walks the buffer again.
+  if s.lang == lang: return
+  s.lang = lang
+  s.highlighter.version = s.version - 1
+  s.highlighter.currentlyIndexing = 0
+  s.highlighter.position = 0
 
 # ---------------------------------------------------------------------------
 # Line offset helpers
@@ -1508,9 +1814,165 @@ proc updateLineCache(s: var SynEdit; offset: int; line: Natural) =
       break
     inc idx
 
+proc setFirstLine(s: var SynEdit; line: int) =
+  ## Put the top of the view on `line` and work out where that line begins.
+  s.firstLine = clamp(line, 0, max(0, s.numberOfLines.int)).Natural
+  s.firstLineOffset = s.getLineOffset(s.firstLine).Natural
+  s.editLow = high(int)
+
+proc shifted(p, at, delta: int): int {.inline.} =
+  ## Where a position that was at `p` ends up once `delta` characters have
+  ## appeared at `at` -- or disappeared from there, when it is negative. A
+  ## position in front of the edit does not move, and one inside a stretch
+  ## that was deleted lands where the stretch was. A negative `p` is one of
+  ## the "there is none" markers and stays one.
+  if p < at or p < 0: p
+  elif delta >= 0: p + delta
+  else: max(at, p + delta)
+
+proc noteEdit(s: var SynEdit; at, delta: int) =
+  ## `delta` characters were inserted at `at`, or removed from there if it is
+  ## negative, so everything behind it has moved.
+  ##
+  ## Unless there is nothing behind it. An edit at the very end of the buffer
+  ## -- which is every character a program prints -- moves nothing that was
+  ## already there, and claiming otherwise is expensive: `syncFirstLine`
+  ## answers the claim by working out where the top line of the view begins
+  ## all over again, and that is a walk from the start of the buffer. A
+  ## `git log -p` of forty thousand lines did nine and a half *billion* bytes
+  ## of walking that way, which is most of the seven seconds it took.
+  ##
+  ## The panels not drawing this buffer at the moment are sitting in `stowed`,
+  ## and the text moved out from under them too. Their carets go with it here,
+  ## because here is the only place that knows: a panel is handed the buffer
+  ## again frames later, with no way of telling what happened to it in the
+  ## meantime. Eight seats is a short loop, and it saves every one of them a
+  ## walk from the top of the buffer to find out.
+  if at >= s.len: return
+  if at < s.editLow: s.editLow = at
+  for j in 0 ..< MaxViews:
+    if j == s.slot: continue
+    template seat: untyped = s.stowed[j]
+    if at < seat.editLow: seat.editLow = at
+    if delta != 0:
+      seat.cursor = Natural(shifted(seat.cursor.int, at, delta))
+      seat.dragStartPos = shifted(seat.dragStartPos, at, delta)
+      seat.selected.a = shifted(seat.selected.a, at, delta)
+      seat.selected.b = shifted(seat.selected.b, at, delta)
+      if seat.selected.b < seat.selected.a: seat.selected = (-1, -1)
+      seat.hotLink.a = shifted(seat.hotLink.a, at, delta)
+      seat.hotLink.b = shifted(seat.hotLink.b, at, delta)
+      if seat.hotLink.b < seat.hotLink.a: seat.hotLink = (-1, -1)
+      # A bracket is matched against the text that was there; the pair is
+      # found again the next time that panel's caret moves.
+      seat.bracketA = -1
+      seat.bracketB = -1
+
+proc syncFirstLine(s: var SynEdit) =
+  ## `firstLine` is a line number and `firstLineOffset` is the position that
+  ## line starts at, and an edit in front of that position moves the text out
+  ## from under it while the number stays right. Nothing says so at the time:
+  ## the edit can be an undo of something far away, or a selection deleted
+  ## from above a view that was scrolled down. Left alone, the view starts in
+  ## the middle of a line and every line after it is counted wrong -- which
+  ## row carries the caret's band, which line a click lands on, what stands in
+  ## the number margin -- so the position is worked out again from the number.
+  ##
+  ## Which costs a walk from the top of the buffer, hence `editLow`: an edit
+  ## behind the position cannot have moved it, and that is where all the
+  ## typing happens, so the walk is for the rare edit that is in front of it.
+  if s.editLow >= s.firstLineOffset.int: return
+  s.setFirstLine(s.firstLine.int)
+
 proc setCurrentLine(s: var SynEdit) =
   s.currentLine = s.getLineFromOffset(s.cursor)
   s.currentLine = clamp(s.currentLine, 0, s.numberOfLines)
+
+# ---------------------------------------------------------------------------
+# Seats. The panel that is drawing the buffer, or being typed into, has its
+# view up in the widget's own fields; the others are stowed. Everything else
+# in this file goes on reading `s.cursor` and `s.firstLine` and never learns
+# that a second panel exists -- which is the point: a document and a view
+# pulled apart into two types would have been the same idea spelled across
+# every proc in three thousand lines.
+# ---------------------------------------------------------------------------
+
+template eachSeatField(s, v, carry: untyped) =
+  ## What belongs to a panel rather than to the buffer, said once. Both
+  ## directions go through this list, so a field cannot be remembered on the
+  ## way out and forgotten on the way back in.
+  carry(s.cursor, v.cursor)
+  carry(s.firstLine, v.firstLine)
+  carry(s.currentLine, v.currentLine)
+  carry(s.firstLineOffset, v.firstLineOffset)
+  carry(s.editLow, v.editLow)
+  carry(s.span, v.span)
+  carry(s.desiredCol, v.desiredCol)
+  carry(s.selected, v.selected)
+  carry(s.hotLink, v.hotLink)
+  carry(s.bracketA, v.bracketA)
+  carry(s.bracketB, v.bracketB)
+  carry(s.followCaret, v.followCaret)
+  carry(s.cursorDim, v.cursorDim)
+  carry(s.mouseX, v.mouseX)
+  carry(s.mouseY, v.mouseY)
+  carry(s.clicks, v.clicks)
+  carry(s.mouseDragging, v.mouseDragging)
+  carry(s.dragStartPos, v.dragStartPos)
+  carry(s.scrollGrabbed, v.scrollGrabbed)
+  carry(s.scrollGrabOffset, v.scrollGrabOffset)
+  carry(s.probeX, v.probeX)
+  carry(s.probeY, v.probeY)
+  carry(s.probeActive, v.probeActive)
+  carry(s.probeResult, v.probeResult)
+  carry(s.closeHover, v.closeHover)
+
+template intoSeat(live, seat: untyped) = seat = live
+template outOfSeat(live, seat: untyped) = live = seat
+
+proc stow(s: var SynEdit) =
+  eachSeatField(s, s.stowed[s.slot], intoSeat)
+  s.stowed[s.slot].stamp = s.cacheId
+
+proc enter*(s: var SynEdit; slot: int) =
+  ## Sit the panel `slot` down in front of this buffer: what it reads and
+  ## types from here on is its own caret and its own top line. Whoever was
+  ## here is put back in their seat first, so nothing of theirs is lost -- and
+  ## nothing of theirs shows in this panel either.
+  ##
+  ## A panel that keeps the same slot number keeps its place in every buffer
+  ## it visits, since the seats are per buffer: leave a file and come back to
+  ## it and the line you were on is still the line you are on.
+  let want = clamp(slot, 0, MaxViews - 1)
+  if want == s.slot: return
+  s.stow()
+  s.slot = want
+  eachSeatField(s, s.stowed[want], outOfSeat)
+  if s.stowed[want].stamp != s.cacheId:
+    # The text moved while this panel was away. Its caret came along with it
+    # (`noteEdit`), but which line that caret is on has to be counted again,
+    # and the top line's offset is worked out at the next render -- `editLow`
+    # was lowered for this seat as well.
+    s.setCurrentLine()
+
+proc copySeat*(s: var SynEdit; src, dest: int) =
+  ## Sit the panel `dest` down exactly where `src` is sitting. What a split
+  ## does: the panel that appears shows what the panel it came out of shows,
+  ## at the same line and with the caret in the same place, and the two of
+  ## them go their own ways from there.
+  let a = clamp(src, 0, MaxViews - 1)
+  let b = clamp(dest, 0, MaxViews - 1)
+  if a == b: return
+  if s.slot == a: s.stow()
+  s.stowed[b] = s.stowed[a]
+  if s.slot == b: eachSeatField(s, s.stowed[b], outOfSeat)
+
+proc resetSeats(s: var SynEdit) =
+  ## Every panel back to the top: whatever they were looking at is gone.
+  var fresh = default(ViewSlot)
+  eachSeatField(s, fresh, intoSeat)
+  fresh.stamp = s.cacheId
+  for j in 0 ..< MaxViews: s.stowed[j] = fresh
 
 # ---------------------------------------------------------------------------
 # Bracket matching
@@ -1518,6 +1980,7 @@ proc setCurrentLine(s: var SynEdit) =
 
 proc cursorMoved(s: var SynEdit) =
   const brackets = {'(', '{', '[', ']', '}', ')'}
+  s.followCaret = true
   s.bracketA = -1
   s.bracketB = -1
   if s[s.cursor] notin brackets: return
@@ -1588,6 +2051,9 @@ proc downFirstLineOffset(s: var SynEdit) =
   s.firstLineOffset = min(i + 1, s.len)
 
 proc scrollLines(s: var SynEdit; amount: int) =
+  # The walk below starts from where the top line begins, so that had better
+  # still be where it begins.
+  s.syncFirstLine()
   let oldFirstLine = s.firstLine
   s.firstLine = clamp(s.firstLine.int + amount, 0, max(0, s.numberOfLines.int - 1)).Natural
   var a = s.firstLine.int - oldFirstLine.int
@@ -1595,6 +2061,44 @@ proc scrollLines(s: var SynEdit; amount: int) =
     while a < 0: s.upFirstLineOffset(); inc a
   elif a > 0:
     while a > 0: s.downFirstLineOffset(); dec a
+
+proc scrollTo*(s: var SynEdit; line: int) =
+  ## Put the top of the view on `line`, clamped to the text. Public for a
+  ## panel whose text is replaced behind the user's back: `setText` puts the
+  ## view back at the top, which is right for a panel that was asked for and
+  ## wrong for one that rebuilt itself because what it lists has changed --
+  ## there the scroll position is what somebody is looking through, and losing
+  ## it is losing their place. Set the caret first: `gotoPos` and `gotoLine`
+  ## move the view to show it, so a scroll set before one of those is undone
+  ## by it.
+  s.setFirstLine(line)
+
+proc centerLine*(s: var SynEdit; line: int) =
+  ## Put `line` halfway down the view and leave the caret alone.
+  ##
+  ## For a list whose lines are things rather than sentences, and where which
+  ## line is *the* one is decided somewhere other than here: the tab list
+  ## follows the editor, so its active row moves without anything in the list
+  ## having been touched. The middle is where a row can be read together with
+  ## the ones on either side of it, which is the point of showing the list at
+  ## all -- the top or the bottom edge shows the row and hides its
+  ## neighbourhood.
+  ##
+  ## Never past the end. A list shorter than the view stays where it is, and
+  ## the last line comes to rest on the bottom row instead of halfway up a
+  ## panel of blanks.
+  if s.span <= 0: return
+  let rows = max(1, s.span - 1)  # the last of `span` rows may be a sliver
+  let count = s.numberOfLines.int + 1  # `getLineCount` is not declared yet
+  s.setFirstLine(clamp(line - rows div 2, 0, max(0, count - rows)))
+
+proc wheelScroll*(s: var SynEdit; delta: int) =
+  ## Scroll by one turn of the mouse wheel: three lines per notch, and the
+  ## sign is the wheel's, so a positive delta scrolls towards the top of the
+  ## text. Public because a wheel event carries only its delta -- an app that
+  ## wants the panel *under the pointer* to scroll, rather than the focused
+  ## one, has to route the event itself, and this is what it routes it to.
+  s.scrollLines(-delta * 3)
 
 proc scroll(s: var SynEdit; amount: int) =
   s.currentLine = (s.currentLine.int + amount).clamp(0, s.numberOfLines.int).Natural
@@ -1628,6 +2132,13 @@ template edit(s: var SynEdit) =
 
 proc rawInsert(s: var SynEdit; c: char) =
   inc s.cacheId
+  # How much longer the buffer is about to get, said before it gets longer:
+  # `noteEdit` reads the length to find out whether anything is behind the
+  # edit at all.
+  s.noteEdit(s.cursor.int, (case c
+                            of '\C': 0
+                            of '\t': s.tabSize
+                            else: 1))
   case c
   of '\L':
     s.front.add Cell(c: '\L')
@@ -1660,19 +2171,25 @@ proc rawBackspace(s: var SynEdit; overrideUtf8: bool; undoAction: var string) =
   inc s.cacheId
   if s.cursor <= 0: return
   var x: int
+  var wasNewline = false
   let ch = s.front[s.cursor - 1].c
   if ch.ord < 128 or overrideUtf8:
     x = 1
     if ch == '\L':
       dec s.numberOfLines
-      s.scroll(-1)
+      wasNewline = true
   else:
     x = s.lastRuneLen(s.cursor - 1)
+  s.noteEdit(s.cursor.int - x, -x)
   if undoAction.len != 0 or true:
     for i in countdown(s.front.len - 1, s.front.len - x):
       undoAction.add s.front[i].c
   s.cursor -= x
   s.front.setLen(s.cursor)
+  # Only now that the character is gone: scrolling reads the buffer to find
+  # out where the top line of the view begins, and until the `setLen` above it
+  # would count the line that is on its way out.
+  if wasNewline: s.scroll(-1)
 
 proc filterForInsert(text: string): string =
   result = newStringOfCap(text.len)
@@ -1744,8 +2261,7 @@ proc gotoPos*(s: var SynEdit; pos: int) =
   if s.currentLine >= s.firstLine + 1 and s.currentLine < s.firstLine + s.span.Natural - 1:
     discard "still in view"
   else:
-    s.firstLine = max(0, s.currentLine.int - (s.span div 2)).Natural
-    s.firstLineOffset = s.getLineOffset(s.firstLine)
+    s.setFirstLine(s.currentLine.int - (s.span div 2))
 
 proc applyUndo(s: var SynEdit; a: Action) =
   let oldCursor = s.cursor
@@ -1993,8 +2509,14 @@ proc pageDown(s: var SynEdit) =
 proc selectAll(s: var SynEdit) =
   s.selected = (0, s.len - 1)
 
-proc deselect(s: var SynEdit) {.inline.} =
+proc deselect*(s: var SynEdit) {.inline.} =
+  ## Drop the selection without touching the text or the caret.
   s.selected.b = -1
+
+proc hasSelection*(s: SynEdit): bool {.inline.} = s.selected.b >= 0
+  ## Whether anything is selected. What a key does can turn on it: Ctrl+C is
+  ## a copy when there is something to copy, and whatever the widget's owner
+  ## makes of it when there is not.
 
 proc getSelectedText*(s: SynEdit): string =
   if s.selected.b < 0: return ""
@@ -2101,6 +2623,44 @@ proc insertText*(s: var SynEdit; text: string) =
   s.insertNoSelect(text, singleUndoOp = true)
   s.cursorMoved()
 
+proc replaceRange*(s: var SynEdit; a, b: int; text: string) =
+  ## Swap the range [a..b] for `text`. The delete and the insert share one
+  ## version, so Ctrl+Z takes the whole replacement back in a single step --
+  ## which is what a search-and-replace wants for every one of its matches.
+  if a < 0 or b >= s.len or a > b: return
+  inc s.version
+  s.selected = (a, b)
+  s.removeSelectedText()
+  if text.len > 0:
+    s.insertNoSelect(text, singleUndoOp = true)
+  s.cursorMoved()
+
+proc getWordPrefix*(s: SynEdit): string =
+  ## The identifier the cursor sits directly behind, "" when it sits behind
+  ## anything else. This is what a completion completes.
+  var i = s.cursor.int
+  while i > 0 and s[i - 1] in Letters: dec i
+  result = newStringOfCap(s.cursor.int - i)
+  for j in i ..< s.cursor.int: result.add s[j]
+
+proc replaceWordPrefix*(s: var SynEdit; word: string) =
+  ## Swap the identifier the cursor sits behind for `word` -- what accepting a
+  ## completion does. Everything this touches shares one `version`, so Ctrl+Z
+  ## takes the completion back in one step instead of one character at a time.
+  let prefix = s.getWordPrefix()
+  if word.len == 0 or word == prefix: return
+  inc s.version
+  s.deselect()
+  # Without this the first backspace would be appended to whatever deletion
+  # came before it -- an action of an older version, which would tear the
+  # group in two.
+  s.actions.setLen(clamp(s.undoIdx + 1, 0, s.actions.len))
+  if s.actions.len > 0 and s.actions[^1].k == dele:
+    s.actions[^1].k = delFinished
+  for i in 0 ..< prefix.len: s.backspaceNoSelect(overrideUtf8 = true)
+  s.insertNoSelect(word, singleUndoOp = true)
+  s.cursorMoved()
+
 proc backspace*(s: var SynEdit; smartIndent: bool) =
   inc s.version
   if s.selected.b < 0:
@@ -2126,7 +2686,10 @@ proc backspace*(s: var SynEdit; smartIndent: bool) =
 proc deleteKey*(s: var SynEdit) =
   if s.selected.b < 0:
     if s.cursor >= s.len: return
-    let L = s.lastRuneLen(s.cursor.int + 1)
+    # Delete eats the rune the caret stands in front of, which is the one that
+    # *begins* here -- `lastRuneLen` answers for a rune that ends at its
+    # argument, and the two only agree for runes of one or two bytes.
+    let L = min(s.graphemeLen(s.cursor), s.len - s.cursor.int)
     s.cursor = (s.cursor.int + L).Natural
     s.setCurrentLine()
     s.backspace(false)
@@ -2158,6 +2721,31 @@ proc insertEnter(s: var SynEdit; smartIndent = true) =
   s.removeSelectedText()
   s.insertNoSelect(toInsert, singleUndoOp = true)
   s.cursorMoved()
+
+proc deleteWordLeft*(s: var SynEdit) =
+  ## Delete the word behind the cursor as one undo step -- Ctrl+Backspace.
+  ## With a selection, just removes the selection, like a plain Backspace.
+  inc s.version
+  if s.hasSelection():
+    s.removeSelectedText()
+  elif s.cursor > 0:
+    s.deselect()
+    s.selectLeft(jump = true)
+    s.removeSelectedText()
+  s.cursorMoved()
+
+proc deleteWordRight*(s: var SynEdit) =
+  ## Delete the word ahead of the cursor as one undo step -- Ctrl+Delete.
+  ## With a selection, just removes the selection, like a plain Delete.
+  inc s.version
+  if s.hasSelection():
+    s.removeSelectedText()
+  elif s.cursor.int < s.len:
+    s.deselect()
+    s.selectRight(jump = true)
+    s.removeSelectedText()
+  s.cursorMoved()
+
 
 proc indent(s: var SynEdit) =
   inc s.version
@@ -2214,13 +2802,50 @@ proc gotoLine*(s: var SynEdit; line, col: int) =
   s.cursor = s.getLineOffset(line).Natural
   s.currentLine = line.Natural
   let span = if s.span > 0: s.span else: 30
-  s.firstLine = max(0, line - (span div 2)).Natural
-  s.firstLineOffset = s.getLineOffset(s.firstLine)
+  s.setFirstLine(line - (span div 2))
   if col > 0:
     var c = 1
     while c <= col and s[s.cursor] != '\L':
       s.rawRight()
       inc c
+
+proc gotoLineBytes*(s: var SynEdit; line, byteCol: int) =
+  ## Like `gotoLine`, except that `byteCol` counts *bytes* into the line rather
+  ## than characters -- which is what a compiler reports, a line info being an
+  ## offset into the bytes it read. The two agree on ASCII and part company on
+  ## a line with a multi-byte rune in front of the column; there the byte count
+  ## is the one that lands where the compiler meant.
+  s.gotoLine(line, 0)
+  var n = byteCol
+  while n > 0 and s.cursor.int < s.len and s[s.cursor] != '\L':
+    let g = s.graphemeLen(s.cursor)
+    if g > n: break
+    dec n, g
+    s.rawRight()
+
+proc lineAndByteCol*(s: SynEdit; pos: int): tuple[line, col: int] =
+  ## Where `pos` is, as a compiler states a position: the line 1-based and the
+  ## column a 0-based count of bytes into it. The inverse of `gotoLineBytes`.
+  let line = s.getLineFromOffset(pos)
+  result = (line.int + 1, pos - s.getLineOffset(line))
+
+proc wordAt*(s: SynEdit; pos: int): tuple[word: string; a, b: int] =
+  ## The identifier `pos` sits in, with the offsets of its first and last
+  ## character. `word` is "" and `a` is -1 when `pos` is not on one -- which is
+  ## what a lookup keyed on a name has to know before it asks anybody.
+  result = ("", -1, -1)
+  if pos < 0 or pos >= s.len or s[pos] notin Letters: return
+  var a = pos
+  while a > 0 and s[a - 1] in Letters: dec a
+  var b = pos
+  while b + 1 < s.len and s[b + 1] in Letters: inc b
+  # A number is not a name: `0xff` must not be looked up, and neither must the
+  # `1` of `x1` be found on its own -- the walk left already covered that.
+  if s[a] in {'0'..'9'}: return
+  result.a = a
+  result.b = b
+  result.word = newStringOfCap(b - a + 1)
+  for j in a .. b: result.word.add s[j]
 
 proc getLineCount*(s: SynEdit): int =
   s.numberOfLines.int + 1
@@ -2261,13 +2886,18 @@ proc deleteLine*(s: var SynEdit) =
   while lineEnd < s.len and s[lineEnd] != '\L': inc lineEnd
   # include the trailing newline if present
   let delEnd = if lineEnd < s.len: lineEnd else: lineEnd - 1
+  # The last line has no newline of its own, so it takes the one in front of
+  # it instead. Otherwise deleting it would leave an empty row where it was,
+  # and a list whose rows are its contents -- the tab list, the history panel
+  # -- would keep a row nothing is behind.
+  let stop = if lineEnd < s.len: lineStart else: max(0, lineStart - 1)
   s.cursor = (delEnd + 1).Natural
   s.setCurrentLine()
   let oldCursor = s.cursor
   s.actions.setLen(clamp(s.undoIdx + 1, 0, s.actions.len))
   s.actions.add(Action(k: delFinished, pos: s.cursor, word: "", version: s.version))
   s.edit()
-  while s.cursor.int > lineStart and s.cursor > 0:
+  while s.cursor.int > stop and s.cursor > 0:
     if s.cursor.int - 1 <= s.readOnly: break
     s.prepareForEdit()
     s.rawBackspace(overrideUtf8 = true, s.actions[^1].word)
@@ -2489,10 +3119,13 @@ proc clear*(s: var SynEdit) =
   s.bracketB = -1
   s.span = 0
   s.firstLineOffset = 0
+  s.editLow = high(int)
   s.readOnly = -1
+  s.ansiEnd = 0
   s.clicks = 0
   s.undoIdx = 0
   s.cursorDim = (0, 0, 0)
+  s.resetSeats()
 
 proc setText*(s: var SynEdit; text: string) =
   s.clear()
@@ -2526,15 +3159,123 @@ proc saveToFile*(s: var SynEdit; filename: string) =
   writeFile(filename, s.fullText)
   s.changed = false
 
-proc appendOutput*(s: var SynEdit; text: string) =
+proc appendOutput*(s: var SynEdit; text: string; highlight = true) =
   ## Append text and mark everything as read-only up to the end.
   ## For terminal/console use: output is protected, user types after it.
+  ##
+  ## `highlight` is for a caller that already knows what color this text is:
+  ## a program that prints escape sequences has *said* what it wants, and the
+  ## highlighter guessing from the shape of the lines would only overrule it.
+  ## Such a caller passes `false`, paints the range itself with
+  ## `setStyleRange`, and says so with `markProgramColored`.
+  ##
+  ## The caret follows the output down only if it was at the end to begin
+  ## with. A caret left further up is a reader's -- somebody is looking at
+  ## what came before, or selecting out of it -- and a program that prints
+  ## while that is going on must not drag them away from it.
+  let stay = s.cursor.int < s.len
+  let oldCursor = s.cursor.int
+  let oldFirstLine = s.firstLine
+  let oldFirstLineOffset = s.firstLineOffset
   s.readOnly = -1
   s.gotoPos(s.len)
   s.prepareForEdit()
+  let start = s.cursor.int
   s.rawInsert(text)
-  s.highlightLine(s.cursor)
+  # Not `highlightLine`: what a program prints arrives in chunks of many lines
+  # at a time, and the last of them is usually the empty one after the final
+  # newline. Highlighting that one line would leave the output colorless --
+  # and appending does not bump `version`, so the incremental pass that walks
+  # the rest of a buffer never comes for this text either.
+  if highlight: s.highlightFrom(start)
   s.readOnly = s.len - 1
+  if stay:
+    s.gotoPos(oldCursor)
+    # What was appended came after every line that was on screen, so where the
+    # view was scrolled to still means the same thing -- and so does where its
+    # top line begins, which is why this pair may be put back as it was.
+    s.firstLine = oldFirstLine
+    s.firstLineOffset = oldFirstLineOffset
+
+proc charSize*(s: SynEdit): tuple[w, h: int] =
+  ## How wide and tall one character is, for a caller that has to think in
+  ## characters rather than pixels -- a terminal telling a program how much
+  ## room it has. Measured on `M`, which in a monospaced family is every
+  ## character, and in one that is not is at least an honest upper bound.
+  (max(1, measureText(s.font, "M").w), max(1, fontLineSkip(s.font)))
+
+proc truncateOutput*(s: var SynEdit; at: int) =
+  ## Drop everything from `at` to the end. What a progress meter needs: it
+  ## draws its line again every time it moves, and the honest way to show that
+  ## is to take the previous drawing back off rather than to leave a hundred
+  ## of them stacked up.
+  ##
+  ## Not an edit anybody can undo -- output is not something the reader typed,
+  ## and a meter would otherwise fill the undo stack at its refresh rate.
+  let at = clamp(at, 0, s.len)
+  if at >= s.len: return
+  inc s.cacheId
+  s.noteEdit(at, at - s.len)
+  s.gotoPos(s.len)
+  s.prepareForEdit()          # which leaves all of it in `front`
+  var removed = 0
+  for i in at ..< s.front.len:
+    if s.front[i].c == '\L': inc removed
+  s.front.setLen at
+  s.cursor = at.Natural
+  s.numberOfLines = Natural(max(0, s.numberOfLines.int - removed))
+  if removed > 0: s.scroll(-removed)
+  if s.ansiEnd > at: s.ansiEnd = at
+  if s.readOnly >= at: s.readOnly = at - 1
+  if s.selected.b >= at or s.selected.a >= at: s.selected = (-1, -1)
+  s.currentLine = s.getLineFromOffset(s.cursor)
+  s.changed = true
+
+proc scrollToOutput*(s: var SynEdit; start: int) =
+  ## Leave the view at the top of what was printed from `start` on, which is
+  ## what a pager does and what the panel stopped doing when the pager was
+  ## taken away: a `git log` that follows its own output down leaves the
+  ## reader at the oldest commit in the repository, having sailed past the one
+  ## they asked about.
+  ##
+  ## Only when there is more of it than fits. Output already on screen needs no
+  ## scrolling, and scrolling it would push it up to make room for nothing.
+  ##
+  ## The caret stays where it is, off the bottom of the view. Moving it is what
+  ## brings the view back down, so the first key typed returns to the prompt.
+  if s.span <= 0: return
+  let start = clamp(start, 0, s.len)
+  let first = s.getLineFromOffset(start).int
+  let last = s.getLineFromOffset(s.len).int
+  if last - first < s.span: return
+  s.setFirstLine(first)
+
+proc revealCaret*(s: var SynEdit) =
+  ## Bring the view back to the caret, with it near the bottom -- which is
+  ## where a prompt is. The counterpart to `scrollToOutput`: having been left
+  ## up at the top of a long piece of output on purpose, the panel needs a way
+  ## back down, and the reader starting to type is it.
+  ##
+  ## Typing does not do this by itself. `render` chases the caret only when
+  ## something said it moved, and inserting a character where the caret
+  ## already is says nothing of the kind -- ordinarily there is no need,
+  ## because the caret was on screen to begin with.
+  if s.span <= 0: return
+  if s.currentLine >= s.firstLine and s.currentLine < s.firstLine + s.span - 1:
+    return
+  s.setFirstLine(s.currentLine.int - (s.span - 2))
+
+proc setStyleRange*(s: var SynEdit; a, b: int; tc: TokenClass) =
+  ## Paint `[a..b]` in one class. For a caller that *knows* the color instead
+  ## of working it out from the text -- which is what reading it out of a
+  ## program's escape sequences amounts to.
+  for i in max(a, 0) .. min(b, s.len - 1): s.setCellStyle(i, tc)
+
+proc markProgramColored*(s: var SynEdit; upTo: int) =
+  ## Everything below `upTo` carries colors that arrived with the text, and
+  ## the highlighter is to keep its hands off them from here on. Output only
+  ## ever grows at the end, so one mark is enough to say it for all of it.
+  if upTo > s.ansiEnd: s.ansiEnd = upTo
 
 proc setLabel*(s: var SynEdit; text: string) =
   ## Set text and make the entire buffer read-only. For labels and status bars.
@@ -2549,14 +3290,19 @@ proc setLabel*(s: var SynEdit; text: string) =
 proc createSynEdit*(font: Font; theme = defaultTheme()): SynEdit =
   result = SynEdit(front: @[], back: @[], actions: @[], cursor: 0,
     selected: (-1, -1), bracketA: -1, bracketB: -1, hotLink: (-1, -1),
-    readOnly: -1, tabSize: TabWidth, lang: langNim,
-    actionLines: -1, closeLines: -1, closeHover: -1,
+    readOnly: -1, tabSize: TabWidth, lang: langNim, editLow: high(int),
+    actionLines: -1, closeLines: -1, closeHover: -1, activeRow: (0, -1),
+    rowHighlight: RowHighlight(line: -1),
     font: font, bigFont: font, theme: theme, flags: {},
-    showLineNumbers: false, cursorVisible: true, lastBlinkTick: 0)
+    showLineNumbers: false, cursorVisible: true, lastBlinkTick: 0,
+    blinks: true)
   # A subtle block tint: nudge the bg toward mid-gray (works on dark and light).
   proc nudge(v: uint8): uint8 =
     (if v.int < 128: min(255, v.int + 12) else: max(0, v.int - 12)).uint8
   result.srcBlockBg = color(nudge(theme.bg.r), nudge(theme.bg.g), nudge(theme.bg.b))
+  # Every seat starts where the first panel does, so a panel that has never
+  # been here yet arrives at the top of the buffer rather than in a hole.
+  result.resetSeats()
 
 # ---------------------------------------------------------------------------
 # Drawing
@@ -2575,7 +3321,7 @@ proc hexDigitValue(c: char): int {.inline.} =
 proc isHexDigit(c: char): bool {.inline.} =
   c in {'0'..'9', 'a'..'f', 'A'..'F'}
 
-proc tryParseHexColor(text: string; start: int; c: var Color; consumed: var int): bool =
+proc tryParseHexColor(text: openArray[char]; start: int; c: var Color; consumed: var int): bool =
   ## Parse #RGB/#RRGGBB/#RRGGBBAA from text[start..].
   if start < 0 or start >= text.len or text[start] != '#':
     return
@@ -2663,7 +3409,21 @@ proc toLoadableBmp(src: string): string =
     discard
   result = ""
 
+proc canDrawImages(): bool =
+  ## Whether this backend has the three image relays. They are optional and
+  ## they go together -- a backend that cannot load a picture cannot draw or
+  ## free one either -- and an optional relay nobody filled in is a nil proc,
+  ## so asking it for the picture is a segfault and not an empty answer. The
+  ## X11 driver fills in none of the three, which makes this the ordinary case
+  ## on Linux rather than a corner of one.
+  drawRelays.loadImage != nil and drawRelays.drawImage != nil and
+    drawRelays.freeImage != nil
+
 proc getCachedImage(s: var SynEdit; path: string): Image =
+  ## `Image(0)` when there is no way to load one; the caller draws its
+  ## placeholder for exactly that. Nothing reaches the cache in that case, so
+  ## `clear` never has an image to free that it could not free.
+  if not canDrawImages(): return Image(0)
   for e in s.imageCache:
     if e.path == path:
       return e.img
@@ -2860,6 +3620,46 @@ proc scanImageAttrs(s: SynEdit; lineStart: int; w, h: var int) =
   if orgW > 0: w = orgW                  # ATTR_ORG overrides other backends
   if orgH > 0: h = orgH
 
+proc extractMarkdownLink*(s: SynEdit; pos: int): tuple[url: string; a, b: int] =
+  ## Buffer-position variant of `findMarkdownLinkAt`.
+  result = ("", -1, -1)
+  if pos < 0 or pos >= s.len: return
+  var lineStart = pos
+  while lineStart > 0 and s[lineStart - 1] != '\L': dec lineStart
+  var lineEnd = pos
+  while lineEnd < s.len and s[lineEnd] != '\L': inc lineEnd
+  var line = newStringOfCap(lineEnd - lineStart)
+  for p in lineStart ..< lineEnd: line.add s[p]
+  let hit = findMarkdownLinkAt(line, pos - lineStart)
+  if hit.a < 0: return
+  result = (hit.url, lineStart + hit.a, lineStart + hit.b)
+
+proc gotoMarkdownHeading*(s: var SynEdit; fragment: string): bool =
+  ## Jump to the first ATX heading whose slug matches `fragment`.
+  let want = markdownHeadingSlug(fragment)
+  if want.len == 0: return false
+  var i = 0
+  var lineNo = 0
+  while i <= s.len:
+    let lineStart = i
+    while i < s.len and s[i] != '\L': inc i
+    var j = lineStart
+    while j < i and s[j] in {' ', '\t'}: inc j
+    var hashes = 0
+    while j < i and s[j] == '#':
+      inc hashes
+      inc j
+    if hashes in 1 .. 6 and j < i and s[j] == ' ':
+      while j < i and s[j] == ' ': inc j
+      var title = ""
+      for p in j ..< i: title.add s[p]
+      if markdownHeadingSlug(title) == want:
+        s.gotoLine(lineNo + 1, 0)
+        return true
+    if i >= s.len: break
+    inc i
+    inc lineNo
+
 proc renderMarkdownImageLine(
     s: var SynEdit; lineStart: int; dim: var Rect;
     endX, endY, lineH: int; showCursor: bool;
@@ -2937,8 +3737,14 @@ proc renderMarkdownImageLine(
 
   let dst = rect(dim.x, dim.y + 1, tw, th)
   if img != Image(0):
-    let src = rect(0, 0, iw, ih)
-    drawImage(img, src, dst)
+    # The source rectangle is in the picture's own pixels, so "all of it" is
+    # its own size -- not the size of the hole it is going into, which is a
+    # different rectangle that happens to also be a rectangle. A driver that
+    # cannot say how big a picture is gets asked the old way and answers by
+    # cropping, which is at least a picture.
+    let srcRect = if iw > 0 and ih > 0: rect(0, 0, iw, ih)
+                  else: rect(0, 0, dst.w, dst.h)
+    drawImage(img, srcRect, dst)
   else:
     fillRect(dst, color(52, 56, 64))
     drawLine(dst.x, dst.y, dst.x + dst.w - 1, dst.y + dst.h - 1, color(140, 146, 172))
@@ -2969,11 +3775,32 @@ proc spaceForLines(s: SynEdit): int =
   else:
     result = 0
 
+proc padX(s: SynEdit): int {.inline.} = max(2, fontLineSkip(s.font) div 3)
+  ## The gap between the text and the left and right edge of the widget.
+proc padY(s: SynEdit): int {.inline.} = max(1, fontLineSkip(s.font) div 6)
+  ## The same above the first row. Both come out of the line height rather
+  ## than out of a constant, so they follow the font size and the display
+  ## scale without anybody having to remember to scale them.
+
+proc onActiveRow(s: SynEdit): bool {.inline.} = s.activeRow.b == high(int)
+  ## Whether the line being drawn is the one carrying the `activeLineBg` band.
+
+proc caretWidth(s: SynEdit): int {.inline.} = max(2, fontLineSkip(s.font) div 6)
+  ## How wide the caret bar is drawn. Out of the line height like the padding,
+  ## so it keeps its weight against the text at every font size and on every
+  ## display scale instead of thinning out to a hairline on a dense one.
+
+proc padding*(s: SynEdit): tuple[x, y: int] {.inline.} = (s.padX, s.padY)
+  ## What `render` keeps free between the text and the edges of the rect it is
+  ## given. A caller that sizes a box around a known number of lines -- the
+  ## completion listing does -- has to add it, or the last line falls outside.
+
 proc getBg(s: SynEdit; i: int): Color =
   if i <= s.selected.b and s.selected.a <= i: return s.theme.selBg
   if i == s.bracketA or i == s.bracketB: return s.theme.bracketBg
   for m in s.markers:
     if m.a <= i and i <= m.b: return m.color
+  if s.activeRow.a <= i and i <= s.activeRow.b: return s.activeRowColor
   for r in s.srcBlockRanges:
     if i in r: return s.srcBlockBg
   return s.theme.bg
@@ -2994,6 +3821,19 @@ proc addMarker*(s: var SynEdit; a, b: int; color: Color) =
 proc clearMarkers*(s: var SynEdit) =
   ## Remove all markers.
   s.markers.setLen 0
+
+proc setRowHighlight*(s: var SynEdit; line: int; color: Color) =
+  ## Paint the whole row of `line` in `color` -- the width of the widget, not
+  ## the width of its text. This is what says "this line is the one" in a list
+  ## whose lines are things rather than sentences: a marker would stop where
+  ## the name does and leave the rest of the row looking like every other.
+  ## The cursor's own band is drawn the same way and wins where they meet.
+  ## There is one such row, as there is one cursor; `line = -1` is none.
+  s.rowHighlight = RowHighlight(line: line, color: color)
+
+proc clearRowHighlight*(s: var SynEdit) =
+  ## Take the row highlight away again.
+  s.rowHighlight.line = -1
 
 # ---------------------------------------------------------------------------
 # Line decorations -- gutter indicators (breakpoints, active line, etc.)
@@ -3050,6 +3890,9 @@ proc drawFrame(r: Rect; color: Color) =
 
 const
   CharBufSize = 80
+  Ellipsis = "\xE2\x80\xA6"
+    ## Written at both ends of a break, so a line that had to be wrapped is
+    ## not read as two lines that were always there.
 
 type
   DrawBuf = object
@@ -3061,13 +3904,20 @@ type
     font: Font
     oldX, maxY, lineH, spaceWidth: int
     lineNoWrap: bool          ## this row draws past the edge (clipped) not wrapped
+    startedWith: int              ## where the line being drawn begins
     chars: array[CharBufSize, char]
     toCursor: array[CharBufSize, int]
 
-proc drawSubtoken(db: var DrawBuf; ra, rb: int; fg, bg: Color) =
+proc drawSubtoken(db: var DrawBuf; ra, rb: int; fg, bg: Color;
+                  ext: TextExtent) =
+  ## `ext` is what `measureText` said about `db.chars[ra..rb]`. The caller has
+  ## measured it already -- it had to, to know whether the run fits on the row
+  ## -- and the same run used to be measured here as well and a third time in
+  ## the driver, to size the background it fills. That is three walks over the
+  ## glyphs of every token on the screen, per frame; this way there is one,
+  ## and `drawText` passes the answer on to the driver.
   db.tempStr.setLen 0
   for k in ra..rb: db.tempStr.add db.chars[k]
-  let ext = measureText(db.font, db.tempStr)
   var d = db.dim
   d.w = ext.w
   d.h = ext.h
@@ -3128,83 +3978,190 @@ proc drawSubtoken(db: var DrawBuf; ra, rb: int; fg, bg: Color) =
   discard drawText(db.font, d.x, d.y, db.tempStr, fgColor, bg)
   if isLink:
     let ulY = d.y + db.lineH - 1
-    drawLine(d.x, ulY, d.x + textWidth(db.font, db.tempStr), ulY, fgColor)
-  if rfColorLiterals in db.s[].flags:
-    var idx = 0
-    while idx < db.tempStr.len:
-      if db.tempStr[idx] == '#':
-        var chipColor: Color
-        var consumed = 0
-        if tryParseHexColor(db.tempStr, idx, chipColor, consumed):
-          var prefix = ""
-          if idx > 0:
-            prefix = db.tempStr[0 ..< idx]
-          let prefixW = textWidth(db.font, prefix)
-          let chipToken = db.tempStr[idx ..< idx + consumed]
-          let tokenW = textWidth(db.font, chipToken)
-          let chipSize = max(6, db.lineH - 6)
-          let chipX = d.x + prefixW + tokenW + 2
-          let chipY = d.y + (db.lineH - chipSize) div 2
-          if chipX + chipSize <= db.dim.w:
-            fillRect(rect(chipX, chipY, chipSize, chipSize), chipColor)
-            drawLine(chipX, chipY, chipX + chipSize, chipY, color(30, 30, 30))
-            drawLine(chipX, chipY, chipX, chipY + chipSize, color(30, 30, 30))
-            drawLine(chipX + chipSize, chipY, chipX + chipSize, chipY + chipSize, color(30, 30, 30))
-            drawLine(chipX, chipY + chipSize, chipX + chipSize, chipY + chipSize, color(30, 30, 30))
-          break
-      inc idx
+    drawLine(d.x, ulY, d.x + ext.w, ulY, fgColor)
 
-proc drawToken(db: var DrawBuf; fg, bg: Color) =
-  if db.dim.y + db.lineH > db.maxY: return
+proc runExtent(db: var DrawBuf; first, last: int): TextExtent =
+  ## How much room `db.chars[first..last]` takes, nothing for an empty range.
+  if first > last: return TextExtent()
   db.tempStr.setLen 0
-  for k in 0 ..< db.charsLen: db.tempStr.add db.chars[k]
-  let ext = measureText(db.font, db.tempStr)
-  let w = ext.w
-  if db.lineNoWrap or db.dim.x + w + db.spaceWidth <= db.dim.w:
-    # A no-wrap (table) row draws the whole run; render() clips to the pane so
-    # overflow past the right edge is hidden rather than wrapped.
-    drawSubtoken(db, 0, db.charsLen - 1, fg, bg)
-    db.dim.x += w
+  for k in first..last: db.tempStr.add db.chars[k]
+  result = measureText(db.font, db.tempStr)
+
+proc runWidth(db: var DrawBuf; first, last: int): int =
+  ## How wide `db.chars[first..last]` comes out. For the search for a place to
+  ## wrap, which asks about width alone and about ranges it will not draw.
+  db.runExtent(first, last).w
+
+proc markerWidth(db: DrawBuf; start: int): int =
+  ## How wide what introduces a Markdown line is -- quote marks, a bullet, a
+  ## number -- counted in columns from `start`. Prose has none, and gets 0.
+  var i = start
+  while db.s[][i] == '>':
+    inc i
+    if db.s[][i] == ' ': inc i
+  if db.s[][i] in {'-', '*', '+'} and db.s[][i + 1] in {' ', '\t'}:
+    inc i
   else:
-    # wrapping: just draw what fits, then continue on next line. Width is
-    # monotonic in length, so binary-search the longest prefix that fits --
-    # the old linear scan rebuilt the string for every probe (O(n^2) on long
-    # lines, e.g. a .bib abstract), which froze the app.
-    var ra = 0
-    while ra < db.charsLen:
-      # Build the longest prefix that fits, one char at a time (so we don't
-      # rebuild the string for every probe -- O(n^2) on long lines like a .bib
-      # abstract). Width is monotonic, so the first char that overflows ends
-      # the segment, matching the original linear scan's wrap points exactly.
-      db.tempStr.setLen 0
-      var probe = ra
-      while probe < db.charsLen:
-        db.tempStr.add db.chars[probe]
-        if db.dim.x + db.spaceWidth + textWidth(db.font, db.tempStr) > db.dim.w:
-          db.tempStr.setLen db.tempStr.len - 1   # drop the char that overflowed
-          break
-        inc probe
-      if probe <= ra:
-        # Not even one char fits in what is left of this row (the token starts
-        # right at the edge). Wrap to the next row and retry instead of giving
-        # up: a bare `break` here dropped the rest of the token and left dim.x
-        # at the edge, so every later token on the line failed the same way and
-        # the rest of the paragraph silently vanished until a resize moved the
-        # wrap points. Only stop when the row is already empty (pane narrower
-        # than one glyph), which would otherwise loop forever.
-        if db.dim.x <= db.oldX: break
-        db.dim.x = db.oldX
-        db.dim.y += db.lineH
-        if db.dim.y + db.lineH > db.maxY: break
-        continue
-      let ext2 = textWidth(db.font, db.tempStr)
-      drawSubtoken(db, ra, probe - 1, fg, bg)
-      db.dim.x += ext2
-      ra = probe
-      if ra < db.charsLen:
-        db.dim.x = db.oldX
-        db.dim.y += db.lineH
-        if db.dim.y + db.lineH > db.maxY: break
+    var j = i
+    while db.s[][j] in {'0'..'9'}: inc j
+    if j > i and db.s[][j] in {'.', ')'} and db.s[][j + 1] in {' ', '\t'}:
+      i = j + 1
+  result = i - start
+  while db.s[][i] in {' ', '\t'}:
+    inc result, (if db.s[][i] == '\t': db.s[].tabSize else: 1)
+    inc i
+
+proc indentWidth(db: DrawBuf): int =
+  ## How far the continuation of a wrapped line is pushed in: past the line's
+  ## own indentation, and past the bracket or the comma that opens what is
+  ## being continued. A console has neither -- what a shell prints is not
+  ## indented code -- so there the continuation starts at the left edge.
+  var i = db.startedWith
+  var r = 0
+  while db.s[][i] in {'\t', ' '}:
+    if db.s[][i] == '\t': inc r, db.s[].tabSize
+    else: inc r
+    inc i
+  if db.s[].lang in {langMarkdown, langOrg}:
+    # Prose is not code: a comma or a bracket in the middle of a sentence
+    # opens nothing, and lining the rest of the sentence up behind it would
+    # push it in by an amount that has no meaning. A wrapped line keeps the
+    # indentation it started with, and an item of a list keeps the hanging
+    # indentation its bullet or its number asks for.
+    inc r, db.markerWidth(i)
+  elif r > 0:
+    inc r, db.s[].tabSize
+  elif db.s[].lang notin {langNone, langConsole}:
+    while true:
+      case db.s[][i]
+      of '(', '{', '[', ',', ';':
+        r = i - db.startedWith
+        break
+      of '\L': break
+      else: inc i
+  result = db.spaceWidth * r
+
+proc smartWrap(db: DrawBuf; ra, last: int; critical: bool): int =
+  ## Where to break a run that does not fit: at the edge of a word, so a name
+  ## does not come apart in the middle if it does not have to. `critical` is
+  ## the second attempt at the same run -- by then anywhere will do, or a run
+  ## without an edge in it would never be drawn at all. Answers `ra - 1` when
+  ## there is nothing good to be had, which moves the whole run down a row.
+  var p = last
+  while p > ra:
+    if (db.chars[p] in Letters) != (db.chars[p + 1] in Letters):
+      return p
+    dec p
+  if not critical: return ra - 1
+  # Anywhere, but not inside a rune: a row that ended in half of one would
+  # show a box, and so would the row that got the other half.
+  result = last
+  while result >= ra and (db.chars[result + 1].ord and 0xC0) == 0x80:
+    dec result
+
+proc drawRun(db: var DrawBuf; a, b: int; fg, bg: Color) =
+  ## Draw `db.chars[a..b]` at the current position, wrapping if it does not fit.
+  if a > b: return
+  let ext = db.runExtent(a, b)
+  if db.lineNoWrap or db.dim.x + ext.w + db.spaceWidth <= db.dim.w:
+    # The common case by far: it still fits. A no-wrap (table) row always takes
+    # this path; render clips it to the pane instead of wrapping it.
+    drawSubtoken(db, a, b, fg, bg, ext)
+    db.dim.x += ext.w
+    return
+  var ra = a
+  var critical = false
+  while ra <= b:
+    # The last character that still fits in what is left of the row, or
+    # `ra - 1` when not even the first one does.
+    # Grown a character at a time: rebuilding the run for every probe is
+    # quadratic, which froze the app on long lines such as a .bib abstract.
+    var last = ra - 1
+    db.tempStr.setLen 0
+    while last < b:
+      db.tempStr.add db.chars[last + 1]
+      if db.dim.x + db.spaceWidth + textWidth(db.font, db.tempStr) > db.dim.w:
+        break
+      inc last
+    let wrapping = last < b
+    if wrapping: last = db.smartWrap(ra, last, critical)
+    if last >= ra:
+      let part = db.runExtent(ra, last)
+      drawSubtoken(db, ra, last, fg, bg, part)
+      db.dim.x += part.w
+      ra = last + 1
+      critical = false
+    else:
+      # This row got nothing: whatever the next one has room for goes on it,
+      # word or no word, or the two of them would trade the run forever.
+      critical = true
+    if not wrapping: break
+    let marked = db.s[].lang notin {langMarkdown, langOrg}   # prose wraps silently
+    if marked:
+      db.dim.x += drawText(db.font, db.dim.x, db.dim.y, Ellipsis, fg, bg).w
+    db.dim.x = db.oldX
+    db.dim.y += db.lineH
+    if db.dim.y + db.lineH > db.maxY: break
+    # A wrapped line is one line, so its band goes on across the rows it
+    # is wrapped onto. `render` cannot paint them: it does not know how
+    # many there will be until the text has been laid out here.
+    if db.s[].onActiveRow:
+      fillRect(rect(db.s[].activeBand.x, db.dim.y, db.s[].activeBand.w,
+                    db.lineH), db.s[].activeRowColor)
+    db.dim.x += min(db.indentWidth, (db.dim.w - db.oldX) div 2)
+    if marked:
+      db.dim.x += drawText(db.font, db.dim.x, db.dim.y, Ellipsis, fg, bg).w
+
+proc drawColorChip(db: var DrawBuf; c: Color): int =
+  ## Draw the chip at the current position, return the width it occupies.
+  let chipSize = max(6, db.lineH - 6)
+  let x = db.dim.x + 2
+  let y = db.dim.y + (db.lineH - chipSize) div 2
+  if x + chipSize + 2 > db.dim.w: return 0
+  fillRect(rect(x, y, chipSize, chipSize), c)
+  drawLine(x, y, x + chipSize, y, color(30, 30, 30))
+  drawLine(x, y, x, y + chipSize, color(30, 30, 30))
+  drawLine(x + chipSize, y, x + chipSize, y + chipSize, color(30, 30, 30))
+  drawLine(x, y + chipSize, x + chipSize, y + chipSize, color(30, 30, 30))
+  result = chipSize + 4
+
+proc drawToken(db: var DrawBuf; tc: TokenClass; fg, bg: Color) =
+  if db.dim.y + db.lineH > db.maxY: return
+  # The face the theme asks for, for this token class only: `styledFont` opens
+  # it the first time it is needed and hands back the same handle afterwards,
+  # so this costs a lookup per token, not an open. A family without the face
+  # gives the upright font back, and the token is simply drawn plain.
+  # Styled from the font already chosen for this run, and put back afterwards:
+  # the caller picks it per run (fontForFlags, heading and caption sizes).
+  let runFont = db.font
+  defer: db.font = runFont
+  db.font = styledFont(runFont, db.s[].theme.style[tc])
+  if rfColorLiterals notin db.s[].flags:
+    db.drawRun(0, db.charsLen - 1, fg, bg)
+    return
+  # A color chip is drawn right behind its literal, so the token is split into
+  # runs at every literal and the rest of the text is shifted to the right.
+  # Anything else either covers the character following the literal or puts
+  # the chip far away from it, at the end of the token.
+  var runStart = 0
+  var idx = 0
+  while idx < db.charsLen:
+    var chipColor: Color
+    var consumed = 0
+    if db.chars[idx] == '#' and
+       tryParseHexColor(db.chars.toOpenArray(0, db.charsLen - 1), idx,
+                        chipColor, consumed):
+      var last = idx + consumed - 1
+      # keep the closing quote of `"#RRGGBB"` with the literal
+      if last + 1 < db.charsLen and db.chars[last + 1] in {'"', '\''}:
+        inc last
+      db.drawRun(runStart, last, fg, bg)
+      db.dim.x += db.drawColorChip(chipColor)
+      runStart = last + 1
+      idx = last + 1
+    else:
+      inc idx
+  db.drawRun(runStart, db.charsLen - 1, fg, bg)
 
 proc isTableLine(s: SynEdit; i: int): bool =
   ## org table rows (start with '|' after leading whitespace) don't wrap; they
@@ -3267,6 +4224,7 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
   db.font = fontForFlags(s, styleFlags, baseFont)
   db.s = addr s
   db.i = i
+  db.startedWith = i
   db.lineH = fontLineSkip(baseFont)
   db.spaceWidth = textWidth(baseFont, " ")
   db.tempStr = ""
@@ -3280,32 +4238,35 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
           db.chars[db.charsLen] = '\0'
           db.toCursor[db.charsLen] = db.i
           if db.charsLen >= 1 and cfHidden notin styleFlags:
-            db.drawToken(s.theme.fg[tokenClass], styleBg)
+            db.drawToken(tokenClass, s.theme.fg[tokenClass], styleBg)
           elif db.i == s.cursor.int:
             db.cursorDim = db.dim
           # mouse click past end of line
-          if s.clicks > 0 and s.mouseX > dim.x and
+          if s.clicks > 0 and s.mouseX >= dim.x and
              db.dim.y + db.lineH > s.mouseY and s.mouseY >= db.dim.y:
             s.cursor = db.i.Natural
             s.setCurrentLine()
             s.clicks = 0
             s.cursorMoved()
+            if s.mouseDragging:
+              if s.dragStartPos < 0:
+                s.dragStartPos = s.cursor.int
+              else:
+                let a = min(s.dragStartPos, s.cursor.int)
+                let b = max(s.dragStartPos, s.cursor.int)
+                if a == b: s.selected = (a, -1)
+                else: s.selected = (a, b - 1)
           break outerLoop
         if cell.s != tokenClass or s.getBg(db.i) != styleBg or cell.f != styleFlags:
           break
         elif db.charsLen == high(db.chars):
-          # Buffer full: flush, but never split a multi-byte UTF-8 rune across
-          # the flush boundary. If the next byte is a continuation byte
-          # (0b10xxxxxx), the buffer currently ends mid-rune -- pop that rune's
-          # bytes back off and re-read them in the next chunk, so every drawn
-          # token is valid UTF-8. Otherwise measureText/drawText mis-size the
-          # run and later text on the line is drawn over it (appears hidden
-          # until a selection re-render reveals it).
-          if (cell.c.ord and 0xC0) == 0x80:
-            while db.charsLen > 0 and (db.chars[db.charsLen - 1].ord and 0xC0) == 0x80:
-              dec db.charsLen; dec db.i
-            if db.charsLen > 0:
-              dec db.charsLen; dec db.i     # drop the rune's lead byte too
+          # The buffer is full. Give back the bytes of a rune that did not
+          # fit in it whole, or this token would end in half of one and the
+          # next would start with the other half -- two boxes where one
+          # character belongs.
+          while db.charsLen > 0 and (s[db.i].ord and 0xC0) == 0x80:
+            dec db.charsLen
+            dec db.i
           break
         if cell.c == '\t':
           # expand tab
@@ -3338,7 +4299,7 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
       db.toCursor[db.charsLen] = db.i
       if db.charsLen >= 1:
         if cfHidden notin styleFlags:
-          db.drawToken(s.theme.fg[tokenClass], styleBg)
+          db.drawToken(tokenClass, s.theme.fg[tokenClass], styleBg)
         tokenClass = s.getCell(db.i).s
         styleBg = s.getBg(db.i)
         styleFlags = s.getCell(db.i).f
@@ -3349,7 +4310,8 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
   dim.x = db.oldX
   if db.cursorDim.h > 0:
     if blink:
-      fillRect(rect(db.cursorDim.x, db.cursorDim.y, 2, db.lineH), s.theme.cursorColor)
+      fillRect(rect(db.cursorDim.x, db.cursorDim.y, s.caretWidth, db.lineH),
+               s.theme.cursorColor)
     s.cursorDim = (db.cursorDim.x, db.cursorDim.y, db.lineH)
   result = db.i + 1
 
@@ -3404,9 +4366,9 @@ proc closeButtonHit(s: SynEdit; area: Rect; x, y: int): int =
   let lineH = fontLineSkip(s.font)
   if lineH <= 0: return
   let endX = area.x + area.w -
-             (if s.scrollEnabled: ScrollBarWidth else: 0) - 1
+             (if s.scrollEnabled: ScrollBarWidth else: 0) - 1 - s.padX
   if x < endX - s.closeButtonWidth or x > endX: return
-  let line = s.firstLine.int + (y - area.y) div lineH
+  let line = s.firstLine.int + max(0, y - area.y - s.padY) div lineH
   if line < s.closeLines or line >= s.getLineCount(): return
   if s.getLineText(line).len == 0: return   # an empty line has no button
   result = line
@@ -3452,8 +4414,10 @@ proc isCaptionLine(s: SynEdit; i: int): bool =
     t.add s[j]; inc j
   t.strip(leading = true, trailing = false).toLowerAscii.startsWith("#+caption")
 
-proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
-  ## Core rendering. Paints the buffer, optionally with a blinking cursor.
+proc renderPass(s: var SynEdit; area: Rect; showCursor: bool) =
+  ## One pass over the visible lines. `render` is what callers want: this
+  ## draws with `firstLine` as it stands and reports, through `cursorDim`,
+  ## whether the caret was among what it drew.
   let lineH = fontLineSkip(s.font)
   let hasScrollBar = s.scrollEnabled
 
@@ -3462,9 +4426,17 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
     s.foldAllBlocks(); s.foldAllPending = false
 
   s.cursorDim.h = 0
+  let px = s.padX
+  let py = s.padY
   let endY = area.y + area.h - 1
-  let endX = area.x + area.w - (if hasScrollBar: ScrollBarWidth else: 0) - 1
+  # `edgeX` is the widget's own inner edge, `endX` where the text has to stop:
+  # the scrollbar and the (x) buttons live against the first, everything that
+  # is read against the second.
+  let edgeX = area.x + area.w - (if hasScrollBar: ScrollBarWidth else: 0) - 1
+  let endX = edgeX - px
   var dim = area
+  dim.x = area.x + px
+  dim.y = area.y + py
   dim.w = endX
   dim.h = endY
 
@@ -3474,17 +4446,19 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
 
   let spl = s.spaceForLines()
   if s.showLineNumbers:
-    dim.x = area.x + spl + 4
+    dim.x = area.x + px + spl + 4
   let baseX = dim.x       # left of text (after gutter); reading margin adds to this
   let fullEndX = endX     # full right edge; code blocks & tables use it, prose insets
 
-  # Keep the top-of-viewport byte offset consistent with firstLine on every
-  # frame. firstLineOffset can drift from firstLine after an edit shifts byte
-  # offsets or a byte-walked scroll, which mis-starts the draw and looks like
-  # broken text wrapping until a window resize re-derives the viewport. Deriving
-  # it here (getLineOffset is cacheId-keyed, so this is cheap) makes every redraw
-  # self-correct.
-  s.firstLineOffset = s.getLineOffset(s.firstLine).Natural
+  # A click in the padding belongs to the row and the column next to it. The
+  # hit test is the drawn rectangle of each token, and the padding is by
+  # definition outside all of them, so without this the click would miss
+  # everything and fall through to the end of the buffer below.
+  if s.clicks > 0:
+    s.mouseX = max(s.mouseX, dim.x)
+    s.mouseY = max(s.mouseY, dim.y)
+
+  s.syncFirstLine()
   var renderLine = s.firstLine
   var i = s.firstLineOffset.int
   s.span = 0
@@ -3492,9 +4466,21 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
   let fontSize = lineH
 
   var blink = false
-  if showCursor and s.readOnly < s.cursor.int:
+  if showCursor:
+    # Wherever it stands, including in text that cannot be edited: a caret
+    # that is not drawn cannot be moved with the arrow keys, and read-only
+    # text is still walked through and selected like any other.
     let ticks = getTicks()
-    if ticks - s.lastBlinkTick > 500:
+    if not s.blinks:
+      # A window nobody is typing in. The caret stays -- it is still where the
+      # next keystroke will go once somebody comes back to it -- but it stops
+      # moving, because a blink is a thing that asks to be looked at and there
+      # is nothing here to look at yet. The clock is kept wound as it waits,
+      # so what comes back with the focus is a whole lit phase and not the
+      # tail end of one.
+      s.cursorVisible = true
+      s.lastBlinkTick = ticks
+    elif ticks - s.lastBlinkTick > BlinkMs:
       s.cursorVisible = not s.cursorVisible
       s.lastBlinkTick = ticks
     blink = s.cursorVisible
@@ -3508,18 +4494,42 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
       let lm = if wide: 0 else: s.readingMargin
       dim.x = baseX + lm
       dim.w = fullEndX - lm
+    let thisLine = renderLine.int
+    # Two things want a band across the whole row: a row highlight the app has
+    # set, and -- while this widget has the focus -- the line the caret is on.
+    # A panel nobody is typing in has no current line worth pointing at, and
+    # six panels each pointing at one would say nothing about where the next
+    # keystroke goes; a row highlight is about the list, so it stays either way.
+    var rowBg = s.theme.bg
+    var banded = false
+    if s.rowHighlight.line == thisLine:
+      rowBg = s.rowHighlight.color
+      banded = true
+    if showCursor and thisLine == s.currentLine.int:
+      rowBg = s.theme.activeLineBg
+      banded = true
+    if banded:
+      s.activeBand = (area.x, edgeX - area.x + 1)
+      s.activeRowColor = rowBg
+      fillRect(rect(s.activeBand.x, dim.y, s.activeBand.w, lineH), rowBg)
+      # The text is drawn with a background of its own behind every glyph, so
+      # `getBg` has to answer with the band as well -- otherwise the row comes
+      # out as words in rectangles of `bg` sitting on top of it.
+      s.activeRow = (i, high(int))
+    else:
+      s.activeRow = (0, -1)
     if s.showLineNumbers:
       let num = $(renderLine + 1)
       var numColor = if renderLine == s.currentLine: s.theme.fg[TokenClass.None]
                      else: s.theme.lineNumColor
-      var numBg = s.theme.bg
+      var numBg = if banded: rowBg else: s.theme.bg
       for ld in s.lineDecorations:
         if ld.line == renderLine.int:
           # Draw a thin vertical bar on the left edge instead of a square.
           # This matches standard editors (VS Code, etc.) and avoids jagged edges.
           fillRect(rect(area.x, dim.y, 3, lineH), ld.color)
           break
-      discard drawText(s.font, area.x + 2, dim.y, num, numColor, numBg)
+      discard drawText(s.font, area.x + px, dim.y, num, numColor, numBg)
 
     var nextI = i
     var consumedRows = 1
@@ -3530,7 +4540,6 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
         renderLine = (renderLine.int + consumedRows).Natural
         continue
 
-    let thisLine = renderLine.int
     let actionLine = s.actionLines >= 0 and thisLine >= s.actionLines
     let closeLine = s.closeLines >= 0 and thisLine >= s.closeLines
     let lineY = dim.y
@@ -3581,10 +4590,11 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
           # The frame outlines the whole row, so the row reads as one target
           # -- and drawing it last puts its edges over the button's fill.
           # lineH - 1 keeps consecutive frames from sharing an edge.
-          drawFrame(rect(area.x, lineY, endX - area.x + 1, lineH - 1),
+          drawFrame(rect(area.x + 1, lineY, edgeX - area.x - 1, lineH - 1),
                     s.theme.actionColor)
     inc s.span, consumedRows
     inc renderLine
+  s.activeRow = (0, -1)
 
   while dim.y + fontSize < endY:
     inc dim.y, lineH
@@ -3621,6 +4631,60 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
       discard drawText(s.font, gx, gy, s.ghostText, s.theme.lineNumColor, s.theme.bg)
 
   restoreState()
+
+proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
+  ## Core rendering. Paints the buffer, optionally with a blinking cursor.
+  ##
+  ## A line too long for the widget is wrapped onto as many rows as it needs,
+  ## and how many that is is only known once it has been drawn -- so the caret
+  ## can turn out to sit on a row past the bottom edge, which counting lines
+  ## beforehand would never have caught. When it does, and something moved it
+  ## there, the view follows it down and the frame is painted again. The wheel
+  ## asks for the opposite, so scrolling the caret out of sight still works.
+  if not showCursor:
+    # A widget nobody is typing in shows no caret and chases none. Whatever
+    # moved it is still owed a look, once the widget has the focus back.
+    s.renderPass(area, showCursor)
+    return
+  let moved = s.followCaret
+  s.followCaret = false
+  s.renderPass(area, showCursor)
+  if s.cursorDim.h > 0:
+    s.followCaret = false
+    return
+  if s.followCaret:
+    # The pass moved the caret itself -- a click in the text does that -- so
+    # what it measured is where the caret used to be. Ask again before going
+    # anywhere.
+    s.followCaret = false
+    s.renderPass(area, showCursor)
+    if s.cursorDim.h > 0: return
+  elif not moved:
+    return
+  if s.currentLine < s.firstLine:
+    # Above the view -- an edit made with the caret scrolled off the top does
+    # that. One line at a time would be a walk of unknown length, and there is
+    # nothing above the caret worth keeping in sight, so its line goes to the
+    # top in one step.
+    s.setFirstLine(s.currentLine.int)
+    s.renderPass(area, showCursor)
+    return
+  if s.firstLine >= s.currentLine: return
+  let oldFirst = s.firstLine
+  let oldOffset = s.firstLineOffset
+  # The caret's own line at the top of the view is as far as scrolling down
+  # can help. If it is still not on screen there, the widget is shorter than
+  # the line the caret is on, and the view goes back to where it was rather
+  # than ending up somewhere nobody asked for.
+  var guard = max(1, s.span)
+  while s.cursorDim.h == 0 and s.firstLine < s.currentLine and guard > 0:
+    dec guard
+    s.scrollLines(1)
+    s.renderPass(area, showCursor)
+  if s.cursorDim.h == 0:
+    s.firstLine = oldFirst
+    s.firstLineOffset = oldOffset
+    s.renderPass(area, showCursor)
 
 proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
   ## Per-frame entry point. When focused, processes input and shows cursor.
@@ -3684,9 +4748,11 @@ proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
       of KeyPageDown:
         s.deselect(); s.pageDown()
       of KeyBackspace:
-        s.backspace(smartIndent = not ctrl)
+        if ctrl: s.deleteWordLeft()
+        else: s.backspace(smartIndent = true)
       of KeyDelete:
-        s.deleteKey()
+        if ctrl: s.deleteWordRight()
+        else: s.deleteKey()
       of KeyEnter:
         s.insertEnter(smartIndent = true)
       of KeyTab:
@@ -3764,6 +4830,10 @@ proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
     else:
       s.probeActive = false
       s.probeResult = -1
+    if s.mouseDragging:
+      s.mouseX = e.x
+      s.mouseY = e.y
+      s.clicks = 1
     if s.scrollGrabbed and hasScrollBar:
       let trackH = float(area.h - 2)
       let totalLines = s.numberOfLines.int + s.span
@@ -3778,6 +4848,8 @@ proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
         s.scrollLines(target - s.firstLine.int)
 
   of MouseWheelEvent:
+    # Without the pointer's position in the event this is the best a widget can
+    # do on its own; `wheelScroll` is how a host routes it by hover instead.
     if focused:
       s.scrollLines(-e.wheelLines)
 

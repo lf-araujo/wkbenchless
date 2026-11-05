@@ -8,6 +8,11 @@ type
     r*, g*, b*, a*: uint8
 
   Font* = distinct int    ## opaque handle; 0 = invalid
+  FontStyle* {.pure.} = enum
+    bold, italics
+  FontStyles* = set[FontStyle]
+    ## From uirelays 0.11, for synedit's theme. Honoring them needs its FontRelays
+    ## change in every driver, so `styledFont` below is a pass-through until then.
   Image* = distinct int   ## opaque handle; 0 = invalid
 
   TextExtent* = object
@@ -69,6 +74,9 @@ type
       ## Optional: drivers that predate it leave it nil (wrapper returns (0,0)).
 
 proc `==`*(a, b: Font): bool {.borrow.}
+
+proc styledFont*(f: Font; style: FontStyles): Font {.inline.} = f
+  ## See `FontStyles`: the upright face. wkbenchless styles text with `fontForFlags`.
 proc `==`*(a, b: Image): bool {.borrow.}
 
 var windowRelays* = WindowRelays(
