@@ -25,6 +25,11 @@ when defined(linux) and not defined(wkbX11) and
     echo "wkbenchless: Nim " & NimVersion & " < 2.4 -- building the CPU X11 " &
          "driver; use Nim >= 2.4 for GPU rendering (or -d:wkbX11 to silence this)"
 
+## Matter (TextMate grammars, pure Nim) highlights R blocks; see src/wkbmatter.nim.
+## `-d:wkbNoMatter` leaves SynEdit's own tokenizers.
+when not defined(wkbNoMatter):
+  switch("define", "wkbMatter")
+
 ## nim-tuntox (the sibling checkout of github.com/lf-araujo/nim-tuntox) is the
 ## in-process Tox tunnel behind extensions/tox_collab.nim. A released build
 ## would `requires "nim-tuntox"` instead of this path. Its toxcore binding

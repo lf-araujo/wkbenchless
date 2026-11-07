@@ -1,6 +1,6 @@
 ## wkbmatter -- Matter (TextMate grammars, pure Nim) as SynEdit's code styler.
 ##
-## Optional: build with `-d:wkbMatter` and `matter` on the path. It only adds an
+## On by default (config.nims); `-d:wkbNoMatter` leaves it out. It only adds an
 ## entry to an editor's `markdownLangs`, so languages without a grammar here, and
 ## every build without the flag, keep SynEdit's own tokenizers.
 ##

@@ -12,7 +12,7 @@ bin           = @["wkbenchless"]   # `wkbenchless ctl <verb>` drives a running e
 requires "nim >= 2.0.0"
 requires "pixie == 6.1.0"   # inline image decode (was vendored; never edited locally)
 requires "checksums"        # sha1/md5, extracted out of the stdlib (std/sha1, std/md5 deprecated)
-# TextMate highlighting for R blocks, compiled in with -d:wkbMatter (src/wkbmatter.nim).
+# TextMate highlighting for R blocks (src/wkbmatter.nim); -d:wkbNoMatter leaves it out.
 requires "https://github.com/elcritch/matter >= 0.6.2"
 requires "https://github.com/fox0430/reni >= 0.2.0"
 requires "unicodedb >= 0.14.1"
