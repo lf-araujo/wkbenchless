@@ -13,9 +13,10 @@ background service, no Electron.
 
 Written in Nim on [[https://github.com/nim-lang/uirelays][uirelays]] (custom
 rendering, no GTK/Qt), so it targets Linux/macOS/Windows. Your configuration is
-*plain Nim compiled into the binary* — commands are Nim procs, keybindings,
-languages, and themes are data, and ~C-c r~ recompiles and restarts /in place/,
-*without dropping your running sessions or terminals*.
+*plain Nim* — commands are Nim procs; keybindings, languages, and themes are
+data. ~C-c r~ reloads an interpreted config instantly, and ~M-x rebuild~
+recompiles the app and restarts /in place/, *without dropping your running
+sessions or terminals*.
 
 * Features
 
@@ -76,7 +77,7 @@ Needs the Nim toolchain. On Linux, wkbenchless renders on the GPU by default:
 Wayland session, X11 otherwise. That needs *Nim >= 2.4* and
 ~nimble install figdraw siwin~ (a current nimble; it fetches Nim 2.4 itself if a
 dependency asks for it). Built with an older Nim, or with ~-d:wkbX11~, it uses
-the CPU X11 driver instead (~libX11~ + ~libXft~). ~C-c r~ in a GPU build rebuilds
+the CPU X11 driver instead (~libX11~ + ~libXft~). ~M-x rebuild~ in a GPU build rebuilds
 with nimble's Nim >= 2.4 when the ~nim~ on PATH is older. macOS uses the native
 Cocoa backend, Windows the winapi one.
 
@@ -92,15 +93,57 @@ Prebuilt binaries for Linux/macOS are attached to each
 
 * Configuration
 
-Edit ~~/.config/wkbenchless/wkbconfig.nim~ (~M-x edit-config~ / ~C-c f~) —
-ordinary Nim with full access to the editor model. The complete default keymap,
-the languages, and the themes all live there, so everything is in one place.
-The first ~C-c f~ creates it from the default ~src/wkbconfig.nim~; whenever it
-exists, builds compile it /in place of/ the default (~config.nims~), so a
-~nimble install~ed binary is configurable too. Apply changes with ~C-c r~
-(recompile & restart — your open sessions and terminals survive the reload).
+There are two config files, each with its own way to apply changes:
+
+| File                                  | Runs as               | Apply with                   | Reaches                                |
+|---------------------------------------+-----------------------+------------------------------+----------------------------------------|
+| ~~/.config/wkbenchless/config.nims~   | Interpreted (Nim VM)  | ~C-c r~ / ~M-x reload-config~ | The host API in ~src/wkbhost.nim~      |
+| ~~/.config/wkbenchless/wkbconfig.nim~ | Compiled into the app | ~M-x rebuild~                | The whole editor model (~App~)         |
+
+*Interpreted config.* ~M-x edit-config~ (~C-c f~) opens it, creating it from a
+template the first time. It handles keybindings, remote methods, settings,
+themes, and commands and hooks written as Nim procs. ~C-c r~ applies it in the
+running editor in a fraction of a second, with no compiler needed, and sessions
+carry on. A reload starts again from the compiled config, so deleting a line
+undoes it (except ~addExecPath~ and ~applyTheme~, which last until the next
+restart or theme change). If the file has an error, the status bar shows it with
+its line number, and the previous config stays active.
+
+#+begin_src nim
+import wkbhost
+import std/strutils
+
+defineRemoteMethod("gpu", "env SHELL=/bin/sh qsub -I -q gpu -l ncpus=8")
+setOpt("gRemoteLaunchTimeout", 600)
+
+proc shoutFileName*() =              # exported, so the host can call it
+  status(currentFile().toUpperAscii)
+defcommand("shout-file-name", "Show the file name in capitals", "shoutFileName")
+bindkey("C-c d", "shout-file-name")
+#+end_src
+
+Pure stdlib modules work (~strutils~, ~sequtils~, ~tables~, ...). Modules that call
+native code do not (~std/os~, ~std/times~): the host API has ~envVar~ and
+~formatNow~ instead. The config runs on the editor's main thread, so a loop that
+never ends freezes the editor. Calling ~quit~ is reported as a config error.
+~WKB_VM_CONFIG=<file>~ points elsewhere.
+
+*Compiled config.* ~M-x edit-compiled-config~ opens ordinary Nim with full access
+to the editor model. The complete default keymap, the languages, and the themes
+all live there. The first use creates it from the default ~src/wkbconfig.nim~;
+whenever it exists, builds compile it /in place of/ the default (~config.nims~),
+so a ~nimble install~ed binary is configurable too. Apply changes with
+~M-x rebuild~ (recompile & restart — your open sessions and terminals survive).
 ~WKB_USER_CONFIG=<file>~ points elsewhere; ~nimble release~ ignores it
 (~WKB_NO_USER_CONFIG=1~) so a shared binary carries the default config.
+
+*Building the VM.* The VM needs Nim's compiler sources, including their ~dist/~
+directory, at build time only. Official Nim installs have them. Otherwise, as
+with Homebrew's Nim, the build fetches the matching source tarball once into
+~~/.cache/wkbenchless/nim-src~ (~WKB_NIM_SRC=<dir>~ overrides this). With no
+sources, or with ~WKB_NO_VM_CONFIG=1~, the build still works and config changes
+go through ~M-x rebuild~. The stdlib the VM needs is embedded in the binary,
+which adds about 10 MB.
 
 #+begin_src nim
 proc configure*(app: var App) =
@@ -115,7 +158,7 @@ Sessions and terminals inherit a PATH seeded from your *login shell*
 (~$SHELL -lc~), so they find R / python / latex even when launched from a GUI;
 add more with ~addExecPath~.
 
-~C-c r~ needs a Nim + C compiler. To work without a system toolchain, bundle one
+~M-x rebuild~ needs a Nim + C compiler (~C-c r~ does not). To work without a system toolchain, bundle one
 next to the binary: ~nimble bundle -- /path/to/zig~ (see
 ~scripts/bundle-toolchain.sh~); Nim uses ~zig cc~ as a hermetic C backend.
 

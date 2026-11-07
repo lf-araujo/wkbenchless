@@ -208,7 +208,7 @@ var
   gHooks*: Table[string, seq[Hook]]       ## event name -> hooks
   gObjectsQuery*: Table[string, string]   ## langId -> code listing the env
   gHelpQuery*: Table[string, string]      ## langId -> code, {word} substituted
-  gRebuildCmd*: string                    ## shell command C-c r runs to rebuild
+  gRebuildCmd*: string                    ## shell command M-x rebuild runs
   gLspServers*: Table[string, string]     ## langId -> server command (argv, space-split)
   gThemes*: seq[AppTheme]                 ## themes the config registers (palette picks one)
   gExtraPaths*: seq[string]               ## dirs to prepend to PATH (config; ~ ok)
@@ -3803,7 +3803,7 @@ proc babelExecuteBufferCmd*(app: var App) =
   discard babelExecuteBuffer(app)
 
 proc detectRebuildCmd*(): string =
-  ## The command C-c r runs to rebuild wkbenchless. Prefer a toolchain bundled under
+  ## The command M-x rebuild runs. Prefer a toolchain bundled under
   ## <appdir>/toolchain so hot-reload needs no system compiler: a Nim under
   ## toolchain/nim/bin (it finds its own stdlib beside it) and, if present, zig
   ## as the hermetic C backend (single binary, ships its own libc, cross-
@@ -4007,6 +4007,8 @@ proc execReload*(app: var App) =
     app.reloadPending = false
 
 const defaultConfigSrc = staticRead("wkbconfig.nim")   ## seeds the user config
+const defaultVmConfigSrc = staticRead("vmconfig_default.nims")  ## seeds config.nims
+var gVmReload*: proc(app: var App): string  ## reload config.nims (set by wkbvmconfig)
 
 proc userConfigPath*(): string =
   ## The user's config, compiled in place of src/wkbconfig.nim when it exists
@@ -4015,8 +4017,14 @@ proc userConfigPath*(): string =
   if env.len > 0: expandTilde(env)
   else: getConfigDir() / "wkbenchless" / "wkbconfig.nim"
 
-proc editConfig*(app: var App) =
-  ## Open the config in the editor (edit, then reload-config / C-c r). Looks in
+proc userVmConfigPath*(): string =
+  ## The interpreted config: ~/.config/wkbenchless/config.nims, or WKB_VM_CONFIG.
+  let env = getEnv("WKB_VM_CONFIG")
+  if env.len > 0: expandTilde(env)
+  else: getConfigDir() / "wkbenchless" / "config.nims"
+
+proc editCompiledConfig*(app: var App) =
+  ## Open the compiled config (edit, then M-x rebuild). Looks in
   ## ~/.config/wkbenchless first, seeding it on first use from the source tree's
   ## src/wkbconfig.nim (else the default built into this binary); falls back to
   ## the source tree's own file if the config dir can't be written.
@@ -4036,11 +4044,34 @@ proc editConfig*(app: var App) =
   app.ed.lang = fileExtToLanguage(".nim")
   app.ed.loadFromFile(p)
   app.docLang = "nim"
-  app.msg = note & "editing config -- reload with C-c r (or M-x reload-config)"
+  app.msg = note & "editing compiled config -- apply with M-x rebuild"
+
+proc editConfig*(app: var App) =
+  ## Open the interpreted config, seeding it on first use. A build without the
+  ## VM has no interpreted config, so this opens the compiled one instead.
+  if gVmReload == nil: editCompiledConfig(app); return
+  if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
+  let p = userVmConfigPath()
+  var note = ""
+  if not fileExists(p):
+    try:
+      createDir(p.parentDir)
+      writeFile(p, defaultVmConfigSrc)
+      note = "created " & p & " -- "
+    except OSError, IOError:
+      app.msg = "could not create " & p; return
+  app.filePath = p
+  app.ed.lang = fileExtToLanguage(".nim")
+  app.ed.loadFromFile(p)
+  app.docLang = "nim"
+  app.msg = note & "editing config -- apply with C-c r (M-x reload-config)"
 
 proc reloadConfig*(app: var App) =
-  ## Rebuild (recompiling wkbconfig.nim into the binary) and restart.
-  recompileConfig(app)
+  ## Apply config.nims in the running editor: no rebuild, no restart.
+  if gVmReload == nil:
+    app.msg = "reload-config: this build has no VM -- use M-x rebuild"
+  else:
+    app.msg = gVmReload(app)
 
 # -- terminal / panel ------------------------------------------------------
 var gTerminalDir*: string   ## config override for the terminal cwd ("" = auto)
@@ -4329,7 +4360,7 @@ proc registerBuiltins*() =
   gRepls["r"] = rSpec
   gRepls["python"] = pySpec
   gRepls["bash"] = bashSpec
-  gRebuildCmd = detectRebuildCmd()   # config may override before first C-c r
+  gRebuildCmd = detectRebuildCmd()   # config may override before first rebuild
 
   gLspServers["nim"] = "nimlangserver"
   gLspServers["python"] = "pylsp"
@@ -4431,7 +4462,8 @@ proc registerBuiltins*() =
                openTerminal(app, cmd, kind = tkAgent))
   defcommand("show-panel", "Show the bottom panel", showPanel)
   defcommand("toggle-panel", "Show/hide the bottom panel", togglePanel)
-  defcommand("recompile", "Recompile config & restart", recompileConfig)
+  defcommand("rebuild", "Rebuild the app & restart", recompileConfig)
+  defcommand("recompile", "Rebuild the app & restart (same as rebuild)", recompileConfig)
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)
   defcommand("complete", "LSP: complete at cursor", lspComplete)
@@ -4443,8 +4475,17 @@ proc registerBuiltins*() =
   defcommand("src-edit-session", "Src-edit: tangle this session's blocks", srcEditSession)
   defcommand("focus-next", "Focus next pane", focusNext)
   defcommand("switch-session", "Switch to next session", switchSession)
-  defcommand("edit-config", "Edit config file", editConfig)
-  defcommand("reload-config", "Reload config (recompile & restart)", reloadConfig)
+  defcommand("edit-config", "Edit config (interpreted, config.nims)", editConfig)
+  defcommand("edit-compiled-config", "Edit compiled config (wkbconfig.nim)", editCompiledConfig)
+  defcommand("reload-config", "Reload config (no rebuild, no restart)", reloadConfig)
+  registerCtlVerb("reload-config", "-- apply config.nims (no rebuild, no restart)",
+    proc(app: var App; args: seq[string]; body: string): string =
+      reloadConfig(app)
+      app.msg)
+  registerCtlVerb("rebuild", "-- rebuild the app and restart (sessions preserved)",
+    proc(app: var App; args: seq[string]; body: string): string =
+      recompileConfig(app)
+      app.msg)
   # The full keymap lives in wkbconfig.nim so every binding is visible and
   # editable in one place (M-x edit-config, then C-c r). These two are a
   # recovery net kept here: a config that removes its binds can still open the

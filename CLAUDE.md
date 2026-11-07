@@ -116,8 +116,12 @@ active buffer (the client sends the new file's path).
 
 ## Run any editor command / reload
 - `wkbctl command <name>` — run any `M-x` command.
-- `wkbctl command recompile` — after editing wkbenchless's own source, rebuild &
-  hot-reload the running instance (sessions and terminals are preserved).
+- `wkbctl reload-config` — apply `~/.config/wkbenchless/config.nims` in the
+  running editor (no rebuild, no restart). Prints the outcome, including any
+  config error with its line number.
+- `wkbctl rebuild` — after editing wkbenchless's own source or the compiled
+  `wkbconfig.nim`, rebuild & hot-reload the running instance (sessions and
+  terminals are preserved). `recompile` is the same command under its old name.
 
 ## Building this project
 ```sh
@@ -127,5 +131,5 @@ nim c --hints:off -o:wkbctl src/wkbctl.nim             # the control CLI
 # prints a note and builds the CPU X11 driver (-d:wkbX11 forces that).
 ```
 Extensions live in `extensions/*.nim` (each `proc extend*(app: var App)`), are
-compiled in on `C-c r`, and filenames must be valid Nim identifiers (use `_`).
+compiled in on `M-x rebuild`, and filenames must be valid Nim identifiers (use `_`).
 Windows is cross-checked with mingw (see the harness memory).

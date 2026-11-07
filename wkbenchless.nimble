@@ -16,6 +16,7 @@ requires "checksums"        # sha1/md5, extracted out of the stdlib (std/sha1, s
 requires "https://github.com/elcritch/matter >= 0.6.2"
 requires "https://github.com/fox0430/reni >= 0.2.0"
 requires "unicodedb >= 0.14.1"
+requires "https://github.com/lf-araujo/nim-tuntox"  # the Tox tunnel; only built where pkg-config finds c-toxcore
 # uirelays is vendored in src/vendor/uirelays (patched for inline images), so
 # there is no external UI dependency to fetch -- config.nims puts it on the path.
 when defined(linux):

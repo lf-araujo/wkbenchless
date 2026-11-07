@@ -112,6 +112,7 @@ org document.
 - =M-x= (or =C-p=) opens the command palette -- every command is there.
 - =C-s= saves. This is a scratch buffer, so pass a path on the command line
   (=wkbenchless file.org=) to save to a real file.
-- Your whole configuration is plain Nim in =src/wkbconfig.nim= -- open it with
-  =C-c f=, add a =bindkey=, =defcommand=, or =registerRepl=, then =C-c r= to
-  recompile and restart in place. The full keymap lives there.
+- Your configuration is plain Nim. =C-c f= opens =config.nims=: add a =bindkey=
+  or =defcommand=, then =C-c r= applies it at once, with no restart. For deep
+  changes, =M-x edit-compiled-config= opens =wkbconfig.nim=, where the full keymap
+  lives, and =M-x rebuild= recompiles and restarts in place.

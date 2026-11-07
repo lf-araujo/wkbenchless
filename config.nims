@@ -35,7 +35,7 @@ when not defined(wkbNoMatter):
 ## would `requires "nim-tuntox"` instead of this path. Its toxcore binding
 ## asks pkg-config for c-toxcore at compile time, so make the usual installs
 ## visible even when the shell that launched the editor didn't export
-## PKG_CONFIG_PATH (C-c r's rebuild re-execs the compiler in-process).
+## PKG_CONFIG_PATH (M-x rebuild re-execs the compiler in-process).
 ## The checkout is found at $WKB_TUNTOX_DIR, beside this one, or as an
 ## installed nimble package (`nimble install` in nim-tuntox -> ~/.nimble/pkgs2/
 ## tuntox-*). The last one is what keeps the tunnel in builds that run away from
@@ -103,7 +103,7 @@ when not defined(wkbNoTox):
 ## User config: ~/.config/wkbenchless/wkbconfig.nim (XDG_CONFIG_HOME, or
 ## %APPDATA% on Windows) is compiled in place of src/wkbconfig.nim when it exists,
 ## so a nimble-installed build can be configured without touching its package
-## dir. M-x edit-config (C-c f) seeds it from the default; C-c r rebuilds with it.
+## dir. M-x edit-compiled-config seeds it from the default; M-x rebuild compiles it.
 ## WKB_USER_CONFIG=<file> overrides the location; WKB_NO_USER_CONFIG=1 skips it
 ## (`nimble release` sets that, so a shared binary carries the default config).
 block:
@@ -116,6 +116,35 @@ block:
     if base.len > 0: userCfg = base & "/wkbenchless/wkbconfig.nim"
   if getEnv("WKB_NO_USER_CONFIG").len == 0 and userCfg.len > 0 and fileExists(userCfg):
     switch("define", "wkbUserConfig=" & userCfg)
+
+## Interpreted config (M-x reload-config): wkbvmconfig.nim embeds Nim's VM, which
+## needs the compiler sources, including their dist/ directory. That directory
+## is not in Nim's git repo, so `requires "compiler"` cannot supply it. Official
+## installs have it, but Homebrew's strips it, so a missing copy is fetched once
+## from the matching source tarball and cached. WKB_NIM_SRC=<dir> overrides this.
+## With no sources the build still succeeds: config changes then go through
+## M-x rebuild. WKB_NO_VM_CONFIG=1 opts out.
+block:
+  proc hasCompilerSrc(dir: string): bool =
+    fileExists(dir & "/compiler/nimeval.nim") and dirExists(dir & "/dist/checksums")
+  if getEnv("WKB_NO_VM_CONFIG").len == 0:
+    var nimSrc = getEnv("WKB_NIM_SRC")
+    if nimSrc.len == 0: nimSrc = getCurrentCompilerExe().parentDir.parentDir
+    if not hasCompilerSrc(nimSrc) and not defined(windows) and getEnv("WKB_NIM_SRC").len == 0:
+      nimSrc = getEnv("HOME") & "/.cache/wkbenchless/nim-src/" & NimVersion
+      if not hasCompilerSrc(nimSrc):
+        echo "note: fetching Nim " & NimVersion & " compiler sources for the interpreted config"
+        let tmp = nimSrc & ".tmp"
+        discard gorgeEx("rm -rf '" & tmp & "' '" & nimSrc & "' && mkdir -p '" & tmp &
+          "' && curl -fsSL -m 300 https://nim-lang.org/download/nim-" & NimVersion &
+          ".tar.xz | tar -xJ -C '" & tmp & "' --strip-components=1 nim-" & NimVersion &
+          "/compiler nim-" & NimVersion & "/dist && mv '" & tmp & "' '" & nimSrc & "'")
+    if hasCompilerSrc(nimSrc):
+      switch("path", nimSrc)
+      switch("define", "wkbVmConfig")
+    else:
+      echo "note: no Nim compiler sources at " & nimSrc &
+        "; building without the interpreted config (set WKB_NIM_SRC)"
 
 ## zippy (pure-Nim zip, dependency-free) vendored in-tree -- the org-tracked
 ## extension uses it to embed the canonical .org into the exported .docx as a
@@ -130,7 +159,7 @@ switch("path", "src/vendor/zippy")
 ## to be self-contained and was never edited locally. synedit's toLoadableBmp
 ## reads with pixie and writes a 24-bit BMP the drivers already decode (no
 ## ImageMagick shell-out). Nimble's pkgs dir goes on the path so plain `nim c`
-## (and C-c r's rebuild, which does not go through nimble) still resolve pixie
+## (and M-x rebuild, which does not go through nimble) still resolve pixie
 ## after one `nimble install`; a toolchain bundled by `nimble bundle` carries
 ## its own copy under toolchain/nim-pkgs (scripts/bundle-toolchain.sh).
 ## NB: use a literal "/" here, not the `/` os-path operator -- under a cross

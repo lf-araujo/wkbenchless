@@ -1,5 +1,5 @@
 ## Example wkbenchless extension. Copy this file, rename it, and edit `extend`;
-## it is compiled in on the next `C-c r`. Delete it if you don't want the demo.
+## it is compiled in on the next `M-x rebuild`. Delete it if you don't want the demo.
 import wkbcore
 
 proc extend*(app: var App) =

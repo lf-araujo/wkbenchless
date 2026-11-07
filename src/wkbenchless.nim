@@ -17,6 +17,7 @@ macro importConfig(path: static string): untyped =
 when wkbUserConfig.len > 0: importConfig(wkbUserConfig)
 else: import wkbconfig
 import wkbextensions
+when defined(wkbVmConfig): import wkbvmconfig
 import wkbdesktop
 import wkbpty
 import wkbctrl
@@ -708,6 +709,7 @@ proc main() =
   configure(app)            # user config (wkbconfig.nim) -- full-typed, no ABI
   app.ed.imageDefaultWidth = gInlineImageWidth   # config may set gInlineImageWidth
   loadExtensions(app)       # extensions/*.nim, each with proc extend*(app)
+  when defined(wkbVmConfig): vmConfigStartup(app)   # config.nims, in the VM
   setupExecPath()           # seed PATH from the login shell (+ config paths)
   app.applyOrgStartup()     # #+STARTUP: latexpreview/inlineimages -- AFTER PATH
                             # is seeded, so latex/dvipng are found

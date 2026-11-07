@@ -1,9 +1,11 @@
 ## wkbenchless user configuration -- plain Nim with full access to the editor model.
 ## This is the "deep ABI": no GObject/.so boundary like the GTK build needed.
 ## A command is a Nim proc; a keybinding or a language is data; a hook is a proc
-## that fires at an editor event. Edit this file and press C-c r inside wkbenchless
-## (command "recompile") -- it rebuilds the binary, which recompiles THIS file,
-## and re-execs, restoring your file and cursor. (`nimble wkbenchless` also works.)
+## that fires at an editor event. Edit this file and run M-x rebuild inside
+## wkbenchless -- it rebuilds the binary, which recompiles THIS file, and
+## re-execs, restoring your file and cursor. (`nimble wkbenchless` also works.)
+## For anything that does not need App directly, prefer the interpreted
+## config.nims (M-x edit-config, C-c r): it applies with no rebuild or restart.
 ## The host calls `configure(app)` once, after the built-ins load.
 
 import wkbcore
@@ -13,7 +15,7 @@ proc configure*(app: var App) =
   # ---- Keymap ---------------------------------------------------------------
   # Every default binding lives here so you can see and change them all. The
   # command names come from wkbcore's registerBuiltins (run M-x to browse
-  # them). Rebind, remove, or add freely, then C-c r to apply. (M-x and C-q are
+  # them). Rebind, remove, or add freely, then M-x rebuild to apply. (M-x and C-q are
   # also set in core as a recovery net.) Note: Shift+letter chords don't reach
   # the X11 driver, so the palette is M-x, not C-S-p.
   bindkey("M-x", "palette")
@@ -55,8 +57,8 @@ proc configure*(app: var App) =
   bindkey("C-c n", "focus-next")        # cycle pane focus
   bindkey("C-c s", "switch-session")    # cycle the current session
   bindkey("C-c k", "terminal")          # bash terminal in the bottom panel
-  bindkey("C-c f", "edit-config")       # open this file
-  bindkey("C-c r", "reload-config")     # recompile & restart
+  bindkey("C-c f", "edit-config")       # open config.nims (interpreted)
+  bindkey("C-c r", "reload-config")     # apply config.nims: no rebuild, no restart
   bindkey("C-x C-f", "open-file")       # browse & open a file (palette)
   bindkey("C-x C-r", "recent-files")    # open a recently used file (palette)
   bindkey("C-x b", "list-buffers")      # switch buffers (palette)

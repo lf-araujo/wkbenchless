@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Assemble a self-contained toolchain next to the wkbenchless binary so config
-# hot-reload (C-c r) works without a system Nim/C compiler.
+# hot-reload (M-x rebuild) works without a system Nim/C compiler.
 #
 # Layout it produces (wkbenchless's detectRebuildCmd looks here):
 #   ./toolchain/nim/bin/nim   + ./toolchain/nim/lib + config  (Nim finds its
@@ -39,12 +39,12 @@ if [ -n "$zig_src" ]; then
   if [ -d "$zdir/lib" ]; then cp -a "$zdir/." "$dest/zig/"; else cp -a "$zig_src" "$dest/zig/zig"; fi
   chmod +x "$dest/zig/zig"
 else
-  echo "note: no zig given -- bundling Nim only; C-c r will use the system C compiler."
+  echo "note: no zig given -- bundling Nim only; M-x rebuild will use the system C compiler."
 fi
 
 # 3. Nimble packages the build needs that are NOT vendored in-tree (pixie and
 #    its deps; zippy and uirelays are vendored). A release install has no
-#    ~/.nimble, so C-c r resolves them from here -- config.nims puts
+#    ~/.nimble, so M-x rebuild resolves them from here -- config.nims puts
 #    toolchain/nim-pkgs on the path.
 pkgs_dest="$dest/nim-pkgs"
 rm -rf "$pkgs_dest"; mkdir -p "$pkgs_dest"
@@ -60,8 +60,8 @@ done
 if [ -n "$(ls -A "$pkgs_dest" 2>/dev/null)" ]; then
   echo "nimble packages copied to $pkgs_dest"
 else
-  echo "warning: no nimble packages found -- run 'nimble install' first, or C-c r on a release install will not resolve pixie."
+  echo "warning: no nimble packages found -- run 'nimble install' first, or M-x rebuild on a release install will not resolve pixie."
 fi
 
 echo "done. toolchain assembled at $dest"
-echo "wkbenchless's C-c r will now prefer it (see detectRebuildCmd)."
+echo "wkbenchless's M-x rebuild will now prefer it (see detectRebuildCmd)."
