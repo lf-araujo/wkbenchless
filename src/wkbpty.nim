@@ -175,13 +175,15 @@ else:
 
   type WinSz = object
     ws_row, ws_col, ws_xpixel, ws_ypixel: cushort
-  proc ioctl(fd, request: cint; argp: pointer): cint {.importc, header: "<sys/ioctl.h>", varargs.}
-  const TIOCSWINSZ = 0x5414   # Linux
+  proc ioctl(fd: cint; request: culong; argp: pointer): cint {.importc, header: "<sys/ioctl.h>", varargs.}
+  # From the header: the number differs by platform (Linux 0x5414, macOS
+  # 0x80087467), and a wrong one fails silently, leaving the child at 80 columns.
+  var TIOCSWINSZ {.importc, header: "<sys/ioctl.h>", nodecl.}: culong
 
   proc setSizeFd(master: cint; rows, cols: int) =
     if master < 0: return
     var ws = WinSz(ws_row: cushort(max(1, rows)), ws_col: cushort(max(1, cols)))
-    discard ioctl(master, TIOCSWINSZ.cint, addr ws)
+    discard ioctl(master, TIOCSWINSZ, addr ws)
 
   when defined(macosx):
     ## fork() is unsafe here: this is a Cocoa/AppKit process, and code between
