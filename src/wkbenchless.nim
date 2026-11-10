@@ -111,6 +111,198 @@ proc fitText(app: App; s: string; maxPx: int): string =
     else: break
   ell
 
+# --- hand-drawn toolbar icons ------------------------------------------------
+# The toolbar font is a monospace coding font (Hack/Consolas/Menlo) with no glyph
+# fallback, so folder/save/find pictographs and emoji don't exist there. Draw the
+# icons as vector shapes (fillRect/drawLine/drawPoint) -- the same approach as the
+# [☰] menu -- so they look identical on Linux, macOS and Windows.
+
+proc icoH(x, y, w: int; c: Color) = fillRect(rect(x, y, max(1, w), 1), c)
+proc icoV(x, y, h: int; c: Color) = fillRect(rect(x, y, 1, max(1, h)), c)
+proc icoBox(x, y, w, h: int; c: Color) =        # 1px rectangle outline
+  icoH(x, y, w, c); icoH(x, y + h - 1, w, c)
+  icoV(x, y, h, c); icoV(x + w - 1, y, h, c)
+proc icoRing(cx, cy, r: int; c: Color) =        # midpoint-circle outline
+  var x = r; var y = 0; var err = 1 - r
+  while x >= y:
+    for (px, py) in [(cx+x, cy+y), (cx+y, cy+x), (cx-y, cy+x), (cx-x, cy+y),
+                     (cx-x, cy-y), (cx-y, cy-x), (cx+y, cy-x), (cx+x, cy-y)]:
+      drawPoint(px, py, c)
+    inc y
+    if err < 0: err += 2 * y + 1
+    else: (dec x; err += 2 * (y - x) + 1)
+
+proc iconOrigin(r: Rect; s: int): (int, int) =
+  (r.x + (r.w - s) div 2, r.y + (r.h - s) div 2)
+
+proc drawOpenIcon(r: Rect; c: Color) =          # a folder with a tab
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  icoH(ix, iy + 1, 7, c)                         # tab top
+  icoV(ix + 7, iy + 1, 2, c)                     # tab right edge
+  icoBox(ix, iy + 3, s, s - 4, c)                # folder body
+
+proc drawSaveIcon(r: Rect; c: Color) =          # a floppy disk
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  icoBox(ix, iy, s, s, c)                         # disk body
+  icoH(ix, iy + 4, s, c)                          # shutter band
+  fillRect(rect(ix + s - 6, iy + 1, 3, 3), c)     # metal slider (top-right)
+  icoBox(ix + 3, iy + 7, s - 6, s - 8, c)         # label (bottom)
+
+proc drawExportIcon(r: Rect; c: Color) =        # an arrow rising out of a tray
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  let cx = ix + s div 2
+  icoV(cx, iy + 1, 7, c); icoV(cx - 1, iy + 1, 7, c)    # 2px shaft
+  drawLine(cx, iy, cx - 4, iy + 4, c)            # arrowhead left
+  drawLine(cx - 1, iy, cx - 5, iy + 4, c)
+  drawLine(cx - 1, iy, cx + 3, iy + 4, c)        # arrowhead right
+  drawLine(cx, iy, cx + 4, iy + 4, c)
+  icoH(ix + 1, iy + s - 1, s - 2, c)             # tray floor
+  icoV(ix + 1, iy + s - 5, 5, c)                 # tray left wall
+  icoV(ix + s - 2, iy + s - 5, 5, c)             # tray right wall
+
+proc drawFindIcon(r: Rect; c: Color) =          # a magnifier
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  let cx0 = ix + 5; let cy0 = iy + 5
+  icoRing(cx0, cy0, 4, c)                         # lens
+  drawLine(cx0 + 3, cy0 + 3, ix + s - 1, iy + s - 1, c)   # handle (2px)
+  drawLine(cx0 + 4, cy0 + 3, ix + s - 1, iy + s - 2, c)
+
+proc drawEditIcon(r: Rect; c: Color) =          # a pencil (tip lower-left, eraser upper-right)
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  # shaft: three parallel 45° strokes forming the pencil body
+  drawLine(ix + 1, iy + 10, ix + 8, iy + 3, c)
+  drawLine(ix + 2, iy + 11, ix + 9, iy + 4, c)
+  drawLine(ix + 3, iy + 12, ix + 10, iy + 5, c)
+  # tip: narrows to a point at the lower-left
+  drawLine(ix, iy + 13, ix + 1, iy + 10, c)
+  drawLine(ix, iy + 13, ix + 3, iy + 12, c)
+  drawPoint(ix, iy + 13, c)
+  # eraser: a short square cap at the upper-right end
+  drawLine(ix + 9, iy + 2, ix + 11, iy + 4, c)
+  drawLine(ix + 10, iy + 1, ix + 12, iy + 3, c)
+  drawLine(ix + 9, iy + 2, ix + 10, iy + 1, c)
+  drawLine(ix + 11, iy + 4, ix + 12, iy + 3, c)
+
+# --- palette row icons (same 14 px vector style as the toolbar's) -----------
+
+proc drawFileIcon(r: Rect; c: Color; filled = false) =  # a page, top-right corner folded
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  let x0 = ix + 2
+  icoH(x0, iy, 7, c)                             # top edge, up to the fold
+  icoV(x0, iy, s, c)                             # left edge
+  icoH(x0, iy + s - 1, 10, c)                    # bottom edge
+  icoV(x0 + 9, iy + 3, s - 3, c)                 # right edge, below the fold
+  drawLine(x0 + 6, iy, x0 + 9, iy + 3, c)        # the fold's diagonal
+  icoV(x0 + 6, iy, 4, c); icoH(x0 + 6, iy + 3, 4, c)   # the folded flap
+  if filled:                                     # unsaved: a solid page
+    fillRect(rect(x0 + 1, iy + 4, 8, s - 5), c)
+    fillRect(rect(x0 + 1, iy + 1, 5, 3), c)
+  else:                                          # two text lines
+    icoH(x0 + 2, iy + 7, 6, c); icoH(x0 + 2, iy + 10, 6, c)
+
+proc drawUpIcon(r: Rect; c: Color) =            # an arrow up: the parent folder
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  let cx = ix + s div 2
+  icoV(cx, iy + 2, s - 2, c); icoV(cx - 1, iy + 2, s - 2, c)   # 2px shaft
+  drawLine(cx, iy + 1, cx + 4, iy + 5, c); drawLine(cx, iy + 2, cx + 4, iy + 6, c)
+  drawLine(cx - 1, iy + 1, cx - 5, iy + 5, c); drawLine(cx - 1, iy + 2, cx - 5, iy + 6, c)
+
+proc drawChevronIcon(r: Rect; c: Color) =       # a run-this mark for plain commands
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  for d in 0 .. 1:
+    drawLine(ix + 4 + d, iy + 3, ix + 8 + d, iy + 7, c)
+    drawLine(ix + 8 + d, iy + 7, ix + 4 + d, iy + 11, c)
+
+proc drawClockIcon(r: Rect; c: Color) =         # recent / history
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  let cx = ix + 7; let cy = iy + 7
+  icoRing(cx, cy, 6, c)
+  icoV(cx, cy - 4, 5, c)                         # minute hand (12 o'clock)
+  icoH(cx, cy, 4, c)                             # hour hand (3 o'clock)
+
+proc drawSwatchIcon(r: Rect; fill, ring: Color) =   # a theme: its background in a ring
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  let cx = ix + 7; let cy = iy + 7
+  for dy in -5 .. 5:                             # filled disc, row by row
+    var dx = 0
+    while (dx + 1) * (dx + 1) + dy * dy <= 30: inc dx
+    icoH(cx - dx, cy + dy, 2 * dx + 1, fill)
+  icoRing(cx, cy, 6, ring)
+
+proc drawHeadingIcon(r: Rect; c: Color) =       # an org heading: a bar over text lines
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  fillRect(rect(ix + 1, iy + 2, 12, 2), c)
+  icoH(ix + 3, iy + 7, 10, c)
+  icoH(ix + 3, iy + 11, 8, c)
+
+proc drawBracesIcon(r: Rect; c: Color) =        # a src block: { }
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  for (x, dir) in [(ix + 4, -1), (ix + 9, 1)]:
+    icoV(x, iy + 2, 4, c); icoV(x, iy + 8, 4, c)          # upper / lower stems
+    drawPoint(x - dir, iy + 1, c); drawPoint(x - dir, iy + 12, c)   # hooks
+    drawPoint(x + dir, iy + 6, c); drawPoint(x + dir, iy + 7, c)    # the point
+  discard s
+
+proc drawPictureIcon(r: Rect; c: Color) =       # a caption: a framed landscape
+  const s = 14
+  let (ix, iy) = iconOrigin(r, s)
+  icoBox(ix, iy + 2, s, s - 4, c)
+  drawLine(ix + 2, iy + 10, ix + 5, iy + 6, c)   # a hill
+  drawLine(ix + 5, iy + 6, ix + 8, iy + 9, c)
+  drawLine(ix + 7, iy + 8, ix + 9, iy + 6, c)
+  drawLine(ix + 9, iy + 6, ix + 12, iy + 10, c)
+  fillRect(rect(ix + 10, iy + 4, 2, 2), c)       # the sun
+
+const paletteMenuCmds = ["export", "open-file", "save-as", "list-buffers",
+                         "theme", "org-nav", "recent-files", "history"]
+  ## commands that open another palette: drawn with a "more" chevron on the right
+
+proc drawPaletteIcon(app: App; id, label: string; r: Rect; c: Color) =
+  ## The icon at the start of a palette row, by palette mode and entry.
+  case app.paletteMode
+  of pmFiles, pmSaveAs:
+    if id == "..": drawUpIcon(r, c)
+    elif label.endsWith("/"): drawOpenIcon(r, c)
+    else: drawFileIcon(r, c)
+  of pmCommands:
+    case id
+    of "open-file": drawOpenIcon(r, c)
+    of "save", "save-as": drawSaveIcon(r, c)
+    of "export": drawExportIcon(r, c)
+    of "find": drawFindIcon(r, c)
+    of "src-edit-block": drawEditIcon(r, c)
+    of "list-buffers": drawFileIcon(r, c)
+    of "recent-files", "history": drawClockIcon(r, c)
+    of "org-nav": drawHeadingIcon(r, c)
+    of "theme": drawSwatchIcon(r, app.theme.windowBg, c)
+    else: drawChevronIcon(r, c)
+  of pmBuffers: drawFileIcon(r, c, filled = "[+]" in label)
+  of pmRecent: drawFileIcon(r, c)
+  of pmHistory: drawClockIcon(r, c)
+  of pmThemes:
+    let i = try: parseInt(id) except ValueError: -1
+    let bg = if i >= 0 and i < gThemes.len: gThemes[i].windowBg else: app.theme.windowBg
+    drawSwatchIcon(r, bg, c)
+  of pmOrg:
+    let s = label.strip
+    if s.startsWith("src["): drawBracesIcon(r, c)
+    elif s.startsWith("caption:"): drawPictureIcon(r, c)
+    else: drawHeadingIcon(r, c)
+  of pmExport: drawExportIcon(r, c)
+  of pmPrompt, pmDagPending: drawChevronIcon(r, c)
+
 proc drawPalette(app: App; area: Rect; lineH: int) =
   let boxW = min(area.w - 60, 900)
   let bx = area.x + (area.w - boxW) div 2
@@ -143,13 +335,21 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
   discard drawText(app.font, bx + 10, by + 8,
                    fitText(app, prompt, max(0, promptPx)) & tailTxt, app.theme.boxFg, boxBg)
   var y = by + 8 + lineH + 4
+  const iconW = 14 + 8                   # icon + gap before the label
+  const moreW = 16                       # room for the "opens a menu" chevron
   for i in top ..< top + rows:
     let rowBg = if i == app.paletteSel: app.theme.boxSelBg else: boxBg
     fillRect(rect(bx + 4, y, boxW - 8, lineH), rowBg)
+    drawPaletteIcon(app, items[i][0], items[i][1], rect(bx + 10, y, 14, lineH),
+                    app.theme.boxFg)
+    let submenu = app.paletteMode == pmCommands and items[i][0] in paletteMenuCmds
     let suffix = if i == top + rows - 1 and more > 0: "   \u2026 +" & $more else: ""
-    let lblPx = boxW - 20 - measureText(app.font, suffix).w
-    discard drawText(app.font, bx + 12, y,
+    let lblPx = boxW - 20 - iconW - measureText(app.font, suffix).w -
+                (if submenu: moreW else: 0)
+    discard drawText(app.font, bx + 10 + iconW, y,
                      fitText(app, items[i][1], max(0, lblPx)) & suffix, app.theme.boxFg, rowBg)
+    if submenu:
+      drawChevronIcon(rect(bx + boxW - 8 - moreW, y, moreW, lineH), app.theme.dimFg)
     y += lineH
 
 # The find / replace panel, styled after Sublime Text's: docked to the bottom
@@ -279,14 +479,22 @@ proc handleSearch(app: var App; e: Event) =
       typed.add ch
     if typed.len > 0: searchFieldAdd(app, typed)
 
+var gPaletteFromCommands = false  ## the open palette was entered from M-x
+
 proc paletteAccept(app: var App) =
   # free-text prompts have no list to select from -- the query IS the
   # answer, so it must not pass through the entries guard below (an
   # empty list made Enter do nothing, ever, for pmPrompt)
   if app.paletteMode == pmPrompt:
+    # With candidates, Enter takes the selected one (the typed text is listed
+    # too); without, or with nothing listed, the query is the answer.
+    let items = paletteEntries(app)
+    let answer = if app.paletteSel >= 0 and app.paletteSel < items.len:
+                   items[app.paletteSel].id
+                 else: app.paletteQuery
     app.paletteActive = false
     if gPromptHandler != nil:
-      gPromptHandler(app, app.paletteQuery)
+      gPromptHandler(app, answer)
     return
   let items = paletteEntries(app)
   if app.paletteSel < 0 or app.paletteSel >= items.len: return
@@ -296,6 +504,9 @@ proc paletteAccept(app: var App) =
     app.paletteActive = false
     gLastCommand = id                       # so M-x reopens preselecting it
     gCommands[id].run(app)
+    # a menu command (export, open-file, ...) opened its own palette: Backspace
+    # on an empty query comes back here, like ../ from a folder
+    gPaletteFromCommands = app.paletteActive and app.paletteMode != pmCommands
   of pmBuffers:
     app.paletteActive = false
     switchToBuffer(app, parseInt(id))
@@ -369,6 +580,9 @@ proc handlePalette(app: var App; e: Event) =
     of KeyBackspace:
       if app.paletteQuery.len > 0:
         app.paletteQuery.setLen(app.paletteQuery.len - 1); app.paletteSel = 0
+      elif gPaletteFromCommands and app.paletteMode != pmCommands:
+        gPaletteFromCommands = false
+        paletteCmd(app)                     # back to M-x, on the command we left
     of KeyV:
       # paste into the prompt (Ctrl-V / Cmd-V) -- a Tox ID is 76 chars,
       # nobody types that. Strip the newline a clipboard copy carries.
@@ -383,6 +597,7 @@ proc handlePalette(app: var App; e: Event) =
       if ch == '\0': break
       app.paletteQuery.add ch
     app.paletteSel = 0
+  if not app.paletteActive: gPaletteFromCommands = false
 
 proc drawCompletion(app: App; area: Rect; lineH: int) =
   let rows = min(app.completionItems.len, 8)
@@ -503,82 +718,55 @@ proc chipWidth(app: App; t: TabInfo; lineH: int): int =
   ## Width of a chip's body (state dot + text), without its [X].
   4 + dotSize(lineH) + measureText(app.font, " " & chipText(t) & " ").w
 
-# --- hand-drawn toolbar icons ------------------------------------------------
-# The toolbar font is a monospace coding font (Hack/Consolas/Menlo) with no glyph
-# fallback, so folder/save/find pictographs and emoji don't exist there. Draw the
-# icons as vector shapes (fillRect/drawLine/drawPoint) -- the same approach as the
-# [☰] menu -- so they look identical on Linux, macOS and Windows.
+proc tabWindow(widths: seq[int]; cur, avail, availWithArrows: int):
+    tuple[first, last: int; arrows: bool] =
+  ## Which tabs a tab bar shows. All of them when their widths (each already
+  ## including its gap) fit in `avail`: no ◀ ▶. Otherwise ◀ ▶ take room
+  ## (`availWithArrows` is left) and the bar shows a run of tabs that holds
+  ## `cur`, as far left as it can; the arrows step to the hidden ones.
+  if widths.len == 0: return (0, -1, false)
+  var total = 0
+  for w in widths: total += w
+  if total <= avail: return (0, widths.high, false)
+  let c = clamp(cur, 0, widths.high)
+  var first = 0
+  var span = 0
+  for i in 0 .. c: span += widths[i]
+  while first < c and span > availWithArrows:   # drop tabs off the left
+    span -= widths[first]; inc first
+  var last = c
+  while last < widths.high and span + widths[last + 1] <= availWithArrows:
+    inc last; span += widths[last]
+  (first, last, true)
 
-proc icoH(x, y, w: int; c: Color) = fillRect(rect(x, y, max(1, w), 1), c)
-proc icoV(x, y, h: int; c: Color) = fillRect(rect(x, y, 1, max(1, h)), c)
-proc icoBox(x, y, w, h: int; c: Color) =        # 1px rectangle outline
-  icoH(x, y, w, c); icoH(x, y + h - 1, w, c)
-  icoV(x, y, h, c); icoV(x + w - 1, y, h, c)
-proc icoRing(cx, cy, r: int; c: Color) =        # midpoint-circle outline
-  var x = r; var y = 0; var err = 1 - r
-  while x >= y:
-    for (px, py) in [(cx+x, cy+y), (cx+y, cy+x), (cx-y, cy+x), (cx-x, cy+y),
-                     (cx-x, cy-y), (cx-y, cy-x), (cx+y, cy-x), (cx+x, cy-y)]:
-      drawPoint(px, py, c)
-    inc y
-    if err < 0: err += 2 * y + 1
-    else: (dec x; err += 2 * (y - x) + 1)
+proc sessionTabLayout(app: App; r: Rect; lineH: int):
+    tuple[chips: seq[tuple[key: string; r, xr: Rect]]; prev, next: Rect] =
+  ## The session tab bar's chips (each with its [X]) and, when they overflow,
+  ## its ◀ ▶ -- shared by drawing and clicking so they always agree.
+  let keys = app.tabKeys()
+  let xw = lineH
+  var widths: seq[int]
+  for k in keys: widths.add chipWidth(app, tabInfo(app, k), lineH) + xw + 4
+  let aw = lineH + 4                                   # one arrow chip
+  let right = r.x + r.w - lineH - 6                    # stop short of [_]
+  let curIdx = max(0, keys.find(app.currentTabKey()))
+  let win = tabWindow(widths, curIdx, right - (r.x + 4),
+                      right - (r.x + 4) - 2 * aw - 8)
+  var cx = r.x + 4
+  for i in win.first .. win.last:
+    let lw = widths[i] - xw - 4
+    result.chips.add (keys[i], rect(cx, r.y, lw, lineH), rect(cx + lw, r.y, xw, lineH))
+    cx += widths[i]
+  if win.arrows:
+    result.prev = rect(right - 2 * aw - 4, r.y, aw, lineH)
+    result.next = rect(right - aw, r.y, aw, lineH)
 
-proc iconOrigin(r: Rect; s: int): (int, int) =
-  (r.x + (r.w - s) div 2, r.y + (r.h - s) div 2)
-
-proc drawOpenIcon(r: Rect; c: Color) =          # a folder with a tab
-  const s = 14
-  let (ix, iy) = iconOrigin(r, s)
-  icoH(ix, iy + 1, 7, c)                         # tab top
-  icoV(ix + 7, iy + 1, 2, c)                     # tab right edge
-  icoBox(ix, iy + 3, s, s - 4, c)                # folder body
-
-proc drawSaveIcon(r: Rect; c: Color) =          # a floppy disk
-  const s = 14
-  let (ix, iy) = iconOrigin(r, s)
-  icoBox(ix, iy, s, s, c)                         # disk body
-  icoH(ix, iy + 4, s, c)                          # shutter band
-  fillRect(rect(ix + s - 6, iy + 1, 3, 3), c)     # metal slider (top-right)
-  icoBox(ix + 3, iy + 7, s - 6, s - 8, c)         # label (bottom)
-
-proc drawExportIcon(r: Rect; c: Color) =        # an arrow rising out of a tray
-  const s = 14
-  let (ix, iy) = iconOrigin(r, s)
-  let cx = ix + s div 2
-  icoV(cx, iy + 1, 7, c); icoV(cx - 1, iy + 1, 7, c)    # 2px shaft
-  drawLine(cx, iy, cx - 4, iy + 4, c)            # arrowhead left
-  drawLine(cx - 1, iy, cx - 5, iy + 4, c)
-  drawLine(cx - 1, iy, cx + 3, iy + 4, c)        # arrowhead right
-  drawLine(cx, iy, cx + 4, iy + 4, c)
-  icoH(ix + 1, iy + s - 1, s - 2, c)             # tray floor
-  icoV(ix + 1, iy + s - 5, 5, c)                 # tray left wall
-  icoV(ix + s - 2, iy + s - 5, 5, c)             # tray right wall
-
-proc drawFindIcon(r: Rect; c: Color) =          # a magnifier
-  const s = 14
-  let (ix, iy) = iconOrigin(r, s)
-  let cx0 = ix + 5; let cy0 = iy + 5
-  icoRing(cx0, cy0, 4, c)                         # lens
-  drawLine(cx0 + 3, cy0 + 3, ix + s - 1, iy + s - 1, c)   # handle (2px)
-  drawLine(cx0 + 4, cy0 + 3, ix + s - 1, iy + s - 2, c)
-
-proc drawEditIcon(r: Rect; c: Color) =          # a pencil (tip lower-left, eraser upper-right)
-  const s = 14
-  let (ix, iy) = iconOrigin(r, s)
-  # shaft: three parallel 45° strokes forming the pencil body
-  drawLine(ix + 1, iy + 10, ix + 8, iy + 3, c)
-  drawLine(ix + 2, iy + 11, ix + 9, iy + 4, c)
-  drawLine(ix + 3, iy + 12, ix + 10, iy + 5, c)
-  # tip: narrows to a point at the lower-left
-  drawLine(ix, iy + 13, ix + 1, iy + 10, c)
-  drawLine(ix, iy + 13, ix + 3, iy + 12, c)
-  drawPoint(ix, iy + 13, c)
-  # eraser: a short square cap at the upper-right end
-  drawLine(ix + 9, iy + 2, ix + 11, iy + 4, c)
-  drawLine(ix + 10, iy + 1, ix + 12, iy + 3, c)
-  drawLine(ix + 9, iy + 2, ix + 10, iy + 1, c)
-  drawLine(ix + 11, iy + 4, ix + 12, iy + 3, c)
+proc stepTab(app: var App; delta: int) =
+  ## The session bar's ◀ ▶: select the neighbouring tab (wraps).
+  let keys = app.tabKeys()
+  if keys.len == 0: return
+  let i = max(0, keys.find(app.currentTabKey()))
+  selectTab(app, keys[(i + delta + keys.len) mod keys.len])
 
 type DiffPiece = tuple[x: int; text: string; kind: char]
 var gDiffLayoutKey = (-1, -1)            ## (diffSerial, width) the cache was built for
@@ -722,6 +910,8 @@ proc main() =
     applyThemeByName(app, gState["theme"])
   if gState.hasKey("bufferTabs"):           # restore whether buffer tabs were on
     gBufferTabs = gState["bufferTabs"] == "true"
+  if gState.hasKey("toolbar"):             # restore whether the top bar shows
+    gToolbar = gState["toolbar"] == "true"
   if gState.hasKey("fontSize"):            # restore the last font size
     try: app.fontSize = max(8, min(48, parseInt(gState["fontSize"])))
     except ValueError: discard
@@ -972,7 +1162,8 @@ proc main() =
     let lay = if app.srcEdit: laySrc
               elif (app.sessions.len > 0 or app.terminals.len > 0) and not app.sessionHidden: layPlain
               else: layBare
-    let toolbarH = lineH + 8
+    let toolbarH = if gToolbar: lineH + 8 else: 0   # 0: no top bar at all
+    if not gToolbar: toolbarMenuOpen = false       # its [☰] menu goes with it
     var cells = resolve(lay, screen.width, screen.height - toolbarH, lineH)
     for _, c in cells.mpairs: c.y += toolbarH   # push panes below the header toolbar
 
@@ -993,36 +1184,43 @@ proc main() =
                       "src-edit-block"]
     var toolbarRects: seq[tuple[r: Rect; cmd, label: string]]
     var bufferTabRects: seq[tuple[r: Rect; idx: int; xr: Rect]]  # tab body + its [x]
-    block:
+    if gToolbar:
       var x = 6
       for (label, cmd) in tbBtns:
         let w = if cmd in iconCmds: toolbarH + 2           # square-ish icon button
                 else: measureText(app.font, label).w + 16
         toolbarRects.add (rect(x, 4, w, toolbarH - 8), cmd, label)
         x += w + 4
-      # ◀/▶ cycle buffers -- tabs overflow the line when titles are long, and
-      # these reach the ones scrolled off either end. Docked just left of [☰].
+      # ◀/▶ cycle buffers, docked just left of [☰] -- only when the tabs
+      # overflow the line; the bar then shows a run of tabs holding the current
+      # buffer, and the arrows reach the others.
       const aw = 26                        # arrow chip width
       const mw = 30      # the [☰] button (drawn as three bars, not a glyph)
-      let tabsRight = screen.width - mw - 6 - 2 * aw - 20   # tabs stop at the ◀
-      toolbarRects.add (rect(screen.width - mw - 6 - 2 * aw - 8, 4, aw, toolbarH - 8),
-                        "prev-buffer", "◀")
-      toolbarRects.add (rect(screen.width - mw - 6 - aw - 4, 4, aw, toolbarH - 8),
-                        "next-buffer", "▶")
+      let xw = toolbarH - 8                # a tab's [x]
+      var widths: seq[int]                 # each tab's natural width + gap
+      if gBufferTabs:
+        for b in app.buffers:
+          let full = " " & (if b.ed.changed: "*" else: "") & bufName(b) & " "
+          widths.add measureText(app.font, full).w + 4 + xw + 4
+      let roomAll = screen.width - mw - 6 - 8 - x
+      let roomArrows = screen.width - mw - 6 - 2 * aw - 20 - x   # tabs stop at the ◀
+      let win = tabWindow(widths, app.curBuf, roomAll, roomArrows)
+      if win.arrows:
+        toolbarRects.add (rect(screen.width - mw - 6 - 2 * aw - 8, 4, aw, toolbarH - 8),
+                          "prev-buffer", "◀")
+        toolbarRects.add (rect(screen.width - mw - 6 - aw - 4, 4, aw, toolbarH - 8),
+                          "next-buffer", "▶")
       toolbarRects.add (rect(screen.width - mw - 6, 4, mw, toolbarH - 8), "__menu__", "")
       # buffer tabs (optional): one per open buffer -- click to switch, [x] to
-      # close. A tab that would overflow the line SHRINKS (middle-ellipsized
-      # name) instead of vanishing, so every buffer always has a tab.
-      if gBufferTabs:
-        for i, b in app.buffers:
-          let full = " " & (if b.ed.changed: "*" else: "") & bufName(b) & " "
-          let xw = toolbarH - 8
-          let avail = tabsRight - x - xw - 4
-          if avail < 40: break                  # not even a stub fits
-          let lw = min(measureText(app.font, full).w + 4, avail)
-          bufferTabRects.add (rect(x, 4, lw + xw, toolbarH - 8), i,
-                              rect(x + lw, 4, xw, toolbarH - 8))
-          x += lw + xw + 4
+      # close. A lone tab too wide for the line SHRINKS (middle-ellipsized name).
+      let tabsRight = x + (if win.arrows: roomArrows else: roomAll)
+      for i in win.first .. win.last:
+        let avail = tabsRight - x - xw - 4
+        if avail < 40: break                    # not even a stub fits
+        let lw = min(widths[i] - xw - 4, avail)
+        bufferTabRects.add (rect(x, 4, lw + xw, toolbarH - 8), i,
+                            rect(x + lw, 4, xw, toolbarH - 8))
+        x += lw + xw + 4
     var menuRects: seq[tuple[r: Rect; cmd, label: string]]
     if toolbarMenuOpen:
       var mw = 24
@@ -1153,15 +1351,17 @@ proc main() =
           if e.x >= r.x + r.w - lineH:          # [_] minimize the panel
             app.sessionHidden = true; app.focus = "editor"
           else:
-            var cx = r.x + 4
-            for k in app.tabKeys():
-              let lw = chipWidth(app, tabInfo(app, k), lineH)
-              let xw = lineH
-              if e.x >= cx and e.x < cx + lw + xw:
-                if e.x >= cx + lw: closeTab(app, k)   # the chip's [x]
-                else: selectTab(app, k)
-                break
-              cx += lw + xw + 4
+            let lay = sessionTabLayout(app, r, lineH)
+            if lay.prev.w > 0 and e.x >= lay.prev.x and e.x < lay.prev.x + lay.prev.w:
+              stepTab(app, -1)                  # ◀
+            elif lay.next.w > 0 and e.x >= lay.next.x and e.x < lay.next.x + lay.next.w:
+              stepTab(app, 1)                   # ▶
+            else:
+              for c in lay.chips:
+                if e.x >= c.r.x and e.x < c.xr.x + c.xr.w:
+                  if e.x >= c.xr.x: closeTab(app, c.key)   # the chip's [x]
+                  else: selectTab(app, c.key)
+                  break
     # Chrome colors from the active theme (re-read each frame so a palette
     # theme-switch takes effect immediately).
     let bg = app.theme.windowBg
@@ -1296,24 +1496,30 @@ proc main() =
       # tab bar: one chip per tab (sessions + the terminal), each with its own
       # [x] to close it, then a [_] to minimize the whole panel.
       fillRect(rect(r.x, r.y, r.w, bh), app.theme.tabBarBg)
-      var cx = r.x + 4
       let curKey = app.currentTabKey()
-      for k in app.tabKeys():
-        let active = k == curKey
+      let tabLay = sessionTabLayout(app, r, lineH)
+      var cx = r.x + 4                     # where the chips end (job strip after)
+      for c in tabLay.chips:
+        let active = c.key == curKey
         let chipBg = if active: app.theme.chipActiveBg else: app.theme.chipBg
         let chipFg = if active: app.theme.chipActiveFg else: app.theme.chipFg
-        let t = tabInfo(app, k)
-        let lw = chipWidth(app, t, lineH)
-        let xw = bh
+        let t = tabInfo(app, c.key)
+        let xw = c.xr.w
         let d = dotSize(lineH)
-        fillRect(rect(cx, r.y, lw + xw, bh), chipBg)
-        fillRect(rect(cx + 4, r.y + (bh - d) div 2, d, d), stateColor(t))
-        discard drawText(app.font, cx + 4 + d, r.y, " " & chipText(t) & " ", chipFg, chipBg)
-        let xr = rect(cx + lw, r.y, xw, bh)   # per-tab [X] close button
-        fillRect(xr, app.theme.closeBg)
-        discard drawText(boldFont, xr.x + xw div 3, r.y, "X",
+        fillRect(rect(c.r.x, r.y, c.r.w + xw, bh), chipBg)
+        fillRect(rect(c.r.x + 4, r.y + (bh - d) div 2, d, d), stateColor(t))
+        discard drawText(app.font, c.r.x + 4 + d, r.y, " " & chipText(t) & " ", chipFg, chipBg)
+        fillRect(c.xr, app.theme.closeBg)   # per-tab [X] close button
+        discard drawText(boldFont, c.xr.x + xw div 3, r.y, "X",
                          color(255, 255, 255), app.theme.closeBg)
-        cx += lw + xw + 4
+        cx = c.xr.x + xw + 4
+      for (ar, glyph) in [(tabLay.prev, "◀"), (tabLay.next, "▶")]:
+        if ar.w == 0: continue             # everything fits: no arrows
+        fillRect(ar, app.theme.chipBg)
+        let gw = measureText(app.font, glyph).w
+        discard drawText(app.font, ar.x + (ar.w - gw) div 2, r.y, glyph,
+                         app.theme.chipFg, app.theme.chipBg)
+      if tabLay.prev.w > 0: cx = r.x + r.w   # arrows fill the bar: no job strip
       let mr = rect(r.x + r.w - bh, r.y, bh, bh)   # [_] minimize button
       block jobStripDraw:            # right-aligned: the run(s) in flight + queue
         let strip = jobStrip(app)
@@ -1494,7 +1700,7 @@ proc main() =
       drawPalette(app, editorRect, lineH)
 
     # --- header toolbar (drawn above the panes) + its [☰] menu ---------------
-    block:
+    if gToolbar:
       fillRect(rect(0, 0, screen.width, toolbarH), app.theme.tabBarBg)
       fillRect(rect(0, toolbarH - 1, screen.width, 1), app.theme.dividerColor)
       for it in toolbarRects:

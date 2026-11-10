@@ -235,6 +235,8 @@ var
                                            ## (org #+ATTR_* :width overrides it);
   gBufferTabs* = false                     ## show a tab per open buffer in the top
                                            ## toolbar (click to switch, [x] to close)
+  gToolbar* = true                         ## show the top bar (icons, buffer tabs,
+                                           ## [☰]); M-x toggle-toolbar hides it all
                                            ## 0 = use each image's native size
   gLatexDpi* = 140                         ## dvipng resolution for M-x latex-preview
                                            ## math images (higher = larger/crisper)
@@ -250,6 +252,9 @@ proc takeSnapshot*(app: var App)
 proc relTime*(t: float): string
 var gExportTargets*: seq[ExportTarget]   ## registered Export-button targets
 var gPromptHandler*: proc(app: var App; text: string)  ## pmPrompt accept callback
+var gPromptChoices*: seq[tuple[id, label: string]]
+  ## pmPrompt candidates (set after openPalette, which clears them): Enter hands
+  ## the selected id to gPromptHandler. Empty = a plain free-text prompt.
 var gStatusCircle*: Color = color(0xb0, 0xb0, 0xb0)  ## status circle: gray=offline
 var gStatusCircleRect*: Rect = rect(0, 0, 0, 0)  ## clickable bounds (set during draw)
 var gDagPendingEntries*: proc(app: App): seq[tuple[id, label: string]]  ## palette items
@@ -908,14 +913,26 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
     # typing e.g. "cite" finds `cite-context` even when its label doesn't contain
     # that word. Rank so the best match is first (the selector starts at the top,
     # so a search never needs scrolling to reach the obvious hit).
+    # Export targets' own commands are not listed: `export` is their one entry
+    # (Enter opens the targets, like a folder), and it also matches whatever a
+    # target matches -- typing "pdf" offers `export`.
+    var targetCmds: seq[string]
+    var exportHit = false
+    for t in gExportTargets:
+      targetCmds.add t.cmd
+      if q.len > 0 and (q in t.cmd.toLowerAscii or q in t.id.toLowerAscii or
+                        q in t.label.toLowerAscii): exportHit = true
     var scored: seq[tuple[score: int; id, label: string]]
     for name, c in gCommands:
+      if name in targetCmds: continue
       let nlow = name.toLowerAscii
       if q.len == 0 or q in nlow or q in c.label.toLowerAscii:
         let sc = if q.len == 0: 0
                  elif q in nlow: matchScore(name, q)
                  else: 100000 + matchScore(c.label, q)   # label-only hits rank last
         scored.add (sc, name, name & "  —  " & c.label)
+      elif name == "export" and exportHit:
+        scored.add (50000, name, name & "  —  " & c.label)
     scored.sort(proc(a, b: (int, string, string)): int =
       result = cmp(a[0], b[0])
       if result == 0: result = cmp(a[1], b[1]))          # stable: then by name
@@ -927,18 +944,30 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
         let dirty = if b.ed.changed: " [+]" else: ""
         result.add ($i, nm & dirty & (if i == app.curBuf: "  (current)" else: ""))
   of pmFiles, pmSaveAs:
-    result.add ("..", "../")
-    var dirs, files: seq[tuple[id, label: string]]
     let filter = app.paletteMode == pmFiles
+    let filtering = filter and q.len > 0
+    # "../" only while browsing: once the user types a filter it would sit on
+    # top and take the selection (Backspace to an empty query brings it back).
+    if not filtering: result.add ("..", "../")
+    var dirs, files: seq[tuple[id, label: string]]
     for kind, path in walkDir(app.paletteDir):
       let nm = extractFilename(path)
       if nm.startsWith("."): continue
-      if filter and q.len > 0 and q notin nm.toLowerAscii: continue
+      if filtering and q notin nm.toLowerAscii: continue
       if kind == pcDir: dirs.add (path, nm & "/")
       else: files.add (path, nm)
-    dirs.sort(proc(a, b: (string, string)): int = cmp(a[1], b[1]))
-    files.sort(proc(a, b: (string, string)): int = cmp(a[1], b[1]))
-    result.add dirs; result.add files
+    if filtering:
+      # one list, best match first (exact < prefix < word start < substring)
+      var all = dirs & files
+      all.sort(proc(a, b: (string, string)): int =
+        result = cmp(matchScore(extractFilename(a[0]), q),
+                     matchScore(extractFilename(b[0]), q))
+        if result == 0: result = cmp(a[1], b[1]))
+      result.add all
+    else:
+      dirs.sort(proc(a, b: (string, string)): int = cmp(a[1], b[1]))
+      files.sort(proc(a, b: (string, string)): int = cmp(a[1], b[1]))
+      result.add dirs; result.add files
   of pmThemes:
     for i in 0 ..< gThemes.len:
       let nm = gThemes[i].name
@@ -967,7 +996,22 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
       if q.len == 0 or q in p.toLowerAscii:
         result.add (p, nm & "    " & p.parentDir)
   of pmPrompt:
-    discard   # free-text: the typed query is the answer, no list to filter
+    # Free text, optionally with candidates (remote-login's hosts): matching
+    # candidates first, best match on top, then the typed text itself, so a new
+    # address is still one Down + Enter away (or just Enter when nothing matches).
+    if gPromptChoices.len == 0: return
+    var scored: seq[tuple[score: int; id, label: string]]
+    for c in gPromptChoices:
+      if q.len == 0 or q in c.label.toLowerAscii:
+        scored.add ((if q.len == 0: 0 else: matchScore(c.label, q)), c.id, c.label)
+    scored.sort(proc(a, b: (int, string, string)): int = cmp(a[0], b[0]))
+    for x in scored: result.add (x.id, x.label)
+    let typed = app.paletteQuery.strip
+    var known = false
+    for c in gPromptChoices:
+      if c.id == typed: known = true
+    if typed.len > 0 and not known:
+      result.add (typed, typed & "    (as typed)")
   of pmDagPending:
     if gDagPendingEntries != nil:
       return gDagPendingEntries(app)
@@ -1266,6 +1310,7 @@ proc openPalette(app: var App; mode: PaletteMode) =
   app.paletteActive = true
   app.paletteQuery = ""
   app.paletteSel = 0
+  gPromptChoices = @[]       # a prompt that wants candidates sets them after this
   if mode == pmCommands and gLastCommand.len > 0:   # reopen on the last-used item
     let entries = paletteEntries(app)
     for i, e in entries:
@@ -2591,6 +2636,13 @@ proc toggleBufferTabs*(app: var App) =
   setState("bufferTabs", $gBufferTabs)      # remember across restarts
   app.msg = "buffer tabs: " & (if gBufferTabs: "on" else: "off")
 
+proc toggleToolbar*(app: var App) =
+  ## Show/hide the whole top bar -- icons, buffer tabs, [☰] -- for a minimal
+  ## window. Everything on it stays reachable from M-x.
+  gToolbar = not gToolbar
+  setState("toolbar", $gToolbar)            # remember across restarts
+  app.msg = "toolbar: " & (if gToolbar: "on" else: "off -- M-x toggle-toolbar brings it back")
+
 # -- src-edit: org-edit-special + session tangle ---------------------------
 proc commonIndent(lines: seq[string]): int =
   result = high(int)
@@ -2950,6 +3002,34 @@ proc sshRefusal*(host: string): string =
   if epochTime() < st.nextTry:
     result.add " [auto-retry in " & $int(st.nextTry - epochTime()) & "s]"
 
+proc sshConfigHosts*(path = getHomeDir() / ".ssh" / "config"): seq[string] =
+  ## The concrete `Host` aliases in an ssh config (patterns with * ? ! skipped).
+  if not fileExists(path): return
+  for raw in (try: readFile(path) except CatchableError: "").splitLines:
+    let line = raw.strip
+    if line.len < 5 or not line.toLowerAscii.startsWith("host") or
+       line[4] notin {' ', '\t', '='}: continue
+    for tok in line[5 .. ^1].replace('=', ' ').splitWhitespace:
+      if tok.len > 0 and not tok.contains({'*', '?', '!'}) and tok notin result:
+        result.add tok
+
+proc remoteHostChoices*(app: App): seq[tuple[id, label: string]] =
+  ## remote-login's candidates: the hosts of remote sessions open in this
+  ## editor, then ~/.ssh/config's hosts. A `:dir` header still picks the
+  ## method (workq, magma) per block; logging in only needs the host.
+  var seen: seq[string]
+  proc addNew(r: var seq[tuple[id, label: string]]; id, label: string) =
+    if id.len > 0 and id notin seen:
+      seen.add id; r.add (id, label)
+  for key, _ in app.sessions:
+    let at = key.find('@')
+    if at < 0: continue
+    var t = key[at + 1 .. ^1]
+    let bar = t.find('|')
+    if bar >= 0: t.setLen(bar)
+    result.addNew(t, t)
+  for t in sshConfigHosts(): result.addNew(t, t)
+
 proc remoteLoginCmd*(app: var App; host: string) =
   ## THE login command: opens the terminal tab that creates the ControlMaster
   ## (explicit -M, the shared ControlPath, keep-alives, a persist that outlives
@@ -2962,6 +3042,7 @@ proc remoteLoginCmd*(app: var App; host: string) =
     gPromptHandler = proc(app: var App; text: string) =
       if text.strip.len > 0: remoteLoginCmd(app, text.strip)
     openPalette(app, pmPrompt)
+    gPromptChoices = remoteHostChoices(app)
     return
   gSshRetry.del(host)            # a fresh login resets the clock
   gSshWatch.incl host
@@ -4471,6 +4552,7 @@ proc registerBuiltins*() =
   defcommand("ghost-dismiss", "Copilot: dismiss the ghost-text completion", ghostDismiss)
   defcommand("toggle-src-edit", "Toggle objects/help (src-edit)", toggleSrcEdit)
   defcommand("toggle-buffer-tabs", "Show/hide buffer tabs in the toolbar", toggleBufferTabs)
+  defcommand("toggle-toolbar", "Show/hide the top bar (icons, tabs, menu) for a minimal window", toggleToolbar)
   defcommand("src-edit-block", "Src-edit: this block (org-edit-special)", srcEditBlock)
   defcommand("src-edit-session", "Src-edit: tangle this session's blocks", srcEditSession)
   defcommand("focus-next", "Focus next pane", focusNext)

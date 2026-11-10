@@ -121,7 +121,7 @@ jobs:
       # (test_tmux_remote, test_highlight_perf) take arguments and are not here.
       - name: Run tests
         run: |
-          tests="test_bib test_cite test_claude_mod test_collab_diverge test_diff test_hist
+          tests="test_bib test_cite test_claude_mod test_collab_diverge test_diff test_file_palette test_hist test_remote_login
                  test_landmark test_logoot test_otd_spans test_regex
                  test_rmd_fold test_search test_session_view test_supplement
                  test_tmuxctl test_tox_transport test_utf8_cursor"
